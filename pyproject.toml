@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "cosyvoice"
 version = "3.0.0"
 description = "Fun-CosyVoice3 Text-to-Speech System - Zero-shot multilingual speech synthesis based on large language models"
@@ -21,10 +21,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-[project.urls]
-Homepage = "https://github.com/FunAudioLLM/CosyVoice"
-Documentation = "https://funaudiollm.github.io/cosyvoice3/"
-Repository = "https://github.com/FunAudioLLM/CosyVoice"
+# [workspace.urls]
+# Homepage = "https://github.com/FunAudioLLM/CosyVoice"
+# Documentation = "https://funaudiollm.github.io/cosyvoice3/"
+# Repository = "https://github.com/FunAudioLLM/CosyVoice"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -37,14 +37,15 @@ include = ["cosyvoice*"]
 # Pixi Configuration
 # ============================================================================
 
-[tool.pixi.project]
-channels = ["conda-forge", "pytorch", "nvidia"]
+[tool.pixi.workspace]
+name = "cosyvoice"
+channels = ["pytorch", "nvidia", "conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.dependencies]
 python = "3.10.*"
 pytorch = ">=2.3.0"
-pytorch-cuda = "12.1.*"
+pytorch-cuda = ">=12.1"
 torchaudio = ">=2.3.0"
 sox = "*"
 libsndfile = "*"
@@ -98,9 +99,10 @@ tensorboard = ">=2.14.0"
 
 # ONNX Runtime (optional, for optimized inference)
 onnx = ">=1.16.0"
+onnxruntime-gpu = ">=1.18.0"
 
-# Training (optional, Linux only)
-deepspeed = {version = ">=0.15.1", markers = "sys_platform == 'linux'"}
+# Training (optional, Linux only - deepspeed only works on Linux)
+deepspeed = ">=0.15.1"
 lightning = ">=2.2.4"
 
 # TensorRT (optional, Linux only for GPU acceleration)
@@ -123,6 +125,11 @@ from modelscope import snapshot_download
 print('Downloading Fun-CosyVoice3-0.5B-2512...')
 snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='pretrained_models/Fun-CosyVoice3-0.5B')
 print('Model downloaded to pretrained_models/Fun-CosyVoice3-0.5B')
+
+from modelscope import snapshot_download
+print('Downloading CosyVoice-ttsfrd...')
+snapshot_download('iic/CosyVoice-ttsfrd', local_dir='pretrained_models/CosyVoice-ttsfrd')
+print('Model downloaded to pretrained_models/CosyVoice-ttsfrd')
 "
 """
 
