@@ -41,6 +41,74 @@ DEFAULT_PROMPT_TEXT = "Eight months to Mars. Counter-orbital slingshot around 14
 DEFAULT_MODEL_DIR = "pretrained_models/Fun-CosyVoice3-0.5B"
 
 
+def cosyvoice3_example():
+    """CosyVoice3 Usage, check https://funaudiollm.github.io/cosyvoice3/ for more details"""
+    cosyvoice = AutoModel(model_dir="pretrained_models/Fun-CosyVoice3-0.5B")
+    # zero_shot usage
+    for i, j in enumerate(
+        cosyvoice.inference_zero_shot(
+            "Peter Piper picked a peck of pickled peppers. How many pickled peppers did Peter Piper pick?",
+            "You are a helpful assistant.<|endofprompt|>I hope you can do better than me in the future.",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "zero_shot_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
+
+    # fine grained control, for supported control, check cosyvoice/tokenizer/tokenizer.py#L280
+    for i, j in enumerate(
+        cosyvoice.inference_cross_lingual(
+            "You are a helpful assistant.<|endofprompt|>[breath]Because that generation of people[breath]are used to living in the countryside,[breath]neighbors are very active,[breath]um, very familiar.[breath]",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "fine_grained_control_{}.wav".format(i),
+            j["tts_speech"],
+            cosyvoice.sample_rate,
+        )
+
+    # instruct usage, for supported control, check cosyvoice/utils/common.py#L28
+    for i, j in enumerate(
+        cosyvoice.inference_instruct2(
+            "It's rare, usually only during National Day or Mid-Autumn Festival.",
+            "You are a helpful assistant. Please use a sad tone.<|endofprompt|>",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "instruct_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
+    for i, j in enumerate(
+        cosyvoice.inference_instruct2(
+            "Received a birthday gift from a friend from afar, that unexpected surprise and deep blessing filled my heart with sweet happiness, smiling like a flower blooming.",
+            "You are a helpful assistant. Please speak as fast as possible.<|endofprompt|>",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "instruct_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
+
+    # hotfix usage
+    for i, j in enumerate(
+        cosyvoice.inference_zero_shot(
+            "Executives also praised the report via phone, SMS, WeChat, etc.",
+            "You are a helpful assistant.<|endofprompt|>I hope you can do better than me in the future.",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "hotfix_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
+
+
 def voice_cloning_example():
     """
     Zero-shot voice cloning example.
@@ -84,32 +152,72 @@ def voice_cloning_example():
     print("\n✨ Voice cloning complete!")
 
 
-def cross_lingual_example():
-    """
-    Cross-lingual synthesis example.
-
-    Synthesizes text in a different language than the reference voice.
-    """
-    print("\n" + "=" * 60)
-    print("Fun-CosyVoice3 Cross-Lingual Example")
-    print("=" * 60)
-
-    cosyvoice = AutoModel(model_dir=DEFAULT_MODEL_DIR)
-
-    # Chinese text with English reference voice
-    tts_text = "You are a helpful assistant.<|endofprompt|>你好，我是一个人工智能语音助手。很高兴为您服务！"
-
-    print(f"\n🎤 Reference voice: {DEFAULT_PROMPT_WAV}")
-    print("📝 Synthesizing Chinese text with English reference voice")
-
-    for i, output in enumerate(
-        cosyvoice.inference_cross_lingual(tts_text, DEFAULT_PROMPT_WAV, stream=False)
+def cosyvoice3_example():
+    """CosyVoice3 Usage, check https://funaudiollm.github.io/cosyvoice3/ for more details"""
+    cosyvoice = AutoModel(model_dir="pretrained_models/Fun-CosyVoice3-0.5B")
+    # zero_shot usage
+    for i, j in enumerate(
+        cosyvoice.inference_zero_shot(
+            "八百标兵奔北坡，北坡炮兵并排跑，炮兵怕把标兵碰，标兵怕碰炮兵炮。",
+            "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
     ):
-        output_path = f"output_cross_lingual_{i}.wav"
-        torchaudio.save(output_path, output["tts_speech"], cosyvoice.sample_rate)
-        print(f"   💾 Saved: {output_path}")
+        torchaudio.save(
+            "zero_shot_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
 
-    print("\n✨ Cross-lingual synthesis complete!")
+    # fine grained control, for supported control, check cosyvoice/tokenizer/tokenizer.py#L280
+    for i, j in enumerate(
+        cosyvoice.inference_cross_lingual(
+            "You are a helpful assistant.<|endofprompt|>[breath]因为他们那一辈人[breath]在乡里面住的要习惯一点，[breath]邻居都很活络，[breath]嗯，都很熟悉。[breath]",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "fine_grained_control_{}.wav".format(i),
+            j["tts_speech"],
+            cosyvoice.sample_rate,
+        )
+
+    # instruct usage, for supported control, check cosyvoice/utils/common.py#L28
+    for i, j in enumerate(
+        cosyvoice.inference_instruct2(
+            "好少咯，一般系放嗰啲国庆啊，中秋嗰啲可能会咯。",
+            "You are a helpful assistant. 请用广东话表达。<|endofprompt|>",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "instruct_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
+    for i, j in enumerate(
+        cosyvoice.inference_instruct2(
+            "收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐，笑容如花儿般绽放。",
+            "You are a helpful assistant. 请用尽可能快地语速说一句话。<|endofprompt|>",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "instruct_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
+
+    # hotfix usage
+    for i, j in enumerate(
+        cosyvoice.inference_zero_shot(
+            "高管也通过电话、短信、微信等方式对报道[j][ǐ]予好评。",
+            "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+            "./asset/zero_shot_prompt.wav",
+            stream=False,
+        )
+    ):
+        torchaudio.save(
+            "hotfix_{}.wav".format(i), j["tts_speech"], cosyvoice.sample_rate
+        )
 
 
 def instruct_example():
@@ -148,10 +256,10 @@ def instruct_example():
 
 def main():
     """Run the voice cloning example by default."""
-    voice_cloning_example()
+    # voice_cloning_example()
+    cosyvoice3_example()
 
     # Uncomment to run additional examples:
-    # cross_lingual_example()
     # instruct_example()
 
 
