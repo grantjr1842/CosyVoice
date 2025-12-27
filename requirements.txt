@@ -1,3 +1,15 @@
+# ============================================================================
+# DEPRECATED: This file is maintained for legacy compatibility only.
+# Please use pixi for package management: https://pixi.sh/
+#
+# To install with pixi:
+#   curl -fsSL https://pixi.sh/install.sh | bash
+#   pixi install
+#   pixi run download-model
+#
+# See pyproject.toml for the canonical dependency specification.
+# ============================================================================
+
 --extra-index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ # https://github.com/microsoft/onnxruntime/issues/21684
 conformer==0.3.2
