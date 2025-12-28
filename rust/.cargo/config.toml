@@ -1,0 +1,9 @@
+# Cargo configuration for CosyVoice Rust components
+#
+# This configures the build environment for PyO3 to find the correct Python.
+
+[env]
+# Point PyO3 to pixi's Python for compilation.
+# This allows running 'cargo build' without 'pixi run' wrapper.
+# The path is relative to the workspace root (rust/ directory).
+PYO3_PYTHON = { value = "../.pixi/envs/default/bin/python", relative = true }
