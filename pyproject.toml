@@ -50,12 +50,14 @@ pytorch-cuda = ">=12.1"
 torchaudio = ">=2.3.0"
 sox = "*"
 libsndfile = "*"
+ffmpeg = ">=6.0"
+openh264 = "*"
 
 [tool.pixi.pypi-dependencies]
 # Core ML dependencies
 conformer = ">=0.3.2"
 diffusers = ">=0.29.0"
-transformers = ">=4.51.3"
+transformers = "==4.51.3"
 x-transformers = ">=2.11.24"
 
 # Audio processing

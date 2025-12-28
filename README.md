@@ -105,6 +105,14 @@ pip install ttsfrd_dependency-0.1-py3-none-any.whl
 pip install ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl
 ```
 
+## Troubleshooting
+
+### Known Issues
+
+- **Garbled Audio Output**: If you experience garbled or unintelligible audio (especially for English), ensure you are using `transformers==4.51.3`. Newer versions (e.g., 4.54+) effectively break the multilingual capabilities of this model. This repository's `pyproject.toml` pins this specific version automatically to prevent this issue.
+
+- **Language Confusion**: For zero-shot voice cloning, it is recommended to add an explicit instruction to the prompt text, e.g., `"You are a helpful assistant. Please speak in English.<|endofprompt|>"`.
+
 ## Basic Usage
 
 ### Voice Cloning Example

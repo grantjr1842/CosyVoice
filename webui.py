@@ -37,13 +37,13 @@ from cosyvoice.utils.file_utils import logging
 # Inference Modes for Fun-CosyVoice3
 # =============================================================================
 
-inference_mode_list = ["3s极速复刻", "跨语种复刻", "自然语言控制"]
+inference_mode_list = ["3s Zero-Shot", "Cross-Lingual", "Instruct"]
 instruct_dict = {
-    "3s极速复刻": "1. 选择prompt音频文件，或录入prompt音频，注意不超过30s，若同时提供，优先选择prompt音频文件\n2. 输入prompt文本\n3. 点击生成音频按钮",
-    "跨语种复刻": "1. 选择prompt音频文件，或录入prompt音频，注意不超过30s，若同时提供，优先选择prompt音频文件\n2. 点击生成音频按钮",
-    "自然语言控制": "1. 选择prompt音频文件\n2. 输入instruct文本（控制语言、情感、语速等）\n3. 点击生成音频按钮",
+    "3s Zero-Shot": "1. Select prompt audio file or record it. Note: Max 30s. If both provided, file takes precedence.\n2. Enter prompt text.\n3. Click Generate Audio button.",
+    "Cross-Lingual": "1. Select prompt audio file or record it. Note: Max 30s. If both provided, file takes precedence.\n2. Click Generate Audio button.",
+    "Instruct": "1. Select prompt audio file.\n2. Enter instruct text (control language, emotion, speed, etc.).\n3. Click Generate Audio button.",
 }
-stream_mode_list = [("否", False), ("是", True)]
+stream_mode_list = [("No", False), ("Yes", True)]
 max_val = 0.8
 
 
@@ -75,49 +75,51 @@ def generate_audio(
         prompt_wav = None
 
     # Validation for instruction mode
-    if mode_checkbox_group == "自然语言控制":
+    if mode_checkbox_group == "Instruct":
         if instruct_text == "":
-            gr.Warning("您正在使用自然语言控制模式, 请输入instruct文本")
+            gr.Warning("You are using Instruct Mode, please enter instruct text")
             yield (cosyvoice.sample_rate, default_data)
             return
         if prompt_wav is None:
-            gr.Warning("请提供prompt音频")
+            gr.Warning("Please provide prompt audio")
             yield (cosyvoice.sample_rate, default_data)
             return
 
     # Validation for cross-lingual mode
-    if mode_checkbox_group == "跨语种复刻":
+    if mode_checkbox_group == "Cross-Lingual":
         if instruct_text != "":
-            gr.Info("您正在使用跨语种复刻模式, instruct文本会被忽略")
+            gr.Info("You are using Cross-Lingual Mode, instruct text will be ignored")
         if prompt_wav is None:
-            gr.Warning("您正在使用跨语种复刻模式, 请提供prompt音频")
+            gr.Warning("You are using Cross-Lingual Mode, please provide prompt audio")
             yield (cosyvoice.sample_rate, default_data)
             return
-        gr.Info("您正在使用跨语种复刻模式, 请确保合成文本和prompt文本为不同语言")
+        gr.Info(
+            "You are using Cross-Lingual Mode, please ensure synth text and prompt text are different languages"
+        )
 
     # Validation for zero-shot mode
-    if mode_checkbox_group == "3s极速复刻":
+    if mode_checkbox_group == "3s Zero-Shot":
         if prompt_wav is None:
-            gr.Warning("prompt音频为空，您是否忘记输入prompt音频？")
+            gr.Warning("Prompt audio is empty, did you forget to upload it?")
             yield (cosyvoice.sample_rate, default_data)
             return
         if torchaudio.info(prompt_wav).sample_rate < prompt_sr:
             gr.Warning(
-                "prompt音频采样率{}低于{}".format(
+                "Prompt audio sample rate {} is lower than {}".format(
                     torchaudio.info(prompt_wav).sample_rate, prompt_sr
                 )
             )
             yield (cosyvoice.sample_rate, default_data)
             return
         if prompt_text == "":
-            gr.Warning("prompt文本为空，您是否忘记输入prompt文本？")
+            gr.Warning("Prompt text is empty, did you forget to enter it?")
             yield (cosyvoice.sample_rate, default_data)
             return
         if instruct_text != "":
-            gr.Info("您正在使用3s极速复刻模式，instruct文本会被忽略！")
+            gr.Info("You are using 3s Zero-Shot Mode, instruct text will be ignored!")
 
     # Run inference based on mode
-    if mode_checkbox_group == "3s极速复刻":
+    if mode_checkbox_group == "3s Zero-Shot":
         logging.info("get zero_shot inference request")
         set_all_random_seed(seed)
         # Add prompt prefix for better quality
@@ -126,7 +128,7 @@ def generate_audio(
             tts_text, full_prompt_text, prompt_wav, stream=stream, speed=speed
         ):
             yield (cosyvoice.sample_rate, i["tts_speech"].numpy().flatten())
-    elif mode_checkbox_group == "跨语种复刻":
+    elif mode_checkbox_group == "Cross-Lingual":
         logging.info("get cross_lingual inference request")
         set_all_random_seed(seed)
         # Add prompt prefix for better quality
@@ -135,7 +137,7 @@ def generate_audio(
             full_tts_text, prompt_wav, stream=stream, speed=speed
         ):
             yield (cosyvoice.sample_rate, i["tts_speech"].numpy().flatten())
-    else:  # 自然语言控制
+    else:  # Instruct Mode
         logging.info("get instruct inference request")
         set_all_random_seed(seed)
         for i in cosyvoice.inference_instruct2(
@@ -147,72 +149,76 @@ def generate_audio(
 def main():
     with gr.Blocks() as demo:
         gr.Markdown("""
-        ### Fun-CosyVoice3 语音合成
+        ### Fun-CosyVoice3 Speech Synthesis
 
-        🎤 **Fun-CosyVoice3-0.5B-2512** - 最新一代语音合成模型
+        🎤 **Fun-CosyVoice3-0.5B-2512** - Latest Generation Speech Synthesis Model
 
         [GitHub](https://github.com/FunAudioLLM/CosyVoice) |
         [ModelScope](https://www.modelscope.cn/models/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) |
         [HuggingFace](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) |
-        [论文](https://arxiv.org/pdf/2505.17589)
+        [Paper](https://arxiv.org/pdf/2505.17589)
         """)
-        gr.Markdown("#### 请输入需要合成的文本，选择推理模式，并按照提示步骤进行操作")
+        gr.Markdown(
+            "#### Please enter text to synthesize, choose inference mode, and follow the steps below"
+        )
 
         tts_text = gr.Textbox(
-            label="输入合成文本",
+            label="Input Text",
             lines=1,
-            value="我是通义实验室语音团队全新推出的生成式语音大模型，提供舒适自然的语音合成能力。",
+            value="I am a new generative speech model launched by the Tongyi Lab Speech Team, providing comfortable and natural speech synthesis capabilities.",
         )
         with gr.Row():
             mode_checkbox_group = gr.Radio(
                 choices=inference_mode_list,
-                label="选择推理模式",
+                label="Inference Mode",
                 value=inference_mode_list[0],
             )
             instruction_text = gr.Text(
-                label="操作步骤", value=instruct_dict[inference_mode_list[0]], scale=0.5
+                label="Instructions",
+                value=instruct_dict[inference_mode_list[0]],
+                scale=0.5,
             )
             stream = gr.Radio(
                 choices=stream_mode_list,
-                label="是否流式推理",
+                label="Stream Inference",
                 value=stream_mode_list[0][1],
             )
             speed = gr.Number(
                 value=1,
-                label="速度调节(仅支持非流式推理)",
+                label="Speed Adjustment (Non-streaming only)",
                 minimum=0.5,
                 maximum=2.0,
                 step=0.1,
             )
             with gr.Column(scale=0.25):
                 seed_button = gr.Button(value="\U0001f3b2")
-                seed = gr.Number(value=0, label="随机推理种子")
+                seed = gr.Number(value=0, label="Random Seed")
 
         with gr.Row():
             prompt_wav_upload = gr.Audio(
                 sources="upload",
                 type="filepath",
-                label="选择prompt音频文件，注意采样率不低于16khz",
+                label="Select prompt audio file (Sample rate >= 16kHz)",
             )
             prompt_wav_record = gr.Audio(
-                sources="microphone", type="filepath", label="录制prompt音频文件"
+                sources="microphone", type="filepath", label="Record prompt audio"
             )
         prompt_text = gr.Textbox(
-            label="输入prompt文本",
+            label="Input Prompt Text",
             lines=1,
-            placeholder="请输入prompt文本，需与prompt音频内容一致，暂时不支持自动识别...",
+            placeholder="Please enter prompt text (must match audio content). Automatic recognition not supported yet...",
             value="",
         )
         instruct_text = gr.Textbox(
-            label="输入instruct文本（自然语言控制模式）",
+            label="Input Instruct Text",
             lines=1,
-            placeholder="例如：请用广东话说这句话<|endofprompt|>",
+            placeholder="Example: Please speak this in Cantonese <|endofprompt|>",
             value="",
         )
 
-        generate_button = gr.Button("生成音频")
+        generate_button = gr.Button("Generate Audio")
 
-        audio_output = gr.Audio(label="合成音频", autoplay=True, streaming=True)
+        audio_output = gr.Audio(label="Generated Audio", autoplay=True, streaming=True)
 
         seed_button.click(generate_seed, inputs=[], outputs=seed)
         generate_button.click(

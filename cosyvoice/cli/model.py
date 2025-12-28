@@ -31,7 +31,11 @@ import torch
 from torch.nn import functional as F
 
 from cosyvoice.utils.common import TrtContextWrapper
-from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
+from cosyvoice.utils.file_utils import (
+    convert_onnx_to_trt,
+    export_cosyvoice2_vllm,
+    logging,
+)
 
 
 class CosyVoice3Model:
@@ -88,6 +92,23 @@ class CosyVoice3Model:
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(self.device).eval()
+
+        # Apply torch.compile for performance
+        if hasattr(torch, "compile"):
+            from cosyvoice.utils.gpu_optimizer import GpuOptimizer
+
+            optimizer = GpuOptimizer()
+            compile_mode = optimizer.suggest_compile_mode()
+
+            logging.info(
+                f"Applying torch.compile to models with mode='{compile_mode}'..."
+            )
+
+            # We use the suggested mode
+            self.llm = torch.compile(self.llm, mode=compile_mode)
+
+            self.flow = torch.compile(self.flow, mode=compile_mode)
+            self.hift = torch.compile(self.hift, mode=compile_mode)
 
     def load_vllm(self, model_dir):
         """Load vLLM for accelerated inference."""
@@ -214,6 +235,7 @@ class CosyVoice3Model:
     ):
         """Convert speech tokens to waveform."""
         with torch.cuda.amp.autocast(self.fp16):
+            # timer for flow
             tts_mel, _ = self.flow.inference(
                 token=token.to(self.device, dtype=torch.int32),
                 token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(
@@ -231,12 +253,12 @@ class CosyVoice3Model:
                 streaming=stream,
                 finalize=finalize,
             )
+
             tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio :]
             # append mel cache
             if self.hift_cache_dict[uuid] is not None:
                 hift_cache_mel = self.hift_cache_dict[uuid]["mel"]
                 tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
-                self.hift_cache_dict[uuid]["mel"] = tts_mel
             else:
                 self.hift_cache_dict[uuid] = {"mel": tts_mel, "speech_offset": 0}
             if speed != 1.0:
@@ -246,11 +268,15 @@ class CosyVoice3Model:
                 tts_mel = F.interpolate(
                     tts_mel, size=int(tts_mel.shape[2] / speed), mode="linear"
                 )
+
+            # timer for hift
             tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+
             tts_speech = tts_speech[:, self.hift_cache_dict[uuid]["speech_offset"] :]
             self.hift_cache_dict[uuid]["speech_offset"] += tts_speech.shape[1]
         return tts_speech
 
+    @torch.inference_mode()
     def tts(
         self,
         text=torch.zeros(1, 0, dtype=torch.int32),
@@ -315,7 +341,8 @@ class CosyVoice3Model:
                 - flow_prompt_speech_token.shape[1]
             )
             while True:
-                time.sleep(0.1)
+                # Reduced sleep time for lower latency
+                time.sleep(0.01)
                 this_token_hop_len = (
                     self.token_hop_len + prompt_token_pad
                     if token_offset == 0

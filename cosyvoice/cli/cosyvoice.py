@@ -30,6 +30,7 @@ from tqdm import tqdm
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoice3Model
 from cosyvoice.utils.file_utils import logging
+from cosyvoice.utils.gpu_optimizer import GpuOptimizer
 
 
 class CosyVoice3:
@@ -53,7 +54,7 @@ class CosyVoice3:
     """
 
     def __init__(
-        self, model_dir, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1
+        self, model_dir, load_trt=False, load_vllm=False, fp16=None, trt_concurrent=1
     ):
         """
         Initialize CosyVoice3.
@@ -62,9 +63,15 @@ class CosyVoice3:
             model_dir: Path to model directory or ModelScope model ID
             load_trt: Load TensorRT engine for accelerated inference
             load_vllm: Load vLLM for accelerated LLM inference
-            fp16: Use FP16 precision
+            fp16: Use FP16 precision. If None, it will be auto-detected based on GPU capabilities.
             trt_concurrent: Number of concurrent TRT contexts
         """
+        if fp16 is None:
+            optimizer = GpuOptimizer()
+            params = optimizer.suggest_parameters()
+            fp16 = params.get("fp16", False)
+            logging.info(f"Auto-configured parameters: fp16={fp16}")
+
         self.model_dir = model_dir
         self.fp16 = fp16
         if not os.path.exists(model_dir):
@@ -198,9 +205,11 @@ class CosyVoice3:
                 **model_input, stream=stream, speed=speed
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
+                inference_time = time.time() - start_time
+                rtf = inference_time / speech_len
                 logging.info(
-                    "yield speech len {}, rtf {}".format(
-                        speech_len, (time.time() - start_time) / speech_len
+                    "yield speech len {:.2f}s, inference time {:.3f}s, rtf {:.3f}".format(
+                        speech_len, inference_time, rtf
                     )
                 )
                 yield model_output
@@ -324,6 +333,15 @@ def AutoModel(**kwargs):
     """
     if not os.path.exists(kwargs["model_dir"]):
         kwargs["model_dir"] = snapshot_download(kwargs["model_dir"])
+
+    # Auto-enable TensorRT if ONNX model exists
+    onnx_path = os.path.join(kwargs["model_dir"], "flow.decoder.estimator.fp32.onnx")
+    if "load_trt" not in kwargs and os.path.exists(onnx_path):
+        logging.info(
+            "Detected ONNX model at {}. Enabling TensorRT loading.".format(onnx_path)
+        )
+        kwargs["load_trt"] = True
+
     if os.path.exists("{}/cosyvoice3.yaml".format(kwargs["model_dir"])):
         return CosyVoice3(**kwargs)
     else:
