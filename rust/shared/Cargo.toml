@@ -1,0 +1,12 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "shared"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

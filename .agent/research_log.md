@@ -1,47 +1,110 @@
-# Research Log: Advanced Optimizations Implementation
+# Research Log: Rust TTS Server & Client
 
 ## Date: 2025-12-27
 
 ## Request
-Enable advanced optimizations using `bitsandbytes`, `accelerate`, and `flash-attn` packages.
+Create a native Rust text-to-speech server and client with maximum performance.
 
-## Findings
+---
 
-### Package Installation Status ✅
+## Previous Research (Preserved)
+
+### Advanced Optimizations (2025-12-27)
 | Package | Version |
 |---------|---------|
 | bitsandbytes | 0.49.0 |
 | accelerate | 1.12.0 |
 | flash-attn | 2.8.3 |
 
-### Existing Optimization Infrastructure
+---
 
-#### 1. `cosyvoice/llm/llm.py` - Qwen2Encoder (lines 302-339)
-Already integrates:
-- **BitsAndBytesConfig**: Imports and applies quantization config from `GpuOptimizer.suggest_quantization()`
-- **FlashAttention-2**: Detects `flash_attn` and sets `attn_implementation="flash_attention_2"`
+## Native Rust TTS Options Researched
 
-#### 2. `cosyvoice/utils/gpu_optimizer.py` - GpuOptimizer
-Provides:
-- `suggest_parameters()`: FP16 recommendations based on compute capability
-- `suggest_compile_mode()`: Recommends torch.compile mode based on VRAM
-- `suggest_quantization()`: Returns 4-bit/8-bit config based on VRAM
+### 1. sherpa-rs (RECOMMENDED) ⭐
+- **Crate**: `sherpa-rs` → bindings to `sherpa-onnx`
+- **TTS Model**: **Kokoro TTS** (82M params, quantized ~40MB)
+- **Inference**: ONNX Runtime via native C++ bindings
+- **Features**: Supports TTS, STT, speaker embedding, diarization
+- **Performance**: Near real-time on CPU, significantly faster with GPU
+- **Platforms**: Windows, Linux, macOS, Android, iOS
 
-#### 3. `cosyvoice/cli/model.py` - CosyVoice3Model
-- Lines 96-111: Applies `torch.compile` with mode from `GpuOptimizer`
+### 2. piper-rs
+- Pure Rust Piper TTS implementation
+- Uses `ort` crate for ONNX Runtime
+- G2P via `mini-bart-g2p` (no espeak-ng dependency)
+- ~120ms generation for 1.9s audio on Intel i5
 
-### Existing Tests
-- `tools/test_gpu_optimizer.py`: Unit tests for GpuOptimizer with mocked GPU properties
-- `benchmark_performance.py`: End-to-end benchmark measuring FTL, RTF, throughput
+### 3. rten (Rust Tensor Engine)
+- Pure Rust ONNX inference engine
+- CPU-only with SIMD (AVX2, AVX-512, NEON, WASM SIMD)
+- Actively working toward ONNX Runtime parity
+- Can run Piper models in pure Rust
 
-## Gaps Identified
+### 4. tts crate
+- High-level cross-platform TTS interface
+- Uses OS native backends (SAPI, Speech Dispatcher, AppKit)
+- Not ML-based, simpler but less flexible
 
-1. **No explicit test for optimization packages being used** - The code checks `import` but doesn't explicitly verify functionality
-2. **No logging of which optimizations are active** - Users have no visibility into applied optimizations
-3. **Consider adding accelerate for model loading** - Currently not directly used
+---
 
-## Recommendations
+## Architecture Decision
 
-1. Add a summary log at model load time showing active optimizations
-2. Run benchmark to verify packages are working
-3. Commit dependency changes to repository
+**Selected**: `sherpa-rs` with Kokoro TTS model
+
+**Rationale**:
+1. **Best performance**: Leverages ONNX Runtime's optimized C++ backend
+2. **Production-ready**: Active development, well-documented API
+3. **Model quality**: Kokoro TTS has excellent voice quality
+4. **Streaming support**: WebSocket streaming available
+5. **Multi-platform**: Single codebase works across OS targets
+
+---
+
+## Performance Optimizations Identified
+
+### Server-Side
+| Optimization | Implementation |
+|--------------|----------------|
+| Memory allocator | `tikv-jemallocator` for reduced fragmentation |
+| Async runtime | `tokio` multi-threaded runtime |
+| HTTP framework | `axum` (tower-based, zero-copy) |
+| Connection pooling | Keep-alive enabled by default |
+| Request batching | Optional concurrent synthesis |
+| Audio encoding | Stream raw PCM, client-side WAV encoding |
+
+### Client-Side
+| Optimization | Implementation |
+|--------------|----------------|
+| Async HTTP | `reqwest` with connection reuse |
+| Stream decoding | Process audio chunks as received |
+| Zero-copy I/O | `bytes` crate for buffer management |
+
+---
+
+## Model Download URLs
+
+Kokoro TTS ONNX models available from sherpa-onnx releases:
+- Base: `kokoro-v1-multi.onnx` (~330MB)
+- Quantized int8: `kokoro-v1-multi.int8.onnx` (~85MB)
+- Voices: Multiple included (American English, British English)
+
+---
+
+## Dependencies Summary
+
+```toml
+# Server
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sherpa-rs = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+tikv-jemallocator = "0.6"
+
+# Client
+reqwest = { version = "0.12", features = ["stream"] }
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"  # WAV encoding
+```

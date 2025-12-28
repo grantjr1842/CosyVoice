@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "server",
+    "client",
+    "shared",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Grant <grant@example.com>"]
+license = "MIT"
+
+[workspace.dependencies]
+# Shared
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Python bridge
+pyo3 = { version = "0.23", features = ["auto-initialize"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Audio
+hound = "3.5"
+
+# Logging & Metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Memory allocator
+tikv-jemallocator = "0.6"
+
+# Utilities
+num_cpus = "1.16"
+anyhow = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true

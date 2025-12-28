@@ -41,10 +41,16 @@ tensorboard
 .cache
 compile_commands.json
 
-# train/inference files
+# rust build files
+rust/target/
+
+# audio files
 *.wav
 *.m4a
 *.aac
+*.mp3
+
+# train/inference files
 *.pt
 pretrained_models/*
 *_pb2_grpc.py
