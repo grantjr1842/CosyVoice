@@ -24,6 +24,7 @@ tikv-jemallocator.workspace = true
 thiserror.workspace = true
 hound.workspace = true
 anyhow.workspace = true
+dotenvy.workspace = true
 
 # Additional
 bytes = "1.9"

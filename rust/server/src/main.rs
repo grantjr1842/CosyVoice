@@ -38,6 +38,14 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file from current directory (project root)
+    // start-server.sh cd's to project root before running binary
+    match dotenvy::from_filename(".env") {
+        Ok(path) => eprintln!("Loaded environment from: {}", path.display()),
+        Err(e) if e.not_found() => eprintln!("No .env file found (this is OK)"),
+        Err(e) => eprintln!("Warning: Could not load .env: {}", e),
+    }
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_target(true))

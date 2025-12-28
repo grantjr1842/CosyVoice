@@ -50,6 +50,11 @@ rust/target/
 *.aac
 *.mp3
 
+# output directory (keep structure, ignore generated files)
+output/*
+!output/.gitkeep
+!output/README.md
+
 # train/inference files
 *.pt
 pretrained_models/*

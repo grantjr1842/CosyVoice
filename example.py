@@ -20,6 +20,7 @@ The default reference voice is the interstellar-tars voice clip.
 """
 
 import sys
+from pathlib import Path
 
 sys.path.append("third_party/Matcha-TTS")
 
@@ -30,6 +31,9 @@ from cosyvoice.cli.cosyvoice import AutoModel
 # =============================================================================
 # Default Voice Cloning Configuration
 # =============================================================================
+
+# Output directory for generated audio files
+OUTPUT_DIR = Path("output")
 
 # Reference voice clip for voice cloning
 DEFAULT_PROMPT_WAV = "./asset/interstellar-tars-01-resemble-denoised.wav"
@@ -79,8 +83,11 @@ def voice_cloning_example():
                 tts_text, full_prompt_text, DEFAULT_PROMPT_WAV, stream=False
             )
         ):
-            output_path = f"output_voice_clone_{idx}_{i}.wav"
-            torchaudio.save(output_path, output["tts_speech"], cosyvoice.sample_rate)
+            OUTPUT_DIR.mkdir(exist_ok=True)
+            output_path = OUTPUT_DIR / f"voice_clone_{idx}_{i}.wav"
+            torchaudio.save(
+                str(output_path), output["tts_speech"], cosyvoice.sample_rate
+            )
             print(f"   💾 Saved: {output_path}")
 
     print("\n✨ Voice cloning complete!")
