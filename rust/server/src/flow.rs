@@ -76,10 +76,49 @@ impl AdaLayerNormZero {
         let shift = shift.unsqueeze(1)?;
         let scale = scale.unsqueeze(1)?;
 
+        let x = self.norm.forward(x)?;
         let x = x.broadcast_mul(&(scale.affine(1.0, 1.0)?))?;
         let x = x.broadcast_add(&shift)?;
-        let x = self.norm.forward(&x)?;
         x.broadcast_mul(&gate)
+    }
+}
+
+pub struct AdaLayerNormZeroFinal {
+    pub norm: LayerNorm,
+    pub linear: Linear,
+    pub silu: candle_nn::Activation,
+}
+
+impl AdaLayerNormZeroFinal {
+    pub fn new(vb: VarBuilder, dim: usize) -> Result<Self> {
+        // Python: elementwise_affine=False, so no weights/bias.
+        // candle LayerNorm requires Tensors. We create them manually (weight=1, bias=0).
+        let device = vb.device();
+        let weight = Tensor::ones((dim,), DType::F32, device)?;
+        let bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let norm = LayerNorm::new(weight, bias, 1e-6);
+
+        let linear = linear(dim, dim * 2, vb.pp("linear"))?;
+        Ok(Self {
+            norm,
+            linear,
+            silu: candle_nn::Activation::Silu,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor, emb: &Tensor) -> Result<Tensor> {
+        let emb = self.linear.forward(&emb.apply(&self.silu)?)?;
+        let chunks = emb.chunk(2, 1)?;
+        let (scale, shift) = (&chunks[0], &chunks[1]);
+
+        let scale = scale.unsqueeze(1)?;
+        let shift = shift.unsqueeze(1)?;
+
+        let x = self.norm.forward(x)?;
+
+
+        x.broadcast_mul(&(scale.affine(1.0, 1.0)?))?
+            .broadcast_add(&shift)
     }
 }
 
@@ -137,7 +176,13 @@ impl DiTBlock {
 
         eprintln!("DIT MLP ADD: res_mlp={:?}, x_mlp={:?}, gate_mlp={:?}", res_mlp.shape(), x_mlp.shape(), gate_mlp.shape());
         let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
+        let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
         let x = res_mlp.broadcast_add(&mul_mlp)?;
+
+        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
+        let sum: f32 = x_vec.iter().sum();
+        let mean = sum / x_vec.len() as f32;
+        eprintln!("DIT BLOCK mean={}, first 5={:?}", mean, &x_vec[0..5]);
 
         Ok(x)
     }
@@ -146,7 +191,7 @@ impl DiTBlock {
 pub struct FeedForward {
     project_in: Linear,
     project_out: Linear,
-    silu: candle_nn::Activation,
+    act: candle_nn::Activation,
 }
 
 impl FeedForward {
@@ -157,12 +202,12 @@ impl FeedForward {
         Ok(Self {
             project_in,
             project_out,
-            silu: candle_nn::Activation::Silu,
+            act: candle_nn::Activation::NewGelu,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.apply(&self.project_in)?.apply(&self.silu)?.apply(&self.project_out)
+        x.apply(&self.project_in)?.apply(&self.act)?.apply(&self.project_out)
     }
 }
 
@@ -229,23 +274,32 @@ impl Attention {
 pub fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (b, h, n, d) = x.dims4()?;
 
-    // Python implementation in CosyVoice uses x_transformers which behaves peculiarly:
-    // It is called with [B, N, H*D] and frequencies [N, D].
-    // This results in valid rotation ONLY for the first D elements (Head 0)
-    // and leaves the rest (Heads 1..H) unchanged.
-    // We must replicate this behavior for parity.
-
     // Split into Head 0 and others
     let x_h0 = x.narrow(1, 0, 1)?; // [B, 1, N, D]
     let x_rest = x.narrow(1, 1, h - 1)?; // [B, H-1, N, D]
 
     // Rotate Head 0
+    // x_transformers matches frequencies to input shape by right-aligning
+    // and uses [cos, cos, sin, sin] but interleave in pairs.
+    // Actually x_transformers stack((freqs, freqs), -1).flatten(-2) -> [f1, f1, f2, f2]
+    // And rotate_half: [-x2, x1, -x4, x3]
+
+    // x_h0: [B, 1, N, D]
+    // freqs (cos/sin): [1, 1, N, D]
+
     let cos = cos.narrow(0, 0, n)?.unsqueeze(0)?.unsqueeze(0)?;
     let sin = sin.narrow(0, 0, n)?.unsqueeze(0)?.unsqueeze(0)?;
 
-    let x1 = x_h0.narrow(3, 0, d / 2)?;
-    let x2 = x_h0.narrow(3, d / 2, d / 2)?;
-    let rotate_x = Tensor::cat(&[&x2.neg()?, &x1], 3)?;
+    // GPT-J style rotation: adjacent pairs
+    // Reshape [B, 1, N, D/2, 2]
+    let x_reshaped = x_h0.reshape((b, 1, n, d / 2, 2))?;
+
+    // x1 = x[..., 0], x2 = x[..., 1]
+    let x1 = x_reshaped.narrow(4, 0, 1)?;
+    let x2 = x_reshaped.narrow(4, 1, 1)?;
+
+    // rotate_x = [-x2, x1]
+    let rotate_x = Tensor::cat(&[&x2.neg()?, &x1], 4)?.flatten_from(3)?; // Back to [B, 1, N, D]
 
     let x_cos = x_h0.broadcast_mul(&cos)?;
     let rot_sin = rotate_x.broadcast_mul(&sin)?;
@@ -266,7 +320,14 @@ impl RotaryEmbedding {
         let freqs = Tensor::from_vec(freqs, (1, dim / 2), device)?;
         let t = Tensor::arange(0.0f32, max_seq_len as f32, device)?.reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&freqs)?;
-        let freqs = Tensor::cat(&[&freqs, &freqs], 1)?;
+
+        // Interleave frequencies: [f1, f1, f2, f2, ...]
+        // freqs: [Seq, Dim/2]
+        // unsqueeze(-1) -> [Seq, Dim/2, 1]
+        // repeat -> [Seq, Dim/2, 2]
+        // flatten -> [Seq, Dim]
+        let freqs = freqs.unsqueeze(2)?.repeat((1, 1, 2))?.flatten_from(1)?;
+
         Ok(Self {
             cos: freqs.cos()?,
             sin: freqs.sin()?,
@@ -324,7 +385,10 @@ impl CausalConvPositionEmbedding {
         // So weights are conv1.0.weight.
         let conv1 = candle_nn::conv1d(dim, dim, 31, conv_cfg, vb.pp("conv1.0"))?;
         let conv2 = candle_nn::conv1d(dim, dim, 31, conv_cfg, vb.pp("conv2.0"))?;
-        Ok(Self { conv1, conv2 })
+        Ok(Self {
+            conv1,
+            conv2,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -333,11 +397,11 @@ impl CausalConvPositionEmbedding {
 
         // Pad left by kernel_size - 1 = 30
         let x = x.pad_with_zeros(2, 30, 0)?;
-        let x = self.conv1.forward(&x)?;
+        let x = x.apply(&self.conv1)?;
         let x = mish(&x)?;
 
         let x = x.pad_with_zeros(2, 30, 0)?;
-        let x = self.conv2.forward(&x)?;
+        let x = x.apply(&self.conv2)?;
         let x = mish(&x)?;
 
         x.transpose(1, 2) // [B, N, D]
@@ -371,7 +435,7 @@ pub struct DiT {
     input_embed: InputEmbedding,
     time_embed: TimestepEmbedding,
     transformer_blocks: Vec<DiTBlock>,
-    pub norm_out: AdaLayerNormZero,
+    pub norm_out: AdaLayerNormZeroFinal,
     proj_out: Linear,
     rotary_embed: RotaryEmbedding,
 }
@@ -385,7 +449,7 @@ impl DiT {
         for i in 0..cfg.depth {
             transformer_blocks.push(DiTBlock::new(vb_blocks.pp(i), cfg.dim, cfg.heads, cfg.dim_head)?);
         }
-        let norm_out = AdaLayerNormZero::new(vb.pp("norm_out"), cfg.dim)?;
+        let norm_out = AdaLayerNormZeroFinal::new(vb.pp("norm_out"), cfg.dim)?;
         let proj_out = linear(cfg.dim, cfg.mel_dim, vb.pp("proj_out"))?;
         let rotary_embed = RotaryEmbedding::new(cfg.dim_head, 4096, vb.device())?;
         Ok(Self {
@@ -401,6 +465,11 @@ impl DiT {
     pub fn forward(&self, x: &Tensor, mask: &Tensor, mu: &Tensor, t: &Tensor, spks: &Tensor, cond: &Tensor) -> Result<Tensor> {
         eprintln!("DIT START: x={:?}, mask={:?}, mu={:?}, t={:?}, spks={:?}, cond={:?}", x.shape(), mask.shape(), mu.shape(), t.shape(), spks.shape(), cond.shape());
         let x = self.input_embed.forward(x, cond, mu, spks)?;
+        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
+        // Calculate mean and std manually or just print first few
+        let sum: f32 = x_vec.iter().sum();
+        let mean = sum / x_vec.len() as f32;
+        eprintln!("Rust InputEmbed output: mean={}, first 5={:?}", mean, &x_vec[0..5]);
         eprintln!("DIT: after input_embed x={:?}", x.shape());
         // TimestepEmbedding handles sinusoidal embedding internally now
         let t_emb = self.time_embed.forward(t)?;
@@ -417,9 +486,22 @@ impl DiT {
 
         eprintln!("DIT: before norm_out x={:?}, t_emb={:?}", x.shape(), t_emb.shape());
         std::io::Write::flush(&mut std::io::stderr()).unwrap();
+        std::io::Write::flush(&mut std::io::stderr()).unwrap();
         x = self.norm_out.forward(&x, &t_emb)?;
-        eprintln!("DIT: after norm_out x={:?}", x.shape());
-        self.proj_out.forward(&x)?.transpose(1, 2)
+
+        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
+        let sum: f32 = x_vec.iter().sum();
+        let mean = sum / x_vec.len() as f32;
+        eprintln!("DIT NORM_OUT mean={}, first 5={:?}", mean, &x_vec[0..5]);
+
+        let out = self.proj_out.forward(&x)?.transpose(1, 2)?;
+
+        let out_vec = out.flatten_all()?.to_vec1::<f32>()?;
+        let sum: f32 = out_vec.iter().sum();
+        let mean = sum / out_vec.len() as f32;
+        eprintln!("DIT FINAL mean={}, first 5={:?}", mean, &out_vec[0..5]);
+
+        Ok(out)
     }
 }
 
