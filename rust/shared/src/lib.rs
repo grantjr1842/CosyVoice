@@ -61,7 +61,7 @@ pub mod config {
     /// Server version.
     pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     /// Default model directory.
-    pub const DEFAULT_MODEL_DIR: &str = "pretrained_models/CosyVoice2-0.5B";
+    pub const DEFAULT_MODEL_DIR: &str = "pretrained_models/Fun-CosyVoice3-0.5B";
 }
 
 #[cfg(test)]

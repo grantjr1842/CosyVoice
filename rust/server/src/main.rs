@@ -38,8 +38,11 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load .env file from current directory (project root)
-    // start-server.sh cd's to project root before running binary
+    // Auto-configure LD_LIBRARY_PATH if needed (must happen before PyO3 loads)
+    // This allows running the binary directly without the shell wrapper
+    ensure_library_path()?;
+
+    // Load .env file for other environment variables
     match dotenvy::from_filename(".env") {
         Ok(path) => eprintln!("Loaded environment from: {}", path.display()),
         Err(e) if e.not_found() => eprintln!("No .env file found (this is OK)"),
@@ -274,4 +277,67 @@ async fn shutdown_signal() {
         _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
         _ = terminate => info!("Received SIGTERM, shutting down..."),
     }
+}
+
+/// Ensure LD_LIBRARY_PATH is set correctly for PyO3/libpython.
+///
+/// If the required library path is not in LD_LIBRARY_PATH, this function:
+/// 1. Loads .env to get LD_LIBRARY_PATH_EXTRA
+/// 2. Sets LD_LIBRARY_PATH with the correct path
+/// 3. Re-executes through pixi to set up Python environment
+///
+/// This allows running the server binary directly without the shell wrapper.
+fn ensure_library_path() -> anyhow::Result<()> {
+    // Check if we've already re-executed (prevent infinite loop)
+    if env::var("_COSYVOICE_REEXEC").is_ok() {
+        return Ok(());
+    }
+
+    // Get current working directory for resolving relative paths
+    let cwd = env::current_dir()?;
+
+    // Load .env to get library path configuration
+    let _ = dotenvy::from_filename(".env");
+
+    // Get the extra library path from .env (default to pixi env)
+    let lib_path_extra = env::var("LD_LIBRARY_PATH_EXTRA")
+        .unwrap_or_else(|_| ".pixi/envs/default/lib".to_string());
+
+    // Resolve to absolute path
+    let lib_path_abs = cwd.join(&lib_path_extra);
+    let lib_path_str = lib_path_abs.to_string_lossy();
+
+    // Check if LD_LIBRARY_PATH already contains this path AND we're in pixi
+    let current_ld_path = env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let in_pixi = env::var("CONDA_SHLVL").map(|v| v != "0").unwrap_or(false);
+
+    if current_ld_path.contains(&*lib_path_str) && in_pixi {
+        return Ok(()); // Already configured and in pixi
+    }
+
+    // Build new LD_LIBRARY_PATH
+    let new_ld_path = if current_ld_path.is_empty() {
+        lib_path_str.to_string()
+    } else if !current_ld_path.contains(&*lib_path_str) {
+        format!("{}:{}", lib_path_str, current_ld_path)
+    } else {
+        current_ld_path.clone()
+    };
+
+    eprintln!("Configuring environment via pixi run...");
+
+    // Re-execute through pixi to get proper Python environment
+    let exe = env::current_exe()?;
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    let status = std::process::Command::new("pixi")
+        .arg("run")
+        .arg(&exe)
+        .args(&args)
+        .env("LD_LIBRARY_PATH", &new_ld_path)
+        .env("_COSYVOICE_REEXEC", "1")
+        .current_dir(&cwd)
+        .status()?;
+
+    std::process::exit(status.code().unwrap_or(1));
 }
