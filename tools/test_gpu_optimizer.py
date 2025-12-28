@@ -80,6 +80,46 @@ class TestGpuOptimizer(unittest.TestCase):
         # major=5. Conditions failed. Output False.
         self.assertFalse(params["fp16"])
 
+    @patch("cosyvoice.utils.gpu_optimizer.torch.cuda")
+    def test_low_vram_quantization(self, mock_cuda):
+        # Simulate very low VRAM (e.g., 2GB card)
+        mock_cuda.is_available.return_value = True
+        mock_cuda.device_count.return_value = 1
+        mock_props = MagicMock()
+        mock_props.total_memory = 3 * (1024**3)  # 3 GB
+        mock_cuda.get_device_properties.return_value = mock_props
+        mock_cuda.get_device_capability.return_value = (6, 1)
+
+        optimizer = GpuOptimizer()
+        quant_config = optimizer.suggest_quantization()
+
+        # Should be 4-bit
+        self.assertTrue(quant_config.get("load_in_4bit"))
+
+    @patch("cosyvoice.utils.gpu_optimizer.torch.cuda")
+    def test_matmul_precision_ampere(self, mock_cuda):
+        # Simulate Ampere (RTX 3090, capability 8.6)
+        mock_cuda.is_available.return_value = True
+        mock_cuda.device_count.return_value = 1
+        mock_cuda.get_device_capability.return_value = (8, 6)
+
+        optimizer = GpuOptimizer()
+        precision = optimizer.suggest_matmul_precision()
+
+        self.assertEqual(precision, "high")
+
+    @patch("cosyvoice.utils.gpu_optimizer.torch.cuda")
+    def test_matmul_precision_turing(self, mock_cuda):
+        # Simulate Turing (RTX 2070, capability 7.5) -> should be default
+        mock_cuda.is_available.return_value = True
+        mock_cuda.device_count.return_value = 1
+        mock_cuda.get_device_capability.return_value = (7, 5)
+
+        optimizer = GpuOptimizer()
+        precision = optimizer.suggest_matmul_precision()
+
+        self.assertEqual(precision, "default")
+
 
 if __name__ == "__main__":
     unittest.main()

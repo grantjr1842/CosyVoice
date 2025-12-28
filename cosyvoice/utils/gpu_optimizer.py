@@ -121,12 +121,28 @@ class GpuOptimizer:
 
         if self.vram_gb < 4:
             logging.info(
-                f"VRAM ({self.vram_gb:.2f}GB) < 4GB. Suggesting 8-bit quantization to fit in memory."
+                f"VRAM ({self.vram_gb:.2f}GB) < 4GB. Suggesting 4-bit quantization for maximum memory efficiency."
             )
-            return {"load_in_8bit": True}
+            return {"load_in_4bit": True}
 
         # For 4GB+ VRAM, FP16 is preferred for quality and often speed
         logging.info(
             f"VRAM ({self.vram_gb:.2f}GB) >= 4GB. Using FP16 (no quantization) for quality."
         )
         return None
+
+    def suggest_matmul_precision(self):
+        """
+        Suggests optimal matmul precision for Ampere+ GPUs.
+        """
+        if self.device_count == 0:
+            return "default"
+
+        # Ampere (8.0) and newer support TF32 which is much faster
+        if self.compute_capability[0] >= 8:
+            logging.info(
+                "GPU supports TF32 (Ampere+). Suggesting 'high' matmul precision."
+            )
+            return "high"
+
+        return "default"
