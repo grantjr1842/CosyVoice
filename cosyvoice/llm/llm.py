@@ -324,18 +324,37 @@ class Qwen2Encoder(torch.nn.Module):
                     "bitsandbytes or accelerate not installed, skipping quantization."
                 )
 
-        # 2. Flash Attention 2
+        # 2. Flash Attention 2 (requires Ampere GPUs or newer - compute capability 8.0+)
         attn_kwargs = {}
         try:
             import flash_attn
 
-            attn_kwargs["attn_implementation"] = "flash_attention_2"
-            logging.info("Using Flash Attention 2 for Qwen2Encoder")
+            # Check if GPU supports FlashAttention-2 (requires Ampere 8.0+)
+            if optimizer.compute_capability[0] >= 8:
+                attn_kwargs["attn_implementation"] = "flash_attention_2"
+                logging.info("Using Flash Attention 2 for Qwen2Encoder")
+            else:
+                logging.info(
+                    f"FlashAttention-2 requires Ampere GPUs (8.0+), "
+                    f"found compute capability {optimizer.compute_capability}. Using SDPA instead."
+                )
+                attn_kwargs["attn_implementation"] = "sdpa"
         except ImportError:
-            logging.info("Flash Attention 2 not available or not installed.")
+            logging.info("Flash Attention 2 not available. Using SDPA attention.")
 
         self.model = Qwen2ForCausalLM.from_pretrained(
             pretrain_path, **quantization_kwargs, **attn_kwargs
+        )
+
+        # Log summary of active optimizations
+        active_opts = []
+        if quantization_kwargs:
+            active_opts.append("Quantization")
+        if attn_kwargs:
+            attn_type = attn_kwargs.get("attn_implementation", "default")
+            active_opts.append(f"Attention: {attn_type}")
+        logging.info(
+            f"🚀 Qwen2Encoder loaded with optimizations: {', '.join(active_opts) if active_opts else 'None (FP16/FP32)'}"
         )
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
