@@ -104,38 +104,29 @@ class GpuOptimizer:
         Suggests quantization configuration.
         Returns:
             dict: Kwargs for QuantizationConfig (or None if no quantization suggested)
+
+        Note: The 0.5B model is small enough (~1GB in FP16) that quantization
+        overhead often outweighs benefits. Only enable for very low VRAM.
         """
         if self.device_count == 0:
             return None
 
-        # If we have very high VRAM (e.g. A100 80GB), maybe we don't need quantization for 0.5B model
-        # But for most consumer GPUs, 4-bit or 8-bit is good for speed/memory.
-        # The model is small (0.5B), so maybe 8-bit is safer for quality, or even FP16 is fine.
-        # But user asked for optimizations.
+        # The Fun-CosyVoice3-0.5B model is ~1GB in FP16 - quite small!
+        # Quantization is only beneficial for very constrained memory situations.
+        # For most GPUs with >= 6GB, FP16 is faster and more reliable.
 
-        # 0.5B model in FP16 is ~1GB.
-        # Actually, for such a small model, quantization overhead might outweigh benefits on high-end cards.
-        # But on low-end cards, it saves memory.
+        # Strategy (conservative for quality):
+        # < 4GB VRAM: 8-bit (4-bit can degrade quality significantly)
+        # >= 4GB: No quantization (FP16 is fast and reliable for 0.5B)
 
-        # Strategy:
-        # < 4GB VRAM: 4-bit
-        # < 8GB VRAM: 8-bit
-        # >= 8GB: FP16 (usually faster than quantized for small models due to overhead, unless memory bound)
-
-        # However, for 'optimizations', let's offer 4-bit if user wants max speed/min memory?
-        # Actually, 4-bit/8-bit compute is often slower than FP16 on adequate hardware.
-        # BUT, if we are memory bandwidth bound, it helps.
-
-        # Let's be aggressive with memory saving if VRAM is low.
-        if self.vram_gb < 6:
+        if self.vram_gb < 4:
             logging.info(
-                f"VRAM ({self.vram_gb:.2f}GB) < 6GB. Suggesting 4-bit quantization."
-            )
-            return {"load_in_4bit": True}
-        elif self.vram_gb < 12:
-            logging.info(
-                f"VRAM ({self.vram_gb:.2f}GB) < 12GB. Suggesting 8-bit quantization."
+                f"VRAM ({self.vram_gb:.2f}GB) < 4GB. Suggesting 8-bit quantization to fit in memory."
             )
             return {"load_in_8bit": True}
 
+        # For 4GB+ VRAM, FP16 is preferred for quality and often speed
+        logging.info(
+            f"VRAM ({self.vram_gb:.2f}GB) >= 4GB. Using FP16 (no quantization) for quality."
+        )
         return None

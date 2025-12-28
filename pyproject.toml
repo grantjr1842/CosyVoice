@@ -57,7 +57,7 @@ openh264 = "*"
 # Core ML dependencies
 conformer = ">=0.3.2"
 diffusers = ">=0.29.0"
-transformers = "==4.51.3"
+transformers = ">=4.54.0"
 x-transformers = ">=2.11.24"
 
 # Audio processing
@@ -107,6 +107,10 @@ onnxruntime-gpu = ">=1.18.0"
 # Training (optional, Linux only - deepspeed only works on Linux)
 deepspeed = ">=0.15.1"
 lightning = ">=2.2.4"
+
+# Advanced optimizations
+bitsandbytes = ">=0.45.0"
+accelerate = ">=1.2.0"
 
 # TensorRT (optional, Linux only for GPU acceleration)
 # Note: TensorRT packages require manual installation for specific GPU architectures
