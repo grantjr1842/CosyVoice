@@ -47,6 +47,7 @@ tikv-jemallocator = "0.6"
 # Utilities
 num_cpus = "1.16"
 anyhow = "1.0"
+dotenvy = "0.15"
 
 [profile.release]
 lto = "thin"

@@ -2,8 +2,11 @@
 
 # CosyVoice Rust Server Startup Script
 #
-# This script sets up the correct Python environment for the Rust server
-# which uses PyO3 to bridge to CosyVoice Python backend.
+# This script sets up the LD_LIBRARY_PATH for libpython before launching the
+# Rust server. The .env file is loaded by the Rust server itself via dotenvy.
+#
+# NOTE: LD_LIBRARY_PATH must be set here (not in Rust) because the dynamic
+# linker needs it BEFORE the Rust binary loads to find libpython.
 
 set -e
 
@@ -12,16 +15,9 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
-# Load environment configuration from .env if present
-if [[ -f "$PROJECT_ROOT/.env" ]]; then
-    # shellcheck source=/dev/null
-    source "$PROJECT_ROOT/.env"
-    echo "Loaded environment from .env"
-fi
-
-# Set up library path for libpython (using .env value or default)
-LD_LIBRARY_PATH_EXTRA="${LD_LIBRARY_PATH_EXTRA:-.pixi/envs/default/lib}"
-export LD_LIBRARY_PATH="$PROJECT_ROOT/$LD_LIBRARY_PATH_EXTRA:${LD_LIBRARY_PATH:-}"
+# Set up library path for libpython (required by PyO3)
+# This MUST be done in shell before the binary starts
+export LD_LIBRARY_PATH="$PROJECT_ROOT/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}"
 
 echo "Starting CosyVoice Rust server..."
 export COSYVOICE_MODEL_DIR="${COSYVOICE_MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B}"
