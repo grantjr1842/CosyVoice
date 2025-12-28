@@ -15,14 +15,14 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
-# Set up library path for libpython (required by PyO3)
-# This MUST be done in shell before the binary starts
-export LD_LIBRARY_PATH="$PROJECT_ROOT/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}"
+# # Set up library path for libpython (required by PyO3)
+# # This MUST be done in shell before the binary starts
+# export LD_LIBRARY_PATH="$PROJECT_ROOT/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}"
+# echo "  LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 
 echo "Starting CosyVoice Rust server..."
 export COSYVOICE_MODEL_DIR="${COSYVOICE_MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B}"
 echo "  Model dir: $COSYVOICE_MODEL_DIR"
-echo "  LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 
 # Use pixi run to ensure correct Python environment
 exec pixi run "$SCRIPT_DIR/target/release/cosyvoice-server" "$@"

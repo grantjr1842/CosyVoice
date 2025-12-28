@@ -77,3 +77,29 @@ Supported synthesis modes:
 - Master Issue: #21
 - Implementation Issue: #22
 - Branch: `agent/task-22`
+
+---
+
+# Session Summary: .env Loading & Output Organization
+
+## Date: 2025-12-28
+
+## Objective
+Load .env from Rust server (not shell script) and organize output files into dedicated directory.
+
+## Completed Tasks
+
+### 1. .env Loading from Rust ✅
+- Added `dotenvy` crate to Rust workspace
+- Server now loads `.env` at startup before any other initialization
+- Removed shell-based `.env` sourcing from `start-server.sh`
+- Kept `LD_LIBRARY_PATH` in shell (required before binary loads for libpython linking)
+
+### 2. Output File Organization ✅
+- Created `output/` directory with `.gitkeep` and README.md
+- Updated `example.py` to save generated audio to `output/` directory
+- Updated `.gitignore` to handle output directory properly
+
+## GitHub Artifacts
+- Issue: #24 (closed by PR)
+- PR: #25 (merged)
