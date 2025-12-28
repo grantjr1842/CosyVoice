@@ -78,17 +78,21 @@ class CosyVoice3Model:
     def load(self, llm_model, flow_model, hift_model):
         """Load model weights from disk."""
         self.llm.load_state_dict(
-            torch.load(llm_model, map_location=self.device), strict=True
+            torch.load(llm_model, map_location=self.device, weights_only=True),
+            strict=True,
         )
         self.llm.to(self.device).eval()
         self.flow.load_state_dict(
-            torch.load(flow_model, map_location=self.device), strict=True
+            torch.load(flow_model, map_location=self.device, weights_only=True),
+            strict=True,
         )
         self.flow.to(self.device).eval()
         # in case hift_model is a hifigan model
         hift_state_dict = {
             k.replace("generator.", ""): v
-            for k, v in torch.load(hift_model, map_location=self.device).items()
+            for k, v in torch.load(
+                hift_model, map_location=self.device, weights_only=True
+            ).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(self.device).eval()
@@ -175,8 +179,8 @@ class CosyVoice3Model:
         """LLM inference job for generating speech tokens."""
         with (
             self.llm_context,
-            torch.cuda.amp.autocast(
-                self.fp16 is True and hasattr(self.llm, "vllm") is False
+            torch.amp.autocast(
+                "cuda", enabled=self.fp16 is True and hasattr(self.llm, "vllm") is False
             ),
         ):
             if isinstance(text, Generator):
@@ -234,7 +238,7 @@ class CosyVoice3Model:
         speed=1.0,
     ):
         """Convert speech tokens to waveform."""
-        with torch.cuda.amp.autocast(self.fp16):
+        with torch.amp.autocast("cuda", enabled=self.fp16):
             # timer for flow
             tts_mel, _ = self.flow.inference(
                 token=token.to(self.device, dtype=torch.int32),
