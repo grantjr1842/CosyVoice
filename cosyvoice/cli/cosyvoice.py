@@ -68,6 +68,15 @@ class CosyVoice3:
         """
         if fp16 is None:
             optimizer = GpuOptimizer()
+
+            # MatMul Precision for Ampere+
+            mm_precision = optimizer.suggest_matmul_precision()
+            if mm_precision != "default":
+                torch.set_float32_matmul_precision(mm_precision)
+                logging.info(
+                    f"Setting torch.set_float32_matmul_precision('{mm_precision}') for performance."
+                )
+
             params = optimizer.suggest_parameters()
             fp16 = params.get("fp16", False)
             logging.info(f"Auto-configured parameters: fp16={fp16}")
@@ -337,10 +346,20 @@ def AutoModel(**kwargs):
     # Auto-enable TensorRT if ONNX model exists
     onnx_path = os.path.join(kwargs["model_dir"], "flow.decoder.estimator.fp32.onnx")
     if "load_trt" not in kwargs and os.path.exists(onnx_path):
-        logging.info(
-            "Detected ONNX model at {}. Enabling TensorRT loading.".format(onnx_path)
-        )
-        kwargs["load_trt"] = True
+        try:
+            import tensorrt
+
+            logging.info(
+                "Detected ONNX model at {}. Enabling TensorRT loading.".format(
+                    onnx_path
+                )
+            )
+            kwargs["load_trt"] = True
+        except ImportError:
+            logging.warning(
+                "Detected ONNX model but tensorrt module not found. Skipping TensorRT."
+            )
+            kwargs["load_trt"] = False
 
     if os.path.exists("{}/cosyvoice3.yaml".format(kwargs["model_dir"])):
         return CosyVoice3(**kwargs)
