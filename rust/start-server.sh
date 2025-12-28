@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
 # CosyVoice Rust Server Startup Script
 #
 # This script sets up the correct Python environment for the Rust server
