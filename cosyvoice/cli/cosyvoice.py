@@ -215,12 +215,15 @@ class CosyVoice3:
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
                 inference_time = time.time() - start_time
-                rtf = inference_time / speech_len
-                logging.info(
-                    "yield speech len {:.2f}s, inference time {:.3f}s, rtf {:.3f}".format(
-                        speech_len, inference_time, rtf
+                if speech_len > 0:
+                    rtf = inference_time / speech_len
+                    logging.info(
+                        "yield speech len {:.2f}s, inference time {:.3f}s, rtf {:.3f}".format(
+                            speech_len, inference_time, rtf
+                        )
                     )
-                )
+                else:
+                    logging.warning("yield speech len is 0, skipping rtf calculation")
                 yield model_output
                 start_time = time.time()
 
