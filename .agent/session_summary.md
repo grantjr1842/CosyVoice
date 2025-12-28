@@ -130,3 +130,10 @@ Load .env from Rust server (not shell script) and organize output files into ded
 ### 3. Model Directory Update ✅
 - Updated `rust/shared/src/lib.rs` default model to `Fun-CosyVoice3-0.5B`
 - This ensures the server uses the correct locally downloaded model by default
+
+### 4. Documentation ✅
+- Updated `README.md` with:
+    - Python 3.12 requirement
+    - Rust server build instructions (native, no pixi wrapper)
+    - Note on `ttsfrd` incompatibility with Python 3.12
+- Created `rust/README.md` for local development guidance

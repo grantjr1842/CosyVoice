@@ -104,7 +104,7 @@ class CosyVoiceFrontEnd:
                 from wetext import Normalizer as ZhNormalizer
 
                 self.zh_tn_model = ZhNormalizer(remove_erhua=False)
-                self.en_tn_model = EnNormalizer()
+                self.en_tn_model = EnNormalizer(lang="en")
                 self.text_frontend = "wetext"
                 logging.info("use wetext frontend")
             except:

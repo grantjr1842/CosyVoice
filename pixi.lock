@@ -4750,9 +4750,9 @@ packages:
   sha256: 1b93e53cddb67a0e4faa34d6cf919ac6c662feb1c8c0ed901d71b595ab396aa3
   requires_dist:
   - numpy
-  - nose ; extra == 'test'
   - numpy ; extra == 'sdist'
   - cython>=0.24 ; extra == 'sdist'
+  - nose ; extra == 'test'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pyyaml-6.0.3-py312h8a5da7c_0.conda
   sha256: 1b3dc4c25c83093fff08b86a3574bc6b94ba355c8eba1f35d805c5e256455fc7
   md5: fba10c2007c8b06f77c5a23ce3a635ad

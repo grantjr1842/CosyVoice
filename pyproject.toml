@@ -95,7 +95,7 @@ wget = ">=3.2"
 
 # Text processing
 inflect = ">=7.3.1"
-wetext = ">=0.0.4"
+wetext = ">=0.1.2,<0.2"
 openai-whisper = ">=20231117"
 
 # Visualization & logging
