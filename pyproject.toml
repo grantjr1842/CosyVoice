@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -43,7 +44,8 @@ channels = ["pytorch", "nvidia", "conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.dependencies]
-python = "3.10.*"
+python = "3.12.*"
+numpy = "<2.0"
 pip = "*"
 pytorch = ">=2.3.0"
 pytorch-cuda = ">=12.1"
@@ -61,6 +63,7 @@ transformers = ">=4.54.0"
 x-transformers = ">=2.11.24"
 
 # Audio processing
+numba = ">=0.60.0"
 librosa = ">=0.10.2"
 soundfile = ">=0.12.1"
 pyworld = ">=0.3.4"
@@ -81,7 +84,7 @@ HyperPyYAML = ">=1.2.2"
 omegaconf = ">=2.3.0"
 
 # Data processing
-numpy = ">=1.26.4"
+numpy = ">=1.26.4,<2.0"
 pyarrow = ">=18.1.0"
 networkx = ">=3.1"
 

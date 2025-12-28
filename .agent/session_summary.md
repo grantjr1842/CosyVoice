@@ -103,3 +103,30 @@ Load .env from Rust server (not shell script) and organize output files into ded
 ## GitHub Artifacts
 - Issue: #24 (closed by PR)
 - PR: #25 (merged)
+
+---
+
+# Session Summary: Python Upgrade & Build Fixes
+
+## Date: 2025-12-28
+
+## Objectives
+- Upgrade to Python 3.12 to match system and resolve SRE module mismatch
+- Fix "hacky" PyO3 build process (remove `pixi run cargo build` requirement)
+- Document lib.rs default model directory update
+
+## Completed Tasks
+
+### 1. Python 3.12 Upgrade ✅
+- Upgraded `pyproject.toml` to use Python 3.12
+- Reinstalled pixi environment to match system Python version
+- **Verification**: `python --version` now returns 3.12.x in pixi env
+
+### 2. PyO3 Build Configuration ✅
+- Created `rust/.cargo/config.toml` setting `PYO3_PYTHON` to point to pixi's Python
+- This enables standard `cargo build` commands to work correctly without wrappers
+- Eliminates the SRE/version mismatch error during PyTorch compilation
+
+### 3. Model Directory Update ✅
+- Updated `rust/shared/src/lib.rs` default model to `Fun-CosyVoice3-0.5B`
+- This ensures the server uses the correct locally downloaded model by default
