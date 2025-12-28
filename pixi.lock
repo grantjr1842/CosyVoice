@@ -247,6 +247,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/0d/e2/9baffdae21a76f77ef8447f1a05a96ec4bc0a24dae08767abc0a2fe680b8/multidict-6.7.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/ed/de/0e6edf44d6a04dabd0318a519125ed0415ce437ad5a1ec9b9be03d9048cf/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/cb/70/ea2bc45205f206b7a24ee68a159f5097c9ca7e6466806e7c213587e0c2b1/numba-0.63.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://download.pytorch.org/whl/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e3/94/1843518e420fa3ed6919835845df698c7e27e183cb997394e4a670973a65/omegaconf-2.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/84/a7/38aa564871d062c11538d65c575af9c7e057be880c09ecbd899dd1abfa83/onnx-1.20.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://aiinfra.pkgs.visualstudio.com/2692857e-05ef-43b4-ba9c-ccf1c22c437c/_packaging/9387c3aa-d9ad-4513-968c-383f6f7f53b8/pypi/download/onnxruntime-gpu/1.19.2/onnxruntime_gpu-1.19.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
@@ -295,6 +296,9 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/d9/52/1064f510b141bd54025f9b55105e26d1fa970b9be67ad766380a3c9b74b0/starlette-0.50.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/9c/d9/a5db55f88f258ac669a92858b70a714bbbd5acd993820b41ec4a96a4d77f/tensorboard-2.20.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/7a/13/e503968fefabd4c6b2650af21e110aa8466fe21432cd7c43a84577a89438/tensorboard_data_server-0.7.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/1a/aa/5a630ac02d05f7bbc774bd11b2bc9a3d31aa0bd7d38b4cfeef06733544b3/tensorrt_cu12-10.13.3.9.tar.gz
+      - pypi: https://files.pythonhosted.org/packages/58/cc/8eddae7c3b0bd6d51290624c59f05b51ec3ded917b3689f1975f8dcfc601/tensorrt_cu12_bindings-10.13.3.9-cp312-none-manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/e1/d3/82b9a603cac94975dbb25d33c7ffb1dba6851980f2dc630f2bf9caf0bffb/tensorrt_cu12_libs-10.13.3.9.tar.gz
       - pypi: https://files.pythonhosted.org/packages/e2/0f/6f08dd89e9d71380a369b1f5b6c97a32d62fc9cfacc1c5b8329505b9e495/textsearch-0.0.24-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f4/90/3dae6cc5436137ebd38944d396b5849e167896fc2073da643a49f372dc4f/tiktoken-0.12.0-cp312-cp312-manylinux_2_28_x86_64.whl
@@ -565,6 +569,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/0d/e2/9baffdae21a76f77ef8447f1a05a96ec4bc0a24dae08767abc0a2fe680b8/multidict-6.7.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/ed/de/0e6edf44d6a04dabd0318a519125ed0415ce437ad5a1ec9b9be03d9048cf/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/cb/70/ea2bc45205f206b7a24ee68a159f5097c9ca7e6466806e7c213587e0c2b1/numba-0.63.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://download.pytorch.org/whl/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e3/94/1843518e420fa3ed6919835845df698c7e27e183cb997394e4a670973a65/omegaconf-2.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/84/a7/38aa564871d062c11538d65c575af9c7e057be880c09ecbd899dd1abfa83/onnx-1.20.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://aiinfra.pkgs.visualstudio.com/2692857e-05ef-43b4-ba9c-ccf1c22c437c/_packaging/9387c3aa-d9ad-4513-968c-383f6f7f53b8/pypi/download/onnxruntime-gpu/1.19.2/onnxruntime_gpu-1.19.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
@@ -613,6 +618,9 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/d9/52/1064f510b141bd54025f9b55105e26d1fa970b9be67ad766380a3c9b74b0/starlette-0.50.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/9c/d9/a5db55f88f258ac669a92858b70a714bbbd5acd993820b41ec4a96a4d77f/tensorboard-2.20.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/7a/13/e503968fefabd4c6b2650af21e110aa8466fe21432cd7c43a84577a89438/tensorboard_data_server-0.7.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/1a/aa/5a630ac02d05f7bbc774bd11b2bc9a3d31aa0bd7d38b4cfeef06733544b3/tensorrt_cu12-10.13.3.9.tar.gz
+      - pypi: https://files.pythonhosted.org/packages/58/cc/8eddae7c3b0bd6d51290624c59f05b51ec3ded917b3689f1975f8dcfc601/tensorrt_cu12_bindings-10.13.3.9-cp312-none-manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/e1/d3/82b9a603cac94975dbb25d33c7ffb1dba6851980f2dc630f2bf9caf0bffb/tensorrt_cu12_libs-10.13.3.9.tar.gz
       - pypi: https://files.pythonhosted.org/packages/e2/0f/6f08dd89e9d71380a369b1f5b6c97a32d62fc9cfacc1c5b8329505b9e495/textsearch-0.0.24-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f4/90/3dae6cc5436137ebd38944d396b5849e167896fc2073da643a49f372dc4f/tiktoken-0.12.0-cp312-cp312-manylinux_2_28_x86_64.whl
@@ -4108,6 +4116,11 @@ packages:
   - pkg:pypi/numpy?source=hash-mapping
   size: 7484186
   timestamp: 1707225809722
+- pypi: https://download.pytorch.org/whl/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+  name: nvidia-cuda-runtime-cu12
+  version: 12.9.79
+  sha256: 25bba2dfb01d48a9b59ca474a1ac43c6ebf7011f1b0b8cc44f54eb6ac48a96c3
+  requires_python: '>=3'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/ocl-icd-2.3.3-hb9d3cd8_0.conda
   sha256: 2254dae821b286fb57c61895f2b40e3571a070910fdab79a948ff703e1ea807b
   md5: 56f8947aa9d5cf37b0b3d43b83f34192
@@ -5154,6 +5167,27 @@ packages:
   version: 0.7.2
   sha256: 7e0610d205889588983836ec05dc098e80f97b7e7bbff7e994ebb78f578d0ddb
   requires_python: '>=3.7'
+- pypi: https://files.pythonhosted.org/packages/1a/aa/5a630ac02d05f7bbc774bd11b2bc9a3d31aa0bd7d38b4cfeef06733544b3/tensorrt_cu12-10.13.3.9.tar.gz
+  name: tensorrt-cu12
+  version: 10.13.3.9
+  sha256: b507abc536ceeaac3b2e6527bd65100bef19000d204e7072db6fe85f9f859a84
+  requires_dist:
+  - tensorrt-cu12-libs==10.13.3.9
+  - tensorrt-cu12-bindings==10.13.3.9
+  - numpy ; extra == 'numpy'
+  requires_python: '>=3.6'
+- pypi: https://files.pythonhosted.org/packages/58/cc/8eddae7c3b0bd6d51290624c59f05b51ec3ded917b3689f1975f8dcfc601/tensorrt_cu12_bindings-10.13.3.9-cp312-none-manylinux_2_28_x86_64.whl
+  name: tensorrt-cu12-bindings
+  version: 10.13.3.9
+  sha256: 193174cd0aa5ec7d63943d8d3f84ca9ec525477a9db3a9100bf2f77071b3fae8
+  requires_dist:
+  - numpy ; extra == 'numpy'
+- pypi: https://files.pythonhosted.org/packages/e1/d3/82b9a603cac94975dbb25d33c7ffb1dba6851980f2dc630f2bf9caf0bffb/tensorrt_cu12_libs-10.13.3.9.tar.gz
+  name: tensorrt-cu12-libs
+  version: 10.13.3.9
+  sha256: 99d11dd42a27705bcb2ea4e2e0f76817a2a9403d892ec1272c502bd2722ebbd9
+  requires_dist:
+  - nvidia-cuda-runtime-cu12
 - pypi: https://files.pythonhosted.org/packages/e2/0f/6f08dd89e9d71380a369b1f5b6c97a32d62fc9cfacc1c5b8329505b9e495/textsearch-0.0.24-py2.py3-none-any.whl
   name: textsearch
   version: 0.0.24

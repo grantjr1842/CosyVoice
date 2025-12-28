@@ -117,6 +117,9 @@ accelerate = ">=1.2.0"
 
 # TensorRT (optional, Linux only for GPU acceleration)
 # Note: TensorRT packages require manual installation for specific GPU architectures
+tensorrt-cu12 = "==10.13.3.9"
+tensorrt-cu12-bindings = "==10.13.3.9"
+tensorrt-cu12-libs = "==10.13.3.9"
 
 [tool.pixi.pypi-options]
 extra-index-urls = [
