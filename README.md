@@ -65,7 +65,7 @@ cd CosyVoice
 git submodule update --init --recursive
 
 # Create and activate conda environment
-conda create -n cosyvoice -y python=3.10
+conda create -n cosyvoice -y python=3.12
 conda activate cosyvoice
 pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
 
@@ -96,13 +96,10 @@ snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='pretrained_
 snapshot_download('FunAudioLLM/CosyVoice-ttsfrd', local_dir='pretrained_models/CosyVoice-ttsfrd')
 ```
 
-Optionally, you can install `ttsfrd` package for better text normalization performance:
-
 ```bash
-cd pretrained_models/CosyVoice-ttsfrd/
-unzip resource.zip -d .
-pip install ttsfrd_dependency-0.1-py3-none-any.whl
-pip install ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl
+# Note: ttsfrd is currently only available for Python 3.8 and 3.10.
+# It is NOT compatible with Python 3.12.
+# If you require ttsfrd, please use a Python 3.10 environment.
 ```
 
 ## Troubleshooting
@@ -188,6 +185,28 @@ Endpoints:
 cd runtime/python/grpc
 python server.py --port 50000 --model_dir pretrained_models/Fun-CosyVoice3-0.5B
 ```
+
+### Rust Server (High Performance)
+
+The Rust server offers high-performance inference and can be run natively.
+
+#### Build
+
+```bash
+cd rust
+cargo build --release
+```
+
+> **Note**: The build configuration in `rust/.cargo/config.toml` automatically points PyO3 to the correct Python environment (pixi or system). You do not need to wrap the build command.
+
+#### Run
+
+```bash
+# Run directly from project root to load .env configuration
+./rust/target/release/cosyvoice-server
+```
+
+The server will automatically configure its environment (including `LD_LIBRARY_PATH` and Python setup) on startup.
 
 ### Docker Deployment
 
