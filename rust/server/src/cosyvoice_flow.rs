@@ -97,6 +97,7 @@ impl PreLookaheadLayer {
             outputs.pad_with_zeros(2, 0, self.pre_lookahead_len)?
         };
 
+        eprintln!("PreLookahead conv1 input shape: {:?}", outputs.shape());
         // Conv1 + LeakyReLU
         let outputs = self.conv1.forward(&outputs)?;
         let outputs = leaky_relu(&outputs, 0.01)?;
@@ -217,29 +218,29 @@ impl CosyVoiceFlow {
         // Repeat interleave for token_mel_ratio
         let h = repeat_interleave(&h, self.config.token_mel_ratio, 1)?;
 
-        let prompt_mel_len = prompt_feat.dim(1)?;
+        let prompt_mel_len = prompt_feat.dim(2)?; // [B, D, T], use dim 2
         let total_mel_len = h.dim(1)?;
         let target_mel_len = total_mel_len - prompt_mel_len;
 
-        // Build conditioning tensor
+        // Build conditioning tensor: [1, 80, total_len]
         let mut conds = Tensor::zeros(
-            (1, prompt_mel_len + target_mel_len, self.config.output_size),
+            (1, self.config.output_size, prompt_mel_len + target_mel_len),
             DType::F32,
             &self.device,
         )?;
 
         // Copy prompt features into conds
-        // conds[:, :prompt_mel_len] = prompt_feat
         if prompt_mel_len > 0 {
-            // For simplicity, we'll build conds by concatenating
+            // Build conds by concatenating [1, 80, prompt_len] and [1, 80, target_len]
             let zeros_part = Tensor::zeros(
-                (1, target_mel_len, self.config.output_size),
+                (1, self.config.output_size, target_mel_len),
                 DType::F32,
                 &self.device,
             )?;
-            conds = Tensor::cat(&[prompt_feat, &zeros_part], 1)?;
+            conds = Tensor::cat(&[prompt_feat, &zeros_part], 2)?; // Cat along dim 2
         }
-        let conds = conds.transpose(1, 2)?; // [batch, mel_dim, mel_len]
+        // conds is now [batch, mel_dim, mel_len]
+        // No transpose needed
 
         // Create mask (all ones for now)
         let mask = Tensor::ones((1, total_mel_len), DType::F32, &self.device)?;

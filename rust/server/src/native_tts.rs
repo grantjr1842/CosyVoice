@@ -12,6 +12,7 @@ use crate::cosyvoice_flow::{CosyVoiceFlow, CosyVoiceFlowConfig};
 use crate::cosyvoice_llm::{CosyVoiceLLM, CosyVoiceLLMConfig};
 use crate::flow::FlowConfig;
 use crate::hift::{HiFTConfig, HiFTGenerator};
+use crate::onnx_frontend::OnnxFrontend;
 use crate::qwen::Config as QwenConfig;
 
 #[derive(Error, Debug)]
@@ -37,6 +38,8 @@ pub struct NativeTtsEngine {
     pub flow: CosyVoiceFlow,
     /// HiFT vocoder for audio synthesis
     pub hift: HiFTGenerator,
+    /// ONNX Frontend for tokenization and embedding
+    pub frontend: Option<OnnxFrontend>,
     /// Device (CPU or CUDA)
     pub device: Device,
     /// Sample rate
@@ -45,11 +48,11 @@ pub struct NativeTtsEngine {
 
 impl NativeTtsEngine {
     /// Create a new native TTS engine from safetensors weights
-    pub fn new(model_dir: &str) -> Result<Self, NativeTtsError> {
+    pub fn new(model_dir: &str, device: Option<Device>) -> Result<Self, NativeTtsError> {
         let model_path = PathBuf::from(model_dir);
 
         // Initialize device
-        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        let device = device.unwrap_or_else(|| Device::cuda_if_available(0).unwrap_or(Device::Cpu));
         eprintln!("Native TTS Engine using device: {:?}", device);
 
         // Load configurations
@@ -100,10 +103,27 @@ impl NativeTtsEngine {
             .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize HiFT: {}", e)))?;
         eprintln!("HiFT initialized successfully");
 
+        // Initialize ONNX Frontend
+        eprintln!("Initializing ONNX Frontend...");
+        // Use device for frontend if CUDA, otherwise CPU
+        // Note: ORT CUDA provider registration inside OnnxFrontend handles the actual GPU usage.
+        // We pass the device mainly for tensor placement if needed.
+        let frontend = match OnnxFrontend::new(model_dir, device.clone()) {
+            Ok(fe) => {
+                eprintln!("ONNX Frontend initialized successfully");
+                Some(fe)
+            },
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize ONNX frontend: {}. Continuing without frontend.", e);
+                None
+            }
+        };
+
         Ok(Self {
             llm,
             flow,
             hift,
+            frontend,
             device,
             sample_rate: 24000,
         })
@@ -206,6 +226,64 @@ impl NativeTtsEngine {
             prompt_tokens,
             prompt_mel,
             speaker_embedding,
+        )
+    }
+
+    /// Process prompt audio tensors to get speech tokens and speaker embedding
+    pub fn process_prompt_tensors(
+        &mut self,
+        prompt_speech_16k: &Tensor,   // [1, 128, T] for Tokenizer
+        prompt_fbank: &Tensor, // [1, T, 80] for Speaker Embedding
+    ) -> Result<(Tensor, Tensor), NativeTtsError> {
+        // 1. Check frontend availability
+        let frontend = self.frontend.as_mut().ok_or_else(|| {
+            NativeTtsError::InferenceError("Frontend not initialized (ONNX error previously logged)".to_string())
+        })?;
+
+        // 2. Speech tokens
+        let mel_len = prompt_speech_16k.dim(2)? as i32;
+        let speech_tokens = frontend.tokenize_speech(prompt_speech_16k, mel_len)
+            .map_err(|e| NativeTtsError::InferenceError(format!("Frontend error (tokenize): {}", e)))?;
+
+        // 3. Speaker embedding
+        let spk_emb = frontend.extract_speaker_embedding(prompt_fbank)
+            .map_err(|e| NativeTtsError::InferenceError(format!("Frontend error (embedding): {}", e)))?;
+
+        Ok((speech_tokens, spk_emb))
+    }
+
+    /// Synthesize speech in instruct/zero-shot mode
+    ///
+    /// # Arguments
+    /// * `text_tokens` - Input text tokens [1, text_len] (including prompt text if any)
+    /// * `prompt_speech_16k` - Prompt mel features for tokenizer [1, 128, mel_len]
+    /// * `prompt_speech_24k` - Prompt mel features for Flow [1, 80, mel_len]
+    /// * `prompt_fbank` - Prompt fbank features for embedding [1, fbank_len, 80]
+    /// * `sampling_k` - Top-k sampling
+    ///
+    /// # Returns
+    /// Audio samples as i16
+    pub fn synthesize_instruct(
+        &mut self,
+        text_tokens: &Tensor,
+        prompt_speech_16k: &Tensor,
+        prompt_speech_24k: &Tensor,
+        prompt_fbank: &Tensor,
+        sampling_k: usize,
+    ) -> Result<Vec<i16>, NativeTtsError> {
+        // 1. Process prompt audio
+        let (prompt_speech_tokens, spk_emb) = self.process_prompt_tensors(prompt_speech_16k, prompt_fbank)?;
+
+        // 2. Embed text tokens
+        let text_embeds = self.llm.embed_text_tokens(text_tokens)?;
+
+        // 3. Full Synthesis pipeline
+        self.synthesize_full(
+            &text_embeds,
+            Some(&prompt_speech_tokens),
+            prompt_speech_24k, // Flow uses 24k mel (80 dim)
+            &spk_emb,
+            sampling_k
         )
     }
 }

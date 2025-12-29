@@ -54,6 +54,10 @@ sox = "*"
 libsndfile = "*"
 ffmpeg = ">=6.0"
 openh264 = "*"
+gxx_linux-64 = "12.*"
+gcc_linux-64 = "12.*"
+cuda-nvcc = "12.1.*"
+cuda-driver-dev = "12.1.*"
 
 [tool.pixi.pypi-dependencies]
 # Core ML dependencies
@@ -107,12 +111,14 @@ tensorboard = ">=2.14.0"
 onnx = ">=1.16.0"
 onnxruntime-gpu = ">=1.18.0"
 
+# CUDA Compiler (for Rust Candle build)
+# cuda-nvcc moved to conda dependencies
+
 # Training (optional, Linux only - deepspeed only works on Linux)
 deepspeed = ">=0.15.1"
 lightning = ">=2.2.4"
 
 # Advanced optimizations
-bitsandbytes = ">=0.45.0"
 accelerate = ">=1.2.0"
 
 # TensorRT (optional, Linux only for GPU acceleration)
@@ -171,8 +177,10 @@ export-onnx = "python cosyvoice/bin/export_onnx.py"
 # Feature Environments (optional configurations)
 # ============================================================================
 
+
+
 [tool.pixi.feature.cuda.dependencies]
-pytorch-cuda = "12.1.*"
+pytorch-cuda = "*"
 
 [tool.pixi.feature.cpu.dependencies]
 pytorch = {version = ">=2.3.0", channel = "pytorch"}

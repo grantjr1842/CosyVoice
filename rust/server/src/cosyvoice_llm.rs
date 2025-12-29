@@ -13,7 +13,8 @@ use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 pub struct CosyVoiceLLMConfig {
     pub llm_input_size: usize,
     pub llm_output_size: usize,
-    pub speech_token_size: usize,  // Will be overridden by actual weight size
+    pub speech_token_size: usize,  // Size in weights (6758)
+    pub sampling_vocab_size: usize, // Valid output range (6561)
     pub spk_embed_dim: usize,
 }
 
@@ -22,7 +23,8 @@ impl Default for CosyVoiceLLMConfig {
         Self {
             llm_input_size: 896,
             llm_output_size: 896,
-            speech_token_size: 6758,  // Fun-CosyVoice3-0.5B default
+            speech_token_size: 6758,  // Fun-CosyVoice3-0.5B default weights size
+            sampling_vocab_size: 6561, // Fun-CosyVoice3-0.5B Flow vocab size
             spk_embed_dim: 192,
         }
     }
@@ -40,6 +42,8 @@ pub struct CosyVoiceLLM {
     llm_decoder: Linear,
     /// Actual speech token vocabulary size (inferred from weights)
     speech_token_size: usize,
+    /// Valid sampling range limit
+    sampling_vocab_size: usize,
     /// Configuration
     config: CosyVoiceLLMConfig,
     /// Device
@@ -99,6 +103,7 @@ impl CosyVoiceLLM {
             speech_embedding,
             llm_decoder,
             speech_token_size: llm_config.speech_token_size,
+            sampling_vocab_size: llm_config.sampling_vocab_size,
             config: llm_config,
             device,
             sos: 0,
@@ -118,6 +123,11 @@ impl CosyVoiceLLM {
         self.llm_embedding.forward(&idx)?.unsqueeze(0)
     }
 
+    /// Embed text tokens using the underlying LLM's embedding layer
+    pub fn embed_text_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.llm.base_model.embed_tokens.forward(tokens)
+    }
+
     /// Embed speech tokens
     fn embed_speech_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
         self.speech_embedding.forward(tokens)
@@ -135,18 +145,27 @@ impl CosyVoiceLLM {
         let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        // Filter out EOS if ignoring
+        // Filter out EOS (or invalid > sampling_vocab_size) if ignoring
+        // Also ensure we don't sample beyond sampling_vocab_size unless it's EOS
         let candidates: Vec<(usize, f32)> = if ignore_eos {
             indexed.into_iter()
-                .filter(|(idx, _)| *idx < self.speech_token_size)
+                .filter(|(idx, _)| *idx < self.sampling_vocab_size)
                 .take(k)
                 .collect()
         } else {
-            indexed.into_iter().take(k).collect()
+            // Filter candidates to be within loading size, but prefer within sampling size
+            // If we want to allow EOS (which might be >= sampling_size), we should check
+            // For now, restrict to sampling_vocab_size (6561) to define "valid tokens"
+            // If EOS is > 6561, then it will be filtered out?
+            // Wait, if EOS is 6561?
+            indexed.into_iter()
+                   .filter(|(idx, _)| *idx < self.sampling_vocab_size || *idx >= self.speech_token_size) // Allow < 6561 OR EOS?
+                   .take(k).collect()
         };
 
         if candidates.is_empty() {
-            return Ok(self.speech_token_size as u32); // EOS token
+             // Fallback to EOS (speech_token_size)
+            return Ok(self.speech_token_size as u32);
         }
 
         // Softmax over top-k
@@ -216,7 +235,7 @@ impl CosyVoiceLLM {
 
         for i in 0..max_len {
             // Forward pass through LLM
-            let y_pred = self.llm.forward_embeds(&lm_input, seqlen_offset)?;
+            let y_pred = self.llm.base_model.forward_embeds(&lm_input, seqlen_offset, None)?;
 
             // Get logits from last position
             let logits = self.llm_decoder.forward(&y_pred.i((.., y_pred.dim(1)? - 1..y_pred.dim(1)?, ..))?)?;
@@ -227,7 +246,9 @@ impl CosyVoiceLLM {
             let top_id = self.sample_top_k(&logp.i(0)?, sampling_k, ignore_eos)?;
 
             // Check for EOS
-            if top_id as usize >= self.speech_token_size {
+            // top_id >= sampling_vocab_size (6561) is considered EOS or invalid
+            if top_id as usize >= self.sampling_vocab_size {
+                eprintln!("LLM: EOS reached at step {} (token id {})", i, top_id);
                 break;
             }
 

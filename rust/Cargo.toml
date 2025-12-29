@@ -55,3 +55,8 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = true
+
+[patch.crates-io]
+ug = { path = "../third_party/ug/ug-core" }
+ug-cuda = { path = "../third_party/ug/ug-cuda" }
+# cudarc = { git = "https://github.com/coreylowman/cudarc" } # No longer needed if ug uses 0.18.2

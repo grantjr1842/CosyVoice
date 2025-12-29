@@ -1,6 +1,6 @@
-use candle_core::{Device, Result, Tensor, DType, Module, IndexOp};
-use candle_nn::{Conv1d, Conv1dConfig, VarBuilder, ops};
-use crate::utils::{StftModule};
+use crate::utils::StftModule;
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle_nn::{ops, Conv1d, Conv1dConfig, VarBuilder};
 use std::f64::consts::PI;
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
@@ -17,7 +17,12 @@ pub struct Snake {
 
 impl Snake {
     pub fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
-        let alpha = vb.get((1, channels, 1), "alpha")?;
+        let alpha = if vb.contains_tensor("alpha") {
+            let a = vb.get(channels, "alpha")?;
+            a.reshape((1, channels, 1))?
+        } else {
+            vb.get((1, channels, 1), "alpha")?
+        };
         Ok(Self { alpha })
     }
 }
@@ -54,11 +59,11 @@ impl SineGen {
         noise_std: f64,
         sampling_rate: usize,
         voiced_threshold: f32,
-        vb: VarBuilder
+        vb: VarBuilder,
     ) -> Result<Self> {
         let dev = vb.device();
         // harmonic_range: [1.0, 2.0, ... H+1]
-        let range: Vec<f32> = (1..=harmonic_num+1).map(|x| x as f32).collect();
+        let range: Vec<f32> = (1..=harmonic_num + 1).map(|x| x as f32).collect();
         // Shape: [1, Harmonics, 1] so we can mul with f0 [Batch, 1, Length] -> [Batch, Harmonics, Length]
         let harmonic_range = Tensor::from_vec(range, (1, harmonic_num + 1, 1), dev)?;
 
@@ -100,17 +105,42 @@ impl SineGen {
         // We want [Batch, H+1, Length].
         // Expand/Broadcast.
 
-        let f0_expanded = f0.broadcast_as((f0.dim(0)?, self.harmonic_num + 1, f0.dim(2)?))?;
+        let _f0_expanded = f0.broadcast_as((f0.dim(0)?, self.harmonic_num + 1, f0.dim(2)?))?;
         // But multiplying needs correct dims.
         // broadcast_mul automatically broadcasts.
 
         // harmonic_range [1, H+1, 1] * f0 [Batch, 1, Length] -> [Batch, H+1, Length]
+        eprintln!("SineGen: harmonic_num={}, harmonic_range shape={:?}, f0 shape={:?}",
+            self.harmonic_num, self.harmonic_range.shape(), f0.shape());
+
         let f_mat = self.harmonic_range.broadcast_mul(f0)?;
+        eprintln!("SineGen: f_mat shape={:?}", f_mat.shape());
         let f_mat = (f_mat / self.sampling_rate)?;
 
         // 2. Cumsum for phase: theta = 2 * pi * cumsum(f_mat) % 1
-        // Candle `cumsum`: dim 2 (Length).
-        let cumsum = f_mat.cumsum(2)?;
+        // Candle `cumsum` implementation naively creates an LxL matrix (O(N^2) memory), causing OOM.
+        // We implement it manually on CPU (O(N)).
+
+        let f_mat_cpu = f_mat.to_device(&Device::Cpu)?;
+        let (b, c, l) = f_mat_cpu.dims3()?;
+        let mut f_vec: Vec<f32> = f_mat_cpu.flatten_all()?.to_vec1()?;
+
+        // Cumsum along dim 2 (inner-most dimension in [B, C, L] layout?)
+        // Check layout. contiguous [B, C, L] means L varies fastest?
+        // Yes, row-major.
+        // So we iterate chunks of size L.
+
+        for i in 0..(b * c) {
+            let offset = i * l;
+            let mut sum = 0.0;
+            for j in 0..l {
+                sum += f_vec[offset + j];
+                f_vec[offset + j] = sum;
+            }
+        }
+
+        let cumsum_cpu = Tensor::from_vec(f_vec, (b, c, l), &Device::Cpu)?;
+        let cumsum = cumsum_cpu.to_device(&f_mat.device())?;
 
         // % 1 logic: x - floor(x).
         // Since we wrap phase, usually we do sin(2pi * x).
@@ -138,7 +168,7 @@ impl SineGen {
         // Python code generates random phase `U[-pi, pi]`.
         // Let's implement it for parity.
         let shape = theta_mat.shape();
-        let phase_vec = (Tensor::rand(0.0f32, 1.0f32, shape, &self.device)? * two_pi)? - PI;
+        let _phase_vec = (Tensor::rand(0.0f32, 1.0f32, shape, &self.device)? * two_pi)? - PI;
         // Zero out fundamental (idx 0) phase?
         // Python: phase_vec[:, 0, :] = 0
         // We can slice and cat.
@@ -153,7 +183,9 @@ impl SineGen {
         let b = shape.dims()[0];
         let l = shape.dims()[2];
         let fund = Tensor::zeros((b, 1, l), DType::F32, &self.device)?;
-        let harm = ((Tensor::rand(0.0f32, 1.0f32, (b, self.harmonic_num, l), &self.device)? * two_pi)? - PI)?;
+        let harm = ((Tensor::rand(0.0f32, 1.0f32, (b, self.harmonic_num, l), &self.device)?
+            * two_pi)?
+            - PI)?;
         let phase_vec = Tensor::cat(&[&fund, &harm], 1)?; // Concat along dim 1 (channels)
 
         let sine_waves = ((theta_mat + phase_vec)?.sin()? * self.sine_amp)?;
@@ -169,7 +201,7 @@ impl SineGen {
         let term2 = ((&ones - &uv)? * (self.sine_amp / 3.0))?;
         let noise_amp = (term1 + term2)?;
 
-        let noise = (Tensor::randn_like(&sine_waves, 0.0, 1.0)? * &noise_amp)?; // Broadcast noise_amp over channels
+        let noise = Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?; // Broadcast noise_amp over channels
 
         // 6. Merge
         // sine_waves = sine_waves * uv + noise
@@ -181,22 +213,34 @@ impl SineGen {
     }
 }
 
-
 fn get_padding(kernel_size: usize, dilation: usize) -> usize {
     (kernel_size - 1) * dilation / 2
 }
 
-fn load_conv1d(vb: VarBuilder, in_c: usize, out_c: usize, k: usize, stride: usize, dilation: usize, padding: usize) -> Result<Conv1d> {
-    // Check if weight_g exists (weight_norm)
+fn load_conv1d(
+    vb: VarBuilder,
+    in_c: usize,
+    out_c: usize,
+    k: usize,
+    stride: usize,
+    dilation: usize,
+    padding: usize,
+) -> Result<Conv1d> {
     let weight = if vb.contains_tensor("weight_g") {
         let g = vb.get((out_c, 1, 1), "weight_g")?;
         let v = vb.get((out_c, in_c, k), "weight_v")?;
-        // w = g * v / ||v||
-        // dims: g [Out, 1, 1], v [Out, In, K]
-        // ||v|| along dims 1,2?
-        // PyTorch weight_norm default dim=0 (output channels).
-        // Norm is computed over (In, K).
-        // Candle: v.sqr()?.sum_keepdim((1, 2))?.sqrt()?
+        let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+        let scale = (g / norm_v)?;
+        v.broadcast_mul(&scale)?
+    } else if vb.contains_tensor("weight.original0") {
+        let g = vb.get((out_c, 1, 1), "weight.original0")?;
+        let v = vb.get((out_c, in_c, k), "weight.original1")?;
+        let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+        let scale = (g / norm_v)?;
+        v.broadcast_mul(&scale)?
+    } else if vb.contains_tensor("parametrizations.weight.original0") {
+        let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
+        let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
         let scale = (g / norm_v)?;
         v.broadcast_mul(&scale)?
@@ -215,6 +259,7 @@ fn load_conv1d(vb: VarBuilder, in_c: usize, out_c: usize, k: usize, stride: usiz
         stride,
         dilation,
         groups: 1,
+        cudnn_fwd_algo: None,
     };
 
     Ok(Conv1d::new(weight, bias, cfg))
@@ -233,9 +278,16 @@ impl SourceModuleHnNSF {
         noise_std: f64,
         sampling_rate: usize,
         voiced_threshold: f32,
-        vb: VarBuilder
+        vb: VarBuilder,
     ) -> Result<Self> {
-        let sine_gen = SineGen::new(harmonic_num, sine_amp, noise_std, sampling_rate, voiced_threshold, vb.clone())?;
+        let sine_gen = SineGen::new(
+            harmonic_num,
+            sine_amp,
+            noise_std,
+            sampling_rate,
+            voiced_threshold,
+            vb.clone(),
+        )?;
         // l_linear: Linear(harmonic_num + 1, 1)
         // Python: nn.Linear(harmonic_num + 1, 1)
         // Check if weight_norm is on logic? generator.py: SourceModuleHnNSF uses regular Linear.
@@ -257,7 +309,7 @@ impl SourceModuleHnNSF {
         // Linear expects [Batch, *, InFeatures].
         // We need to transpose to apply linear on Harmonics dimension?
         // Candle Linear applies to last dim.
-        // sine_waves: [Batch, Chan, Time]. We want [Batch, Time, Chan].
+        // sine_wavs: [Batch, Chan, Time]. We want [Batch, Time, Chan].
         let sine_wavs_t = sine_wavs.transpose(1, 2)?;
         let sine_merge = self.l_linear.forward(&sine_wavs_t)?;
         let sine_merge = sine_merge.tanh()?;
@@ -298,7 +350,12 @@ pub struct ResBlock {
 }
 
 impl ResBlock {
-    pub fn new(channels: usize, kernel_size: usize, dilations: &[usize], vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        channels: usize,
+        kernel_size: usize,
+        dilations: &[usize],
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let mut convs1 = Vec::new();
         let mut convs2 = Vec::new();
         let mut acti1 = Vec::new();
@@ -325,7 +382,12 @@ impl ResBlock {
             acti2.push(Snake::new(channels, vb_a2.pp(i))?);
         }
 
-        Ok(Self { convs1, convs2, acti1, acti2 })
+        Ok(Self {
+            convs1,
+            convs2,
+            acti1,
+            acti2,
+        })
     }
 }
 
@@ -344,16 +406,37 @@ impl Module for ResBlock {
     }
 }
 
-fn load_conv_transpose1d(vb: VarBuilder, in_c: usize, out_c: usize, k: usize, stride: usize, padding: usize) -> Result<candle_nn::ConvTranspose1d> {
+fn load_conv_transpose1d(
+    vb: VarBuilder,
+    in_c: usize,
+    out_c: usize,
+    k: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<candle_nn::ConvTranspose1d> {
     let weight = if vb.contains_tensor("weight_g") {
-         let g = vb.get((in_c, 1, 1), "weight_g")?;
-         let v = vb.get((in_c, out_c, k), "weight_v")?;
-         let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-         let scale = (g / norm)?;
-         v.broadcast_mul(&scale)?
+        let g = vb.get((out_c, 1, 1), "weight_g")?;
+        let v = vb.get((out_c, in_c, k), "weight_v")?;
+        let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+        let scale = (g / norm)?;
+        v.broadcast_mul(&scale)?
+    } else if vb.contains_tensor("weight.original0") {
+        let g = vb.get((out_c, 1, 1), "weight.original0")?;
+        let v = vb.get((out_c, in_c, k), "weight.original1")?;
+        let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+        let scale = (g / norm)?;
+        v.broadcast_mul(&scale)?
+    } else if vb.contains_tensor("parametrizations.weight.original0") {
+        let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
+        let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
+        let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+        let scale = (g / norm)?;
+        v.broadcast_mul(&scale)?
     } else {
-         vb.get((in_c, out_c, k), "weight")?
+        vb.get((out_c, in_c, k), "weight")?
     };
+
+    let weight = weight.transpose(0, 1)?; // Candle expects [In, Out, Kernel] for ConvTranspose1d
 
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get(out_c, "bias")?)
@@ -383,25 +466,24 @@ impl F0Predictor {
         let mut condnet = Vec::new();
         let vb_net = vb.pp("condnet");
 
-        // 0: Conv1d(in, cond)
-        condnet.push(load_conv1d(vb_net.pp(0), in_channels, cond_channels, 3, 1, 1, 1)?);
-
-        // 2, 4, 6, 8: Conv1d(cond, cond)
-        // Indices in Sequential are 0, 1(ELU), 2, 3(ELU)...
-        for i in [2, 4, 6, 8] {
-             condnet.push(load_conv1d(vb_net.pp(i), cond_channels, cond_channels, 3, 1, 1, 1)?);
+        // 0, 2, 4, 6, 8: Conv1d layers
+            let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, k / 2)?;
+            condnet.push(layer);
         }
 
         // Classifier
         let classifier = candle_nn::linear(cond_channels, 1, vb.pp("classifier"))?;
 
-        Ok(Self { condnet, classifier })
+        Ok(Self {
+            condnet,
+            classifier,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [Batch, 80, Time]
         let mut h = x.clone();
-        for (i, conv) in self.condnet.iter().enumerate() {
+        for conv in self.condnet.iter() {
             h = conv.forward(&h)?;
             h = h.elu(1.0)?; // ELU
         }
@@ -409,9 +491,7 @@ impl F0Predictor {
         let h_t = h.transpose(1, 2)?;
         let out = self.classifier.forward(&h_t)?;
         // out: [Batch, Time, 1]
-        // squeeze(-1) -> [Batch, Time]
-        // abs()
-        let f0 = out.squeeze(2)?.abs()?;
+        let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
         Ok(f0)
     }
 }
@@ -429,6 +509,7 @@ pub struct HiFTGenerator {
     f0_upsamp_scale: usize,
     num_kernels: usize,
     m_source: SourceModuleHnNSF,
+    device: Device,
 }
 
 impl HiFTGenerator {
@@ -438,20 +519,36 @@ impl HiFTGenerator {
         let base_ch = config.base_channels;
 
         // F0 Predictor
-        let f0_predictor = F0Predictor::new(config.in_channels, 512, vb.pp("f0_predictor"))?;
+        let _f0_predictor = F0Predictor::new(config.in_channels, 512, vb.pp("f0_predictor"))?;
 
         // Conv Pre
-        let conv_pre = load_conv1d(vb.pp("conv_pre"), config.in_channels, base_ch, 7, 1, 1, 3)?;
+        // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
+        let conv_pre_k = if vb.pp("conv_pre").contains_tensor("weight.original1") {
+             5
+        } else if vb.pp("conv_pre").contains_tensor("parametrizations.weight.original1") {
+             5
+        } else {
+             13
+        };
+        let conv_pre = load_conv1d(
+            vb.pp("conv_pre"),
+            config.in_channels,
+            base_ch,
+            conv_pre_k,
+            1,
+            1,
+            conv_pre_k / 2,
+        )?;
 
         // Ups
         let mut ups = Vec::new();
         let vb_ups = vb.pp("ups");
         for (i, (&u, &k)) in ups_rates.iter().zip(ups_kernels).enumerate() {
-             let in_c = base_ch / (1 << i);
-             let out_c = base_ch / (1 << (i + 1));
-             let pad = (k - u) / 2;
-             let conv = load_conv_transpose1d(vb_ups.pp(i), in_c, out_c, k, u, pad)?;
-             ups.push(conv);
+            let in_c = base_ch / (1 << i);
+            let out_c = base_ch / (1 << (i + 1));
+            let pad = (k - u) / 2;
+            let conv = load_conv_transpose1d(vb_ups.pp(i), in_c, out_c, k, u, pad)?;
+            ups.push(conv);
         }
 
         // Source Downs & ResBlocks
@@ -500,9 +597,9 @@ impl HiFTGenerator {
 
             // source_down
             let sd = if u == 1 {
-                 load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, 0)?
+                load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, 0)?
             } else {
-                 load_conv1d(vb_sd.pp(i), in_ch, ch, u*2, u, 1, u/2)?
+                load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, u / 2)?
             };
             source_downs.push(sd);
 
@@ -514,51 +611,73 @@ impl HiFTGenerator {
         // ResBlocks
         let mut resblocks = Vec::new();
         let vb_rb = vb.pp("resblocks");
-         // i loops over ups
+        // i loops over ups
         let num_ups = ups_rates.len();
         let num_kernels = config.resblock_kernel_sizes.len();
 
         for i in 0..num_ups {
             let ch = base_ch / (1 << (i + 1));
-            for (j, (&k, d)) in config.resblock_kernel_sizes.iter().zip(&config.resblock_dilation_sizes).enumerate() {
-                 let idx = i * num_kernels + j;
-                 let rb = ResBlock::new(ch, k, d, vb_rb.pp(idx))?;
-                 resblocks.push(rb);
+            for (j, (&k, d)) in config
+                .resblock_kernel_sizes
+                .iter()
+                .zip(&config.resblock_dilation_sizes)
+                .enumerate()
+            {
+                let idx = i * num_kernels + j;
+                let rb = ResBlock::new(ch, k, d, vb_rb.pp(idx))?;
+                resblocks.push(rb);
             }
         }
 
         // Post
         let last_ch = base_ch / (1 << num_ups);
-        let conv_post = load_conv1d(vb.pp("conv_post"), last_ch, config.istft_params_n_fft + 2, 7, 1, 1, 3)?;
-
-        let stft = crate::utils::InverseStftModule::new(config.istft_params_n_fft, config.istft_params_hop_len, vb.device())?;
-        let analysis_stft = crate::utils::StftModule::new(config.istft_params_n_fft, config.istft_params_hop_len, vb.device())?;
-
-        let m_source = SourceModuleHnNSF::new(
-             config.nb_harmonics,
-             0.1,
-             0.003,
-             config.sampling_rate,
-             0.0,
-             vb.pp("m_source")
+        let conv_post = load_conv1d(
+            vb.pp("conv_post"),
+            last_ch,
+            config.istft_params_n_fft + 2,
+            7,
+            1,
+            1,
+            3,
         )?;
 
-        // F0 Upsample scale
-        let total_upsample = ups_rates.iter().product::<usize>() * config.istft_params_hop_len;
+        let stft = crate::utils::InverseStftModule::new(
+            config.istft_params_n_fft,
+            config.istft_params_hop_len,
+            vb.device(),
+        )?;
+        let analysis_stft = crate::utils::StftModule::new(
+            config.istft_params_n_fft,
+            config.istft_params_hop_len,
+            vb.device(),
+        )?;
+
+        // Source
+        let m_source = SourceModuleHnNSF::new(
+            config.nb_harmonics,
+            0.1,
+            0.003,
+            config.sampling_rate,
+            0.0,
+            vb.pp("m_source"),
+        )?;
+
+        let f0_predictor = F0Predictor::new(config.in_channels, base_ch, vb.pp("f0_predictor"))?;
 
         Ok(Self {
             conv_pre,
             ups,
+            resblocks,
             source_downs,
             source_resblocks,
-            resblocks,
+            num_kernels,
             conv_post,
-            f0_predictor,
             stft,
             analysis_stft,
-            f0_upsamp_scale: total_upsample,
-            num_kernels,
             m_source,
+            f0_predictor,
+            f0_upsamp_scale: ups_rates.iter().product::<usize>() * config.istft_params_hop_len,
+            device: vb.device().clone(),
         })
     }
 
@@ -566,15 +685,18 @@ impl HiFTGenerator {
         // mel: [Batch, 80, Length]
 
         // 1. F0 Predictor
-        let f0 = self.f0_predictor.forward(mel)?; // [Batch, Length]
-        let f0 = f0.unsqueeze(1)?; // [Batch, 1, Length]
+        let f0 = self.f0_predictor.forward(mel)?; // [Batch, 1, Length_f0]
+        let mel_len = mel.dim(2)?;
+        let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
 
         // 2. Upsample F0 to Source Resolution
         // Nearest neighbor upsample: [B, 1, L] -> [B, 1, L, Scale] -> [B, 1, L*Scale]
         let (b, c, l) = f0.dims3()?;
-        let s = f0.unsqueeze(3)?
-                  .repeat((1, 1, 1, self.f0_upsamp_scale))?
-                  .reshape((b, c, l * self.f0_upsamp_scale))?;
+        let s = f0
+            .unsqueeze(3)?
+            .repeat((1, 1, 1, self.f0_upsamp_scale))?
+            .reshape((b, c, l * self.f0_upsamp_scale))?;
+        eprintln!("HiFT s (upsampled f0) shape: {:?}", s.shape());
 
         // 3. Source Module
         let (s_source, _, _) = self.m_source.forward(&s)?; // [B, 1, L_up]
@@ -605,31 +727,22 @@ impl HiFTGenerator {
             // Ref padding?
             // hift.py: if i == num_ups - 1: reflection_pad(x)
             if i == num_ups - 1 {
-                x = x.pad_with_zeros(2, 1, 0)?; // Hack: Reflection pad not trivial. Zero pad?
-                // Or implement reflection pad manually: cat(rev, x).
-                // Let's use replication or zero for now, verify later.
-                // ReflectionPad1d(1, 0) -> pad last dim by (1, 0). Left 1, Right 0?
-                // No, padding argument order.
-                // ReflectionPad1d((1, 0)): left=1, right=0.
-                // x is [B, C, T].
-                // x = torch.cat([x[:, :, 1:2], x], dim=2) ?
-                // Reflecting index 0?
-                // Let's assume zero pad or minimal error for now.
-                // Correctness fix: implement reflection.
                 let left = x.i((.., .., 1..2))?;
                 x = Tensor::cat(&[&left, &x], 2)?;
             }
 
             // Fusion
             // si = source_downs[i](s_stft)
-            // s_stft might need interpolation if resolutions mismatch?
-            // "source_downs" has strides that match the resolution hierarchy.
-            // s_stft frames = L_up / hop.
-            // x frames changes during ups.
-            // hift.py: source_downs match resolution.
             let si = self.source_downs[i].forward(&s_stft)?;
             let si = self.source_resblocks[i].forward(&si)?;
-            x = (x + si)?;
+
+            // Robust slice to handle boundary effects
+            let x_len = x.dim(2)?;
+            let si_len = si.dim(2)?;
+            let common_len = x_len.min(si_len);
+            let mut x_slice = x.i((.., .., ..common_len))?;
+            let si_slice = si.i((.., .., ..common_len))?;
+            x = (x_slice + si_slice)?;
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
@@ -660,29 +773,29 @@ impl HiFTGenerator {
 
         let magnitude = mag_log.exp()?;
         let phase = phase_in.sin()?; // Redundant sin in python?
-        // Python: phase = torch.sin(x[:, mid:, :])
-        // Then ISTFT(mag, phase) -> real = mag * cos(phase), img = mag * sin(phase).
-        // Since phase input is already sine of something?
-        // Wait, "actually, sin is redundancy" comment in python.
-        // It implies the network predicts 'phase' value which we treat as angle?
-        // No, it predicts x. Phase = sin(x).
-        // So Phase Angle is not x.
-        // Real part reconstruction uses cos(phase_angle). Imag uses sin(phase_angle).
-        // Here `phase` variable IS `sin(angle)`.
-        // So we have sin(theta). We need cos(theta).
-        // cos = sqrt(1 - sin^2). Sign?
-        // If we only predict sin(theta), we lose sign of cos(theta).
-        // Maybe HiFT assumes phase is in [-pi/2, pi/2] or something?
-        // Or "sin is redundancy" means we just use it as is?
-        // Let's check `_istft` in generator.py
-        // `real = magnitude * torch.cos(phase)`
-        // `img = magnitude * torch.sin(phase)`
-        // Wait, if `phase` variable passed to `_istft` is already result of `sin(x)`, then
-        // `real = mag * cos(sin(x))`. `img = mag * sin(sin(x))`.
-        // This seems weird if `x` is unbounded.
-        // If `x` is angle, then `phase = sin(x)`.
-        // Then we do `cos(sin(x))`.
-        // This seems to be the literal translation.
+                                     // Python: phase = torch.sin(x[:, mid:, :])
+                                     // Then ISTFT(mag, phase) -> real = mag * cos(phase), img = mag * sin(phase).
+                                     // Since phase input is already sine of something?
+                                     // Wait, "actually, sin is redundancy" comment in python.
+                                     // It implies the network predicts 'phase' value which we treat as angle?
+                                     // No, it predicts x. Phase = sin(x).
+                                     // So Phase Angle is not x.
+                                     // Real part reconstruction uses cos(phase_angle). Imag uses sin(phase_angle).
+                                     // Here `phase` variable IS `sin(angle)`.
+                                     // So we have sin(theta). We need cos(theta).
+                                     // cos = sqrt(1 - sin^2). Sign?
+                                     // If we only predict sin(theta), we lose sign of cos(theta).
+                                     // Maybe HiFT assumes phase is in [-pi/2, pi/2] or something?
+                                     // Or "sin is redundancy" means we just use it as is?
+                                     // Let's check `_istft` in generator.py
+                                     // `real = magnitude * torch.cos(phase)`
+                                     // `img = magnitude * torch.sin(phase)`
+                                     // Wait, if `phase` variable passed to `_istft` is already result of `sin(x)`, then
+                                     // `real = mag * cos(sin(x))`. `img = mag * sin(sin(x))`.
+                                     // This seems weird if `x` is unbounded.
+                                     // If `x` is angle, then `phase = sin(x)`.
+                                     // Then we do `cos(sin(x))`.
+                                     // This seems to be the literal translation.
 
         // I will implement `stft.forward` taking `magnitude` and `phase_input`.
         // Logic inside `InverseStftModule::forward` was `mag * phase.cos()`.
@@ -710,7 +823,6 @@ impl HiFTGenerator {
     }
 }
 
-
 pub struct HiFTConfig {
     pub in_channels: usize,
     pub base_channels: usize,
@@ -726,21 +838,44 @@ pub struct HiFTConfig {
     pub source_resblock_dilation_sizes: Vec<Vec<usize>>,
 }
 
-impl Default for HiFTConfig {
-    fn default() -> Self {
+impl HiFTConfig {
+    pub fn new(n_fft: usize) -> Self {
         Self {
             in_channels: 80,
             base_channels: 512,
             nb_harmonics: 8,
-            sampling_rate: 22050,
-            upsample_rates: vec![8, 8],
-            upsample_kernel_sizes: vec![16, 16],
-            istft_params_n_fft: 16,
+            sampling_rate: 24000,
+            upsample_rates: vec![8, 5, 3],
+            upsample_kernel_sizes: vec![16, 11, 7],
+            istft_params_n_fft: n_fft,
             istft_params_hop_len: 4,
             resblock_kernel_sizes: vec![3, 7, 11],
-            resblock_dilation_sizes: vec![vec![1,3,5], vec![1,3,5], vec![1,3,5]],
-            source_resblock_kernel_sizes: vec![7, 11],
-            source_resblock_dilation_sizes: vec![vec![1,3,5], vec![1,3,5]],
+            resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            source_resblock_kernel_sizes: vec![7, 7, 11],
+            source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
         }
+    }
+
+    pub fn fun_cosyvoice_3_0_5b(n_fft: usize) -> Self {
+        Self {
+            in_channels: 80,
+            base_channels: 512,
+            nb_harmonics: 8,
+            sampling_rate: 24000,
+            upsample_rates: vec![8, 5, 3],
+            upsample_kernel_sizes: vec![16, 11, 7],
+            istft_params_n_fft: n_fft,
+            istft_params_hop_len: 4,
+            resblock_kernel_sizes: vec![3, 7, 11],
+            resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            source_resblock_kernel_sizes: vec![7, 7, 11],
+            source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+        }
+    }
+}
+
+impl Default for HiFTConfig {
+    fn default() -> Self {
+        Self::new(16)
     }
 }

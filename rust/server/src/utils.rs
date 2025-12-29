@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor, DType};
+use candle_core::{DType, Device, Result, Tensor};
 use std::f64::consts::PI;
 
 pub struct STFT {
@@ -30,7 +30,7 @@ impl STFT {
     /// Returns: (magnitude, phase) or (real, imag)?
     /// HiFT expects: pure STFT return.
     /// Returns: (real, imag) each of shape [Batch, Freq, Frames]
-    pub fn stft(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn forward(&self, _x: &Tensor) -> Result<(Tensor, Tensor)> {
         // 1. Pad signal if needed (reflection padding is usually handled outside or assume input is padded)
         // For HiFT, input 's' is source excitation, usually matches hop size logic.
 
@@ -50,11 +50,11 @@ impl STFT {
 }
 
 pub struct StftModule {
-    n_fft: usize,
+    _n_fft: usize,
     hop_length: usize,
     filters_real: Tensor, // [n_fft/2 + 1, 1, n_fft]
     filters_imag: Tensor, // [n_fft/2 + 1, 1, n_fft]
-    device: Device,
+    _device: Device,
 }
 
 impl StftModule {
@@ -64,41 +64,39 @@ impl StftModule {
 
         // Apply window to filters
         // filter = dft_basis * window
-        let filters_real = (dft_real * &window.unsqueeze(0)?)?;
-        let filters_imag = (dft_imag * &window.unsqueeze(0)?)?;
+        let filters_real = dft_real.broadcast_mul(&window.unsqueeze(0)?)?;
+        let filters_imag = dft_imag.broadcast_mul(&window.unsqueeze(0)?)?;
 
         // Reshape for Conv1d: [OutCh, InCh, Kernel] -> [n_fft/2+1, 1, n_fft]
         let filters_real = filters_real.unsqueeze(1)?;
         let filters_imag = filters_imag.unsqueeze(1)?;
 
         Ok(Self {
-            n_fft,
+            _n_fft: n_fft,
             hop_length,
             filters_real,
             filters_imag,
-            device: device.clone(),
+            _device: device.clone(),
         })
     }
 
     pub fn transform(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         // x: [Batch, Time] -> need [Batch, 1, Time] for conv1d
-        let x_unsqueezed = x.unsqueeze(1)?;
+        let x_unsqueezed = if x.rank() == 2 {
+             x.unsqueeze(1)?
+        } else {
+             x.clone()
+        };
 
         let real = x_unsqueezed.conv1d(
             &self.filters_real,
             0,
             self.hop_length,
             1, // dilation
-            1  // groups
+            1, // groups
         )?;
 
-        let imag = x_unsqueezed.conv1d(
-            &self.filters_imag,
-            0,
-            self.hop_length,
-            1,
-            1
-        )?;
+        let imag = x_unsqueezed.conv1d(&self.filters_imag, 0, self.hop_length, 1, 1)?;
 
         // Output: [Batch, Freq, Frames]
         Ok((real, imag))
@@ -106,19 +104,18 @@ impl StftModule {
 }
 
 use candle_nn::{ConvTranspose1d, ConvTranspose1dConfig, Module};
-use candle_core::IndexOp;
 
 pub struct InverseStftModule {
-    n_fft: usize,
-    hop_length: usize,
+    _n_fft: usize,
+    _hop_length: usize,
     conv_real: ConvTranspose1d,
     conv_imag: ConvTranspose1d,
-    device: Device,
+    _device: Device,
 }
 
 impl InverseStftModule {
     pub fn new(n_fft: usize, hop_length: usize, device: &Device) -> Result<Self> {
-        let window = hann_window(n_fft, device)?; // [n_fft]
+        let _window = hann_window(n_fft, device)?; // [n_fft]
 
         let n_bins = n_fft / 2 + 1;
         let mut real_weights = Vec::with_capacity(n_bins * n_fft);
@@ -174,19 +171,19 @@ impl InverseStftModule {
         let conv_imag = ConvTranspose1d::new(w_imag, None, cfg);
 
         Ok(Self {
-            n_fft,
-            hop_length,
+            _n_fft: n_fft,
+            _hop_length: hop_length,
             conv_real,
             conv_imag,
-            device: device.clone(),
+            _device: device.clone(),
         })
     }
 
     /// Input: Magnitude, Phase [Batch, Freq, Frames]
     /// Output: Audio [Batch, 1, Time]
     pub fn forward(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Tensor> {
-        let real = (magnitude * phase.cos()?)?;
-        let imag = (magnitude * phase.sin()?)?;
+        let real = magnitude.broadcast_mul(&phase.cos()?)?;
+        let imag = magnitude.broadcast_mul(&phase.sin()?)?;
 
         // ConvTranspose1d expects [Batch, InChannels, Time/Frames]
         // Our input is [Batch, Freq, Frames].
@@ -203,7 +200,6 @@ impl InverseStftModule {
         Ok(y)
     }
 }
-
 
 /// Generates Hann Window of size N
 fn hann_window(n: usize, device: &Device) -> Result<Tensor> {

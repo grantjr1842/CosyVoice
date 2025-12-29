@@ -54,6 +54,6 @@ wetext==0.0.4
 wget==3.2
 
 # Advanced optimizations
-bitsandbytes>=0.45.0; sys_platform == 'linux'
+
 accelerate>=1.2.0
 flash-attn>=2.5.0; sys_platform == 'linux'

@@ -330,7 +330,7 @@ impl Attention {
 
         let mut attn = (q.matmul(&k.transpose(2, 3)?)? * self.scale)?;
 
-        let m = mask.unsqueeze(1)?; // [B, 1, 1, N]
+        let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
         let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?;
         attn = candle_nn::ops::softmax(&attn.broadcast_sub(&m_inv)?, 3)?;
 

@@ -1,7 +1,7 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
-use std::sync::Arc;
 use candle_transformers::utils::repeat_kv;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -49,15 +49,6 @@ impl RotaryEmbedding {
     fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.hidden_size / cfg.num_attention_heads;
         let max_seq_len = cfg.max_position_embeddings;
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
-            .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
             sin: freqs.sin()?,
@@ -142,7 +133,8 @@ impl Attention {
         let use_flash_attn = if cfg!(feature = "cuda") {
             // Check if device is CUDA and supports it (could be dynamic)
             // For now, assume true if cuda feature is on and we are using CUDA device
-            true
+            // TODO: Implement Flash Attention call
+            false
         } else {
             false
         };
@@ -201,7 +193,7 @@ impl Attention {
 
         // Flash Attention Logic
         let attn_output = if self.use_flash_attn {
-             panic!("Flash Attention not supported without cuda feature");
+            panic!("Flash Attention not supported without cuda feature");
         } else {
             let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
             let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
@@ -276,34 +268,38 @@ impl DecoderLayer {
 }
 
 pub struct Model {
-    embed_tokens: candle_nn::Embedding,
+    pub embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    sliding_window: usize,
-    device: Device,
-    dtype: DType,
+    _sliding_window: usize,
+    _device: Device,
+    _dtype: DType,
 }
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
+        eprintln!("Qwen2: Loading embed_tokens...");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        eprintln!("Qwen2: Loading rotary_emb...");
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
+            eprintln!("Qwen2: Loading layer {}/{}...", layer_idx, cfg.num_hidden_layers);
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
+        eprintln!("Qwen2: Loading norm...");
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         Ok(Self {
             embed_tokens,
             layers,
             norm,
-            sliding_window: cfg.sliding_window,
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
+            _sliding_window: cfg.sliding_window,
+            _device: vb.device().clone(),
+            _dtype: vb.dtype(),
         })
     }
 
@@ -367,7 +363,11 @@ impl ModelForCausalLM {
             .apply(&self.lm_head)
     }
 
-    pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
         let (_b_size, seq_len, _hidden) = inputs_embeds.dims3()?;
         self.base_model
             .forward_embeds(inputs_embeds, seqlen_offset, None)?
