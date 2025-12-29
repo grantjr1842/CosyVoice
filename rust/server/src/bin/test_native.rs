@@ -31,8 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Current Directory: {:?}", std::env::current_dir().unwrap());
 
     // Load test artifacts
-    let artifact_path_str = "../../tests/test_artifacts.safetensors";
-    let artifact_path = Path::new(artifact_path_str);
+    let artifact_path_str = std::env::var("ARTIFACT_PATH")
+        .unwrap_or_else(|_| "tests/test_artifacts.safetensors".to_string());
+    let artifact_path = Path::new(&artifact_path_str);
     if !artifact_path.exists() {
         eprintln!("Error: {} not found. Run 'pixi run python tests/generate_test_artifacts.py' first.", artifact_path_str);
         std::process::exit(1);
@@ -68,14 +69,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n✅ Engine loaded successfully!");
 
     // Run synthesis
-    println!("Synthesizing (Direct/Bypassing Frontend)...");
+    println!("\nSynthesizing (Direct/Bypassing Frontend)...");
+    let start_total = std::time::Instant::now();
 
     // 1. Embed text tokens
-    println!("Embedding text tokens...");
+    println!("Step 1: Embedding text tokens...");
+    let start_embed = std::time::Instant::now();
     let text_embeds = engine.llm.embed_text_tokens(&text_ids)?;
+    let duration_embed = start_embed.elapsed();
+    println!("   Done in {:?}", duration_embed);
 
     // 2. Full Synthesis
-    // Force sampling_k=1 for determinism if possible, or 25 as config
+    println!("Step 2: Full Synthesis (LLM -> Flow -> HiFT)...");
+    let start_synth = std::time::Instant::now();
     let audio_samples = engine.synthesize_full(
         &text_embeds,
         Some(&speech_tokens),
@@ -83,8 +89,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &speaker_embedding,
         25
     )?;
+    let duration_synth = start_synth.elapsed();
+    let duration_total = start_total.elapsed();
 
-    println!("Synthesis complete! Generated {} samples.", audio_samples.len());
+    let audio_duration_sec = audio_samples.len() as f64 / 24000.0;
+    let rtf = duration_total.as_secs_f64() / audio_duration_sec;
+
+    println!("\n✅ Synthesis complete!");
+    println!("   Total duration: {:?}", duration_total);
+    println!("   Audio duration: {:.2}s", audio_duration_sec);
+    println!("   RTF: {:.4}", rtf);
+    println!("   Generated {} samples.", audio_samples.len());
 
     // Save to WAV
     let spec = hound::WavSpec {

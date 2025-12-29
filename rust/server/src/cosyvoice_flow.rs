@@ -207,7 +207,7 @@ impl CosyVoiceFlow {
 
         // Concatenate prompt and target tokens
         let combined_token = Tensor::cat(&[prompt_token, token], 1)?;
-        let token_len = combined_token.dim(1)?;
+        // let token_len = combined_token.dim(1)?;
 
         // Embed tokens
         let token_emb = self.input_embedding.forward(&combined_token)?;
@@ -279,7 +279,7 @@ fn repeat_interleave(x: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
     }
 
     let shape = x.shape().dims();
-    let n = shape[dim];
+    // let n = shape[dim];
 
     // Reshape, expand, and flatten back
     // For dim=1: [B, N, D] -> [B, N, 1, D] -> [B, N, R, D] -> [B, N*R, D]

@@ -2,7 +2,7 @@
 //!
 //! This module wraps the Qwen2 model and adds speech token generation capabilities.
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use rand::Rng;
 

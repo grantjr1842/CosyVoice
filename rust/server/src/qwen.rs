@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
@@ -48,8 +48,15 @@ struct RotaryEmbedding {
 impl RotaryEmbedding {
     fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.hidden_size / cfg.num_attention_heads;
-        let max_seq_len = cfg.max_position_embeddings;
-        let freqs = t.matmul(&inv_freq)?;
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq = Tensor::new(inv_freq.as_slice(), dev)?;
+        let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
+            .to_dtype(dtype)?
+            .reshape((cfg.max_position_embeddings, 1))?;
+        let freqs = t.matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,

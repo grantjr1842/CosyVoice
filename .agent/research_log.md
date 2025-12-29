@@ -1,33 +1,50 @@
-# Research Log - TTS Audio and CUDA Issues
+# Audio Quality Research Log
 
-## Findings
+## Date: 2025-12-29
 
-### 1. ONNX Runtime (ORT) Hang/OOM
-- **Issue**: `SessionBuilder::commit_from_memory` hangs when loading the `speech_tokenizer_v3.onnx` (969MB) on CPU.
-- **Cause**: High initial memory consumption during model initialization. Without GPU acceleration, ORT on CPU may exceed available memory or hang during optimization.
-- **Solution**: Re-enabling GPU providers (CUDA/TensorRT) is essential for large models. If CPU must be used, disabling optimizations or using `mimalloc` might help.
+## Objective
+Improve the audio quality of CosyVoice3 TTS output.
 
-### 2. Missing `libcublasLt.so.12`
-- **Issue**: `ort` fails to load the CUDA execution provider because `libcublasLt.so.12` is not found.
-- **Cause**: This is a core CUDA 12 library. Pixi installs dependencies in `.pixi/envs/default`, but the system loader doesn't know about them unless `LD_LIBRARY_PATH` is correctly set.
-- **Action**: Locate the library within the `.pixi` environment and ensure it's in the search path.
+## Research Findings
 
-### 3. Candle CUDA Detection
-- **Issue**: `candle_core::utils::cuda_is_available()` was returning false.
-- **Cause**: Missing `cuda` feature flag during `cargo run`.
-- **Solution**: Use `--features cuda`. This is already verified to work.
+### Key Audio Quality Factors in CosyVoice
 
-### 4. Audio Garble
-- **Issue**: Garbled output audio.
-- **Cause**: Redundant `repeat_interleave` in `cosyvoice_flow.rs` caused double upsampling of mel features.
-- **Solution**: Removed the redundant call. Verified theoretically, needs final audio validation once the engine runs.
+Based on web research and codebase analysis:
 
-### 5. CUDA Device-Side Assert
-- **Issue**: `Assertion `ids[id_i] < src_dim_size` failed` in `PreLookaheadLayer::forward`.
-- **Cause**: Device mismatch between test runner and engine, or incorrect padding/upsampling logic.
-- **Solution**: Ensured consistent device selection. Fixed the upsampling logic.
+1. **Input Reference Audio Quality**
+   - Clear reference audio (3-10 seconds) is crucial
+   - Single speaker, minimal background noise
+   - Natural speaking pace
 
-## Next Steps
-- Finalize the implementation plan.
-- Resolve ORT library paths.
-- Run end-to-end verification.
+2. **Sampling Parameters (LLM)**
+   - `top_p` (nucleus sampling): controls diversity (default: 0.8)
+   - `top_k`: limits token choices (default: 25)
+   - `tau_r`: repetition penalty (default: 0.1)
+   - Higher quality often comes from lower sampling temperature
+
+3. **Flow Matching (CFM/DiT) Parameters**
+   - `inference_cfg_rate`: Classifier-free guidance strength (default: 0.7)
+   - `sigma_min`: minimum noise level
+   - Higher CFG rate = more adherence to content but potentially less natural
+
+4. **HiFi-GAN Vocoder**
+   - `audio_limit`: max amplitude (default: 0.99)
+   - Upsample rates and kernel sizes affect quality
+   - `nsf_alpha` and `nsf_sigma` control harmonic generation
+
+5. **Post-Processing Opportunities**
+   - Noise reduction
+   - Audio level normalization
+   - Sample rate upscaling (24kHz → 48kHz)
+
+## Potential Improvements
+
+### Quick Wins
+1. **Improve reference audio quality** - Ensure prompt audio is clean and well-recorded
+2. **Tune sampling parameters** - Lower `top_p` for more consistent output
+3. **Enable supersampling** - Output at higher sample rates
+
+### Advanced
+1. **Enable torch.compile optimizations** - Already implemented
+2. **Use 32-bit precision for vocoder** - May improve quality at cost of speed
+3. **Post-process with audio enhancement** - External tool integration
