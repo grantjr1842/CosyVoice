@@ -35,18 +35,32 @@ pub struct TimestepEmbedding {
 
 impl TimestepEmbedding {
     pub fn new(vb: VarBuilder, dim: usize, inner_dim: usize) -> Result<Self> {
-        let linear_1 = linear(dim, inner_dim, vb.pp("linear_1"))?;
-        let linear_2 = linear(inner_dim, inner_dim, vb.pp("linear_2"))?;
-        Ok(Self {
-            linear_1,
-            linear_2,
-            silu: candle_nn::Activation::Silu,
-        })
+    // PyTorch uses time_mlp.0 and time_mlp.2 (Sequential indices) instead of linear_1/linear_2
+    // Try both naming conventions for compatibility
+    let time_mlp = vb.pp("time_mlp");
+    let linear_1 = if time_mlp.contains_tensor("0.weight") {
+        linear(dim, inner_dim, time_mlp.pp("0"))?
+    } else {
+        linear(dim, inner_dim, vb.pp("linear_1"))?
+    };
+    let linear_2 = if time_mlp.contains_tensor("2.weight") {
+        linear(inner_dim, inner_dim, time_mlp.pp("2"))?
+    } else {
+        linear(inner_dim, inner_dim, vb.pp("linear_2"))?
+    };
+    Ok(Self {
+        linear_1,
+        linear_2,
+        silu: candle_nn::Activation::Silu,
+    })
     }
 
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
         let t_emb = sinusoidal_embedding(t, 256)?; // 256 is default dim for SinusPositionEmbedding
-        t_emb.apply(&self.linear_1)?.apply(&self.silu)?.apply(&self.linear_2)
+        t_emb
+            .apply(&self.linear_1)?
+            .apply(&self.silu)?
+            .apply(&self.linear_2)
     }
 }
 
@@ -58,7 +72,11 @@ pub struct AdaLayerNormZero {
 
 impl AdaLayerNormZero {
     pub fn new(vb: VarBuilder, dim: usize) -> Result<Self> {
-        let norm = layer_norm_no_bias(dim, 1e-6, vb.clone())?;
+        let device = vb.device();
+        let weight = Tensor::ones((dim,), DType::F32, device)?;
+        let bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let norm = LayerNorm::new(weight, bias, 1e-6);
+
         let linear = linear(dim, dim * 6, vb.pp("linear"))?;
         Ok(Self {
             norm,
@@ -116,7 +134,6 @@ impl AdaLayerNormZeroFinal {
 
         let x = self.norm.forward(x)?;
 
-
         x.broadcast_mul(&(scale.affine(1.0, 1.0)?))?
             .broadcast_add(&shift)
     }
@@ -131,9 +148,14 @@ pub struct DiTBlock {
 
 impl DiTBlock {
     pub fn new(vb: VarBuilder, dim: usize, heads: usize, dim_head: usize) -> Result<Self> {
+        let device = vb.device();
         let attn_norm = AdaLayerNormZero::new(vb.pp("attn_norm"), dim)?;
         let attn = Attention::new(vb.pp("attn"), dim, heads, dim_head)?;
-        let ff_norm = layer_norm_no_bias(dim, 1e-6, vb.pp("ff_norm"))?;
+
+        let ff_norm_weight = Tensor::ones((dim,), DType::F32, device)?;
+        let ff_norm_bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let ff_norm = LayerNorm::new(ff_norm_weight, ff_norm_bias, 1e-6);
+
         let ff = FeedForward::new(vb.pp("ff"), dim, 2)?;
         Ok(Self {
             attn_norm,
@@ -143,8 +165,17 @@ impl DiTBlock {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, t_emb: &Tensor, mask: &Tensor, rope: Option<&(Tensor, Tensor)>) -> Result<Tensor> {
-        let emb = self.attn_norm.linear.forward(&t_emb.apply(&self.attn_norm.silu)?)?;
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        t_emb: &Tensor,
+        mask: &Tensor,
+        rope: Option<&(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let emb = self
+            .attn_norm
+            .linear
+            .forward(&t_emb.apply(&self.attn_norm.silu)?)?;
         let chunks = emb.chunk(6, 1)?;
 
         let shift_msa = chunks[0].unsqueeze(1)?;
@@ -157,25 +188,46 @@ impl DiTBlock {
         // MSA
         let res_msa = x.clone();
         let x_norm = self.attn_norm.norm.forward(x)?;
-        eprintln!("DIT MSA: x_norm={:?}, scale_msa={:?}, shift_msa={:?}", x_norm.shape(), scale_msa.shape(), shift_msa.shape());
-        let x_norm = x_norm.broadcast_mul(&(scale_msa.affine(1.0, 1.0)?))?
+        eprintln!(
+            "DIT MSA: x_norm={:?}, scale_msa={:?}, shift_msa={:?}",
+            x_norm.shape(),
+            scale_msa.shape(),
+            shift_msa.shape()
+        );
+        let x_norm = x_norm
+            .broadcast_mul(&(scale_msa.affine(1.0, 1.0)?))?
             .broadcast_add(&shift_msa)?;
         let x_attn = self.attn.forward(&x_norm, mask, rope)?;
 
-        eprintln!("DIT MSA ADD: res_msa={:?}, x_attn={:?}, gate_msa={:?}", res_msa.shape(), x_attn.shape(), gate_msa.shape());
+        eprintln!(
+            "DIT MSA ADD: res_msa={:?}, x_attn={:?}, gate_msa={:?}",
+            res_msa.shape(),
+            x_attn.shape(),
+            gate_msa.shape()
+        );
         let mul_msa = x_attn.broadcast_mul(&gate_msa)?;
         let x = res_msa.broadcast_add(&mul_msa)?;
 
         // MLP
         let res_mlp = x.clone();
         let x_norm = self.ff_norm.forward(&x)?;
-        eprintln!("DIT MLP: x_norm={:?}, scale_mlp={:?}, shift_mlp={:?}", x_norm.shape(), scale_mlp.shape(), shift_mlp.shape());
-        let x_norm = x_norm.broadcast_mul(&(scale_mlp.affine(1.0, 1.0)?))?
+        eprintln!(
+            "DIT MLP: x_norm={:?}, scale_mlp={:?}, shift_mlp={:?}",
+            x_norm.shape(),
+            scale_mlp.shape(),
+            shift_mlp.shape()
+        );
+        let x_norm = x_norm
+            .broadcast_mul(&(scale_mlp.affine(1.0, 1.0)?))?
             .broadcast_add(&shift_mlp)?;
         let x_mlp = self.ff.forward(&x_norm)?;
 
-        eprintln!("DIT MLP ADD: res_mlp={:?}, x_mlp={:?}, gate_mlp={:?}", res_mlp.shape(), x_mlp.shape(), gate_mlp.shape());
-        let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
+        eprintln!(
+            "DIT MLP ADD: res_mlp={:?}, x_mlp={:?}, gate_mlp={:?}",
+            res_mlp.shape(),
+            x_mlp.shape(),
+            gate_mlp.shape()
+        );
         let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
         let x = res_mlp.broadcast_add(&mul_mlp)?;
 
@@ -196,9 +248,10 @@ pub struct FeedForward {
 
 impl FeedForward {
     pub fn new(vb: VarBuilder, dim: usize, mult: usize) -> Result<Self> {
+        // FeedForward: Python Sequential(Linear, Gelu, Linear) -> Rust names match
         let inner_dim = dim * mult;
-        let project_in = linear(dim, inner_dim, vb.pp("project_in"))?;
-        let project_out = linear(inner_dim, dim, vb.pp("project_out"))?;
+        let project_in = linear(dim, inner_dim, vb.pp("ff.0.0"))?;
+        let project_out = linear(inner_dim, dim, vb.pp("ff.2"))?;
         Ok(Self {
             project_in,
             project_out,
@@ -207,7 +260,9 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.apply(&self.project_in)?.apply(&self.act)?.apply(&self.project_out)
+        x.apply(&self.project_in)?
+            .apply(&self.act)?
+            .apply(&self.project_out)
     }
 }
 
@@ -239,18 +294,32 @@ impl Attention {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, mask: &Tensor, rope: Option<&(Tensor, Tensor)>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        rope: Option<&(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let q = self.to_q.forward(x)?;
         let k = self.to_k.forward(x)?;
         let v = self.to_v.forward(x)?;
 
-        let q = q.reshape((b, n, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let k = k.reshape((b, n, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let v = v.reshape((b, n, self.heads, self.dim_head))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b, n, self.heads, self.dim_head))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, n, self.heads, self.dim_head))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, n, self.heads, self.dim_head))?
+            .transpose(1, 2)?;
 
         let (q, k) = if let Some((cos, sin)) = rope {
-            (apply_rotary_pos_emb(&q, cos, sin)?, apply_rotary_pos_emb(&k, cos, sin)?)
+            (
+                apply_rotary_pos_emb(&q, cos, sin)?,
+                apply_rotary_pos_emb(&k, cos, sin)?,
+            )
         } else {
             (q, k)
         };
@@ -267,7 +336,10 @@ impl Attention {
 
         let v = v.contiguous()?;
         let out = attn.matmul(&v)?;
-        self.to_out.forward(&out.transpose(1, 2)?.reshape((b, n, self.heads * self.dim_head))?)
+        self.to_out.forward(
+            &out.transpose(1, 2)?
+                .reshape((b, n, self.heads * self.dim_head))?,
+        )
     }
 }
 
@@ -316,7 +388,10 @@ pub struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub fn new(dim: usize, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let freqs: Vec<f32> = (0..dim).step_by(2).map(|i| 1.0 / 10000.0f32.powf(i as f32 / dim as f32)).collect();
+        let freqs: Vec<f32> = (0..dim)
+            .step_by(2)
+            .map(|i| 1.0 / 10000.0f32.powf(i as f32 / dim as f32))
+            .collect();
         let freqs = Tensor::from_vec(freqs, (1, dim / 2), device)?;
         let t = Tensor::arange(0.0f32, max_seq_len as f32, device)?.reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&freqs)?;
@@ -357,7 +432,12 @@ fn sinusoidal_embedding(x: &Tensor, dim: usize) -> Result<Tensor> {
     // args = scale * x.unsqueeze(1) * freqs.unsqueeze(0)
     let x_uns = x.unsqueeze(1)?.to_dtype(DType::F32)?;
     let freqs_uns = freqs.unsqueeze(0)?;
-    eprintln!("SINUSOIDAL: x={:?}, x_uns={:?}, freqs_uns={:?}", x.shape(), x_uns.shape(), freqs_uns.shape());
+    eprintln!(
+        "SINUSOIDAL: x={:?}, x_uns={:?}, freqs_uns={:?}",
+        x.shape(),
+        x_uns.shape(),
+        freqs_uns.shape()
+    );
     let args = (x_uns * scale)?.broadcast_mul(&freqs_uns)?;
 
     let emb_sin = args.sin()?;
@@ -385,10 +465,7 @@ impl CausalConvPositionEmbedding {
         // So weights are conv1.0.weight.
         let conv1 = candle_nn::conv1d(dim, dim, 31, conv_cfg, vb.pp("conv1.0"))?;
         let conv2 = candle_nn::conv1d(dim, dim, 31, conv_cfg, vb.pp("conv2.0"))?;
-        Ok(Self {
-            conv1,
-            conv2,
-        })
+        Ok(Self { conv1, conv2 })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -417,7 +494,10 @@ impl InputEmbedding {
     pub fn new(vb: VarBuilder, mel_dim: usize, out_dim: usize) -> Result<Self> {
         let proj = linear(mel_dim * 4, out_dim, vb.pp("proj"))?;
         let conv_pos_embed = CausalConvPositionEmbedding::new(vb.pp("conv_pos_embed"), out_dim)?;
-        Ok(Self { proj, conv_pos_embed })
+        Ok(Self {
+            proj,
+            conv_pos_embed,
+        })
     }
 
     pub fn forward(&self, x: &Tensor, cond: &Tensor, mu: &Tensor, spks: &Tensor) -> Result<Tensor> {
@@ -447,7 +527,12 @@ impl DiT {
         let mut transformer_blocks = Vec::new();
         let vb_blocks = vb.pp("transformer_blocks");
         for i in 0..cfg.depth {
-            transformer_blocks.push(DiTBlock::new(vb_blocks.pp(i), cfg.dim, cfg.heads, cfg.dim_head)?);
+            transformer_blocks.push(DiTBlock::new(
+                vb_blocks.pp(i),
+                cfg.dim,
+                cfg.heads,
+                cfg.dim_head,
+            )?);
         }
         let norm_out = AdaLayerNormZeroFinal::new(vb.pp("norm_out"), cfg.dim)?;
         let proj_out = linear(cfg.dim, cfg.mel_dim, vb.pp("proj_out"))?;
@@ -462,14 +547,34 @@ impl DiT {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, mask: &Tensor, mu: &Tensor, t: &Tensor, spks: &Tensor, cond: &Tensor) -> Result<Tensor> {
-        eprintln!("DIT START: x={:?}, mask={:?}, mu={:?}, t={:?}, spks={:?}, cond={:?}", x.shape(), mask.shape(), mu.shape(), t.shape(), spks.shape(), cond.shape());
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        mu: &Tensor,
+        t: &Tensor,
+        spks: &Tensor,
+        cond: &Tensor,
+    ) -> Result<Tensor> {
+        eprintln!(
+            "DIT START: x={:?}, mask={:?}, mu={:?}, t={:?}, spks={:?}, cond={:?}",
+            x.shape(),
+            mask.shape(),
+            mu.shape(),
+            t.shape(),
+            spks.shape(),
+            cond.shape()
+        );
         let x = self.input_embed.forward(x, cond, mu, spks)?;
         let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
         // Calculate mean and std manually or just print first few
         let sum: f32 = x_vec.iter().sum();
         let mean = sum / x_vec.len() as f32;
-        eprintln!("Rust InputEmbed output: mean={}, first 5={:?}", mean, &x_vec[0..5]);
+        eprintln!(
+            "Rust InputEmbed output: mean={}, first 5={:?}",
+            mean,
+            &x_vec[0..5]
+        );
         eprintln!("DIT: after input_embed x={:?}", x.shape());
         // TimestepEmbedding handles sinusoidal embedding internally now
         let t_emb = self.time_embed.forward(t)?;
@@ -479,12 +584,21 @@ impl DiT {
 
         let mut x = x;
         for (i, block) in self.transformer_blocks.iter().enumerate() {
-            eprintln!("DIT: entering block {} with x={:?}, t_emb={:?}", i, x.shape(), t_emb.shape());
+            eprintln!(
+                "DIT: entering block {} with x={:?}, t_emb={:?}",
+                i,
+                x.shape(),
+                t_emb.shape()
+            );
             x = block.forward(&x, &t_emb, mask, rope.as_ref())?;
             eprintln!("DIT: exiting block {} with x={:?}", i, x.shape());
         }
 
-        eprintln!("DIT: before norm_out x={:?}, t_emb={:?}", x.shape(), t_emb.shape());
+        eprintln!(
+            "DIT: before norm_out x={:?}, t_emb={:?}",
+            x.shape(),
+            t_emb.shape()
+        );
         std::io::Write::flush(&mut std::io::stderr()).unwrap();
         std::io::Write::flush(&mut std::io::stderr()).unwrap();
         x = self.norm_out.forward(&x, &t_emb)?;
@@ -505,12 +619,16 @@ impl DiT {
     }
 }
 
-fn t_to_sinusoidal(t: &Tensor, dim: usize) -> Result<Tensor> {
+fn _t_to_sinusoidal(t: &Tensor, dim: usize) -> Result<Tensor> {
     let device = t.device();
     let half_dim = dim / 2;
-    let inv_freq: Vec<f32> = (0..half_dim).map(|i| 1.0 / 10000.0f32.powf(i as f32 / (half_dim as f32 - 1.0))).collect();
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / 10000.0f32.powf(i as f32 / (half_dim as f32 - 1.0)))
+        .collect();
     let inv_freq = Tensor::from_vec(inv_freq, half_dim, device)?;
-    let outer = t.reshape((t.elem_count(), 1))?.matmul(&inv_freq.reshape((1, half_dim))?)?;
+    let outer = t
+        .reshape((t.elem_count(), 1))?
+        .matmul(&inv_freq.reshape((1, half_dim))?)?;
     Tensor::cat(&[outer.sin()?, outer.cos()?], 1)
 }
 
@@ -521,16 +639,36 @@ pub struct ConditionalCFM {
 }
 
 impl ConditionalCFM {
-    pub fn new(_vb: VarBuilder, estimator: DiT, _ode_type: String, sigma: f64, cfg_strength: f64) -> Result<Self> {
-        Ok(Self { estimator, sigma, cfg_strength })
+    pub fn new(
+        _vb: VarBuilder,
+        estimator: DiT,
+        _ode_type: String,
+        sigma: f64,
+        cfg_strength: f64,
+    ) -> Result<Self> {
+        Ok(Self {
+            estimator,
+            sigma,
+            cfg_strength,
+        })
     }
 
-    pub fn forward(&self, mu: &Tensor, mask: &Tensor, n_timesteps: usize, temperature: f64, spks: Option<&Tensor>, cond: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        mu: &Tensor,
+        mask: &Tensor,
+        n_timesteps: usize,
+        temperature: f64,
+        spks: Option<&Tensor>,
+        cond: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let device = mu.device();
         let mut x = (mu.randn_like(0.0, 1.0)? * temperature)?;
         x = (x.zeros_like()?.affine(1.0, 0.1)? * temperature)?;
 
-        let mut t_span: Vec<f32> = (0..=n_timesteps).map(|i| i as f32 / n_timesteps as f32).collect();
+        let mut t_span: Vec<f32> = (0..=n_timesteps)
+            .map(|i| i as f32 / n_timesteps as f32)
+            .collect();
         for t in t_span.iter_mut() {
             *t = 1.0 - (*t * 0.5 * std::f32::consts::PI).cos();
         }
@@ -556,14 +694,26 @@ impl ConditionalCFM {
             let spks_in = Tensor::cat(&[&spks, &spks.zeros_like()?], 0)?;
             let cond_in = Tensor::cat(&[&cond, &cond.zeros_like()?], 0)?;
 
-            let v = self.estimator.forward(&x_in, &mask_in, &mu_in, &t_tensor, &spks_in, &cond_in)?;
+            let v = self
+                .estimator
+                .forward(&x_in, &mask_in, &mu_in, &t_tensor, &spks_in, &cond_in)?;
             let chunks = v.chunk(2, 0)?;
             let (v1, v2) = (&chunks[0], &chunks[1]);
 
-            let v_cfg = (v1.broadcast_mul(&(Tensor::from_vec(vec![self.cfg_strength as f32 + 1.0], 1, device)?))? - v2.broadcast_mul(&(Tensor::from_vec(vec![self.cfg_strength as f32], 1, device)?))?)?;
+            let v_cfg = (v1.broadcast_mul(
+                &(Tensor::from_vec(vec![self.cfg_strength as f32 + 1.0], 1, device)?),
+            )? - v2
+                .broadcast_mul(&(Tensor::from_vec(vec![self.cfg_strength as f32], 1, device)?))?)?;
 
-            eprintln!("CFM ADD: x={:?}, v_cfg={:?}, dt={:?}", x.shape(), v_cfg.shape(), dt);
-            x = x.broadcast_add(&(v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], 1, device)?))?))?;
+            eprintln!(
+                "CFM ADD: x={:?}, v_cfg={:?}, dt={:?}",
+                x.shape(),
+                v_cfg.shape(),
+                dt
+            );
+            x = x.broadcast_add(
+                &(v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], 1, device)?))?),
+            )?;
             t_curr = t_span[i];
         }
 
