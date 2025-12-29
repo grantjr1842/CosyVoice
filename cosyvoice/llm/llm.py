@@ -307,29 +307,6 @@ class Qwen2Encoder(torch.nn.Module):
 
         optimizer = GpuOptimizer()
 
-        # 1. Quantization
-        quantization_kwargs = {}
-        quant_config_dict = optimizer.suggest_quantization()
-        if quant_config_dict:
-            try:
-                import accelerate
-                from transformers import BitsAndBytesConfig
-
-                # Enhanced 4-bit config
-                if quant_config_dict.get("load_in_4bit"):
-                    quant_config_dict["bnb_4bit_compute_dtype"] = torch.float16
-                    quant_config_dict["bnb_4bit_quant_type"] = "nf4"
-                    quant_config_dict["bnb_4bit_use_double_quant"] = True
-
-                quantization_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    **quant_config_dict
-                )
-                logging.info(f"Using quantization config: {quant_config_dict}")
-            except ImportError:
-                logging.warning(
-                    "bitsandbytes or accelerate not installed, skipping quantization."
-                )
-
         # 2. Flash Attention 2 (requires Ampere GPUs or newer - compute capability 8.0+)
         attn_kwargs = {}
         try:
@@ -348,14 +325,10 @@ class Qwen2Encoder(torch.nn.Module):
         except ImportError:
             logging.info("Flash Attention 2 not available. Using SDPA attention.")
 
-        self.model = Qwen2ForCausalLM.from_pretrained(
-            pretrain_path, **quantization_kwargs, **attn_kwargs
-        )
+        self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path, **attn_kwargs)
 
         # Log summary of active optimizations
         active_opts = []
-        if quantization_kwargs:
-            active_opts.append("Quantization")
         if attn_kwargs:
             attn_type = attn_kwargs.get("attn_implementation", "default")
             active_opts.append(f"Attention: {attn_type}")
@@ -364,6 +337,45 @@ class Qwen2Encoder(torch.nn.Module):
         )
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
+        if hasattr(self, "rust_model"):
+            # Prepare input for Rust model
+            # xs is (Batch, Seq, Hidden), xs_lens is (Batch,)
+            # Convert xs to flat list of floats and pass shape
+            # NOTE: usage of tolist() might be slow.
+            xs_flat = xs.detach().cpu().float().flatten().tolist()
+            shape = list(xs.shape)
+
+            try:
+                out_vec = self.rust_model.forward_embeds(xs_flat, shape)
+                # Convert back to tensor
+                # Output shape expected (Batch, Seq, Hidden)
+                # But Qwen2Rust currently returns... wait, I implemented it to return f16->f32 vec.
+                out_tensor = torch.tensor(
+                    out_vec, dtype=torch.float32, device=xs.device
+                ).view(shape)
+                # We need only the last hidden state? No, TransformerLM.encode uses all.
+                # TransformerLM:
+                # encoder_out, encoder_mask = self.text_encoder(text, text_lengths, ...)
+                # encoder_out is usually (Batch, Seq, Hidden).
+
+                # Qwen2Encoder forward returns:
+                # outs.hidden_states[-1], masks.unsqueeze(1)
+
+                # So we assume Rust backend returns the last hidden state.
+                # My Rust implementation returns 'output' which is from `base_model.forward_embeds`.
+                # `base_model.forward_embeds` returns `xs.apply(&self.norm)`.
+                # This corresponds to the final hidden state.
+
+                T = xs.size(1)
+                masks = ~make_pad_mask(xs_lens, T)
+
+                return out_tensor, masks.unsqueeze(1)
+            except Exception as e:
+                logging.error(
+                    f"Rust backend execution failed: {e}. Falling back to Python."
+                )
+                # Fallback code below
+
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T)
         outs = self.model(

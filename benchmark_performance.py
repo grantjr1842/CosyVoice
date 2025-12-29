@@ -52,10 +52,16 @@ def benchmark_tts(model_dir, test_text, prompt_text, prompt_wav, iterations=3):
         end_gen = time.time()
         total_gen_time = end_gen - start_gen
 
-        rtf = total_gen_time / total_audio_len
+        if total_audio_len > 0:
+            rtf = total_gen_time / total_audio_len
+            throughput = total_audio_len / total_gen_time
+            metrics["rtf"].append(rtf)
+            metrics["throughput"].append(throughput)
+        else:
+            metrics["rtf"].append(0)
+            metrics["throughput"].append(0)
+
         metrics["ftl"].append(first_token_time)
-        metrics["rtf"].append(rtf)
-        metrics["throughput"].append(total_audio_len / total_gen_time)
         metrics["total_time"].append(total_gen_time)
 
         print(

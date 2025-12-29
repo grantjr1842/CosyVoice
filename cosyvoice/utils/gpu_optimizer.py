@@ -99,36 +99,6 @@ class GpuOptimizer:
             # Low VRAM, prefer default or no compilation if very tight
             return "default"
 
-    def suggest_quantization(self):
-        """
-        Suggests quantization configuration.
-        Returns:
-            dict: Kwargs for QuantizationConfig (or None if no quantization suggested)
-
-        Note: The 0.5B model is small enough (~1GB in FP16) that quantization
-        overhead often outweighs benefits. Only enable for very low VRAM.
-        """
-        if self.device_count == 0:
-            return None
-
-        # The Fun-CosyVoice3-0.5B model is ~1GB in FP16 - quite small!
-        # Quantization is only beneficial for very constrained memory situations.
-        # For most GPUs with >= 6GB, FP16 is faster and more reliable.
-
-        # Strategy (conservative for quality):
-        # < 4GB VRAM: 8-bit (4-bit can degrade quality significantly)
-        # >= 4GB: No quantization (FP16 is fast and reliable for 0.5B)
-
-        if self.vram_gb < 4:
-            logging.info(
-                f"VRAM ({self.vram_gb:.2f}GB) < 4GB. Suggesting 4-bit quantization for maximum memory efficiency."
-            )
-            return {"load_in_4bit": True}
-
-        # For 4GB+ VRAM, FP16 is preferred for quality and often speed
-        logging.info(
-            f"VRAM ({self.vram_gb:.2f}GB) >= 4GB. Using FP16 (no quantization) for quality."
-        )
         return None
 
     def suggest_matmul_precision(self):

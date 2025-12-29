@@ -223,7 +223,7 @@ class CosyVoice3:
                         )
                     )
                 else:
-                    logging.warning("yield speech len is 0, skipping rtf calculation")
+                    logging.debug("yield speech len is 0, skipping rtf calculation")
                 yield model_output
                 start_time = time.time()
 
@@ -264,11 +264,14 @@ class CosyVoice3:
                 **model_input, stream=stream, speed=speed
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
-                logging.info(
-                    "yield speech len {}, rtf {}".format(
-                        speech_len, (time.time() - start_time) / speech_len
+                if speech_len > 0:
+                    logging.info(
+                        "yield speech len {}, rtf {}".format(
+                            speech_len, (time.time() - start_time) / speech_len
+                        )
                     )
-                )
+                else:
+                    logging.debug("yield speech len is 0, skipping rtf calculation")
                 yield model_output
                 start_time = time.time()
 
@@ -311,11 +314,14 @@ class CosyVoice3:
                 **model_input, stream=stream, speed=speed
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
-                logging.info(
-                    "yield speech len {}, rtf {}".format(
-                        speech_len, (time.time() - start_time) / speech_len
+                if speech_len > 0:
+                    logging.info(
+                        "yield speech len {}, rtf {}".format(
+                            speech_len, (time.time() - start_time) / speech_len
+                        )
                     )
-                )
+                else:
+                    logging.debug("yield speech len is 0, skipping rtf calculation")
                 yield model_output
                 start_time = time.time()
 

@@ -41,9 +41,6 @@ tensorboard
 .cache
 compile_commands.json
 
-# rust build files
-rust/target/
-
 # audio files
 *.wav
 *.m4a
@@ -55,13 +52,46 @@ output/*
 !output/.gitkeep
 !output/README.md
 
+# rust build files
+target/
+target_cuda/
+
 # train/inference files
 *.pt
 pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
-*.tar
-# Rust cuda build
-rust/target_cuda/
+*.target
+
 *.so
 *.so.bak
+
+# Logs and verification outputs
+*.log
+verify_output*.txt
+rust/server/*.log
+
+# Local task/plan artifacts (if any leaked to root)
+task.md
+implementation_plan.md
+Integrate Native Rust TTS.md
+
+# Local debug scripts and binaries
+/check_*.py
+/fix_*.py
+/test_*.py
+/debug_*.py
+/cosyvoice-server*
+
+# Large model weights and data
+pretrained_models/
+rust/pretrained_models/
+rust/server/pretrained_models/
+tests/*.safetensors
+
+# Temporary test folders and internal third_party
+temp_test/
+third_party/ug/
+
+# Rust internal debug scripts
+rust/server/check_*.py
