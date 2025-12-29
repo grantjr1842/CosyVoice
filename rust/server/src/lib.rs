@@ -1,5 +1,8 @@
+pub mod cosyvoice_flow;
+pub mod cosyvoice_llm;
 pub mod flow;
 pub mod hift;
+pub mod native_tts;
 pub mod qwen;
 pub mod utils;
 

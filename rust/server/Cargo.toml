@@ -24,6 +24,7 @@ numpy.workspace = true
 candle-core = { version = "0.8.2" }
 candle-nn = { version = "0.8.2" }
 candle-transformers = { version = "0.8.2" }
+candle-kernels = { version = "0.8.2", optional = true }
 # candle-flash-attn = { version = "0.8.2" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -34,6 +35,14 @@ thiserror.workspace = true
 hound.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
-
-# Additional
 bytes = "1.9"
+rand = "0.8"
+
+[features]
+default = []
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "candle-kernels",
+]
