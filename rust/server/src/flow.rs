@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{layer_norm_no_bias, linear, LayerNorm, Linear, VarBuilder};
+use candle_nn::{linear, LayerNorm, Linear, VarBuilder};
 
 // Force rebuild marker: REBUILD_V1
 const _FORCE_REBUILD: u32 = 1;

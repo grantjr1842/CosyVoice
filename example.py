@@ -66,10 +66,8 @@ def voice_cloning_example():
         "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet.",
     ]
 
-    # Prompt prefix for better quality (recommended for CosyVoice3)
-    prompt_prefix = (
-        "You are a helpful assistant. Please speak in English.<|endofprompt|>"
-    )
+    # Prompt prefix for better quality - explicitly request English
+    prompt_prefix = "Please speak in English.<|endofprompt|>"
     full_prompt_text = prompt_prefix + DEFAULT_PROMPT_TEXT
 
     print(f"\n🎤 Reference voice: {DEFAULT_PROMPT_WAV}")
@@ -78,6 +76,7 @@ def voice_cloning_example():
     for idx, tts_text in enumerate(texts):
         print(f'\n🔊 Synthesizing [{idx + 1}/{len(texts)}]: "{tts_text[:50]}..."')
 
+        # Use inference_zero_shot with English instruction in full_prompt_text
         for i, output in enumerate(
             cosyvoice.inference_zero_shot(
                 tts_text, full_prompt_text, DEFAULT_PROMPT_WAV, stream=False

@@ -63,7 +63,7 @@ cuda-driver-dev = "12.1.*"
 # Core ML dependencies
 conformer = ">=0.3.2"
 diffusers = ">=0.29.0"
-transformers = ">=4.54.0"
+transformers = "==4.51.3"
 x-transformers = ">=2.11.24"
 
 # Audio processing

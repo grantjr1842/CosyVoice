@@ -1,6 +1,6 @@
-use crate::utils::StftModule;
+// use crate::utils::StftModule; // Commented out until used
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
-use candle_nn::{ops, Conv1d, Conv1dConfig, VarBuilder};
+use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 use std::f64::consts::PI;
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
@@ -99,74 +99,41 @@ impl SineGen {
     pub fn forward(&self, f0: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         // f0: [Batch, 1, Length]
 
-        // 1. Calculate F_mat: harmonics
-        // harmonic_range: [1, H+1, 1]
-        // f0: [Batch, 1, Length]
-        // We want [Batch, H+1, Length].
-        // Expand/Broadcast.
+        let upsample_scale = 480; // [8*5*3*4]
 
-        let _f0_expanded = f0.broadcast_as((f0.dim(0)?, self.harmonic_num + 1, f0.dim(2)?))?;
-        // But multiplying needs correct dims.
-        // broadcast_mul automatically broadcasts.
+        let (b, _, l) = f0.dims3()?;
+        let l_mel = l / upsample_scale;
 
-        // harmonic_range [1, H+1, 1] * f0 [Batch, 1, Length] -> [Batch, H+1, Length]
-        eprintln!("SineGen: harmonic_num={}, harmonic_range shape={:?}, f0 shape={:?}",
-            self.harmonic_num, self.harmonic_range.shape(), f0.shape());
+        // 1. Convert to Mel rate for phase accumulation (SineGen2 behavior)
+        let f0_cpu = f0.to_device(&Device::Cpu)?;
+        let f0_vec = f0_cpu.flatten_all()?.to_vec1::<f32>()?;
 
-        let f_mat = self.harmonic_range.broadcast_mul(f0)?;
-        eprintln!("SineGen: f_mat shape={:?}", f_mat.shape());
-        let f_mat = (f_mat / self.sampling_rate)?;
-
-        // 2. Cumsum for phase: theta = 2 * pi * cumsum(f_mat) % 1
-        // Candle `cumsum` implementation naively creates an LxL matrix (O(N^2) memory), causing OOM.
-        // We implement it manually on CPU (O(N)).
-
-        let f_mat_cpu = f_mat.to_device(&Device::Cpu)?;
-        let (b, c, l) = f_mat_cpu.dims3()?;
-        let mut f_vec: Vec<f32> = f_mat_cpu.flatten_all()?.to_vec1()?;
-
-        // Cumsum along dim 2 (inner-most dimension in [B, C, L] layout?)
-        // Check layout. contiguous [B, C, L] means L varies fastest?
-        // Yes, row-major.
-        // So we iterate chunks of size L.
-
-        for i in 0..(b * c) {
-            let offset = i * l;
-            let mut sum = 0.0;
-            for j in 0..l {
-                sum += f_vec[offset + j];
-                f_vec[offset + j] = sum;
+        // Cumsum at Mel rate (SineGen2 behavior)
+        let mut cumsum_upsampled = Vec::with_capacity(b * (self.harmonic_num + 1) * l);
+        for i in 0..b {
+            let offset_f0 = i * l;
+            for h in 0..=(self.harmonic_num) {
+                let mult = (h + 1) as f32;
+                let mut sum = 0.0;
+                let mut mels = Vec::with_capacity(l_mel);
+                for j in 0..l_mel {
+                    // Each step is mult * f0 / SR * 480
+                    let freq_step = (f0_vec[offset_f0 + j * upsample_scale] * mult / (self.sampling_rate as f32)) * (upsample_scale as f32);
+                    sum = (sum + freq_step) % 1.0;
+                    mels.push(sum);
+                }
+                // Nearest neighbor upsample (for Causal context)
+                for m in 0..l_mel {
+                    let val = mels[m];
+                    for _ in 0..upsample_scale {
+                        cumsum_upsampled.push(val);
+                    }
+                }
             }
         }
 
-        let cumsum_cpu = Tensor::from_vec(f_vec, (b, c, l), &Device::Cpu)?;
-        let cumsum = cumsum_cpu.to_device(&f_mat.device())?;
-
-        // % 1 logic: x - floor(x).
-        // Since we wrap phase, usually we do sin(2pi * x).
-        // sin(2pi * (x % 1)) = sin(2pi * x).
-        // So we can skip % 1 if we just multiply by 2pi.
-        // However, large floats lose precision. keeping it bounded is good.
-        // x - x.floor()
-        // Candle doesn't have `floor`?
-        // It does.
-        // Or assume f32 precision holds enough for short clips.
-        // Let's preserve precision:
-        // theta_mat = 2 * pi * (cumsum % 1)
-        // If candle missing floor, check ops.
-        // Assuming precision is fine for typical audio chunks (30s).
-
-        let two_pi = 2.0 * PI;
-        let theta_mat = (cumsum * two_pi)?;
-
-        // 3. Random phase (for noise/texture?)
-        // Python: phase_vec = u_dist.sample(...)
-        // phase_vec[:, 0, :] = 0
-        // sine_waves = sine_amp * sin(theta + phase)
-
-        // We can skip random phase for inference determinism or implement it.
-        // Python code generates random phase `U[-pi, pi]`.
-        // Let's implement it for parity.
+        let cumsum = Tensor::from_vec(cumsum_upsampled, (b, self.harmonic_num + 1, l), &f0.device())?;
+        let theta_mat = (cumsum * (2.0 * PI))?;
         let shape = theta_mat.shape();
         let _phase_vec = (Tensor::rand(0.0f32, 1.0f32, shape, &self.device)? * two_pi)? - PI;
         // Zero out fundamental (idx 0) phase?
@@ -208,8 +175,7 @@ impl SineGen {
         // Check broadcast: sine_waves [B, H+1, L], uv [B, 1, L]. OK.
         let output = ((sine_waves.broadcast_mul(&uv))? + noise.clone())?;
 
-        // Return [Batch, H+1, Length], UV, Noise
-        Ok((output, uv, noise)) // Noise not typically used outside
+        Ok((output.transpose(1, 2)?, uv.transpose(1, 2)?, noise))
     }
 }
 
@@ -305,15 +271,10 @@ impl SourceModuleHnNSF {
         let (sine_wavs, uv, _) = self.sine_gen.forward(f0)?;
 
         // sine_merge = tanh(linear(sine_waves))
-        // sine_waves: [Batch, Harmonics, Length].
-        // Linear expects [Batch, *, InFeatures].
-        // We need to transpose to apply linear on Harmonics dimension?
-        // Candle Linear applies to last dim.
-        // sine_wavs: [Batch, Chan, Time]. We want [Batch, Time, Chan].
-        let sine_wavs_t = sine_wavs.transpose(1, 2)?;
-        let sine_merge = self.l_linear.forward(&sine_wavs_t)?;
+        // sine_wavs: [Batch, Length, Harmonics+1]
+        let sine_merge = self.l_linear.forward(&sine_wavs)?;
         let sine_merge = sine_merge.tanh()?;
-        // Transpose back to [Batch, 1, Length] (since out=1)
+        // Transpose to [Batch, 1, Length]
         let sine_merge = sine_merge.transpose(1, 2)?;
 
         // Noise branch
@@ -399,7 +360,6 @@ impl Module for ResBlock {
             let xt = self.convs1[i].forward(&xt)?;
             let xt = self.acti2[i].forward(&xt)?;
             let xt = self.convs2[i].forward(&xt)?;
-            let xt = self.convs2[i].forward(&xt)?;
             x = (x + xt)?;
         }
         Ok(x)
@@ -462,12 +422,18 @@ pub struct F0Predictor {
 
 impl F0Predictor {
     pub fn new(in_channels: usize, cond_channels: usize, vb: VarBuilder) -> Result<Self> {
-        // condnet: 5 layers of Conv1d(3, padding=1) + WeightNorm
+        // condnet: 5 layers of Conv1d + WeightNorm
         let mut condnet = Vec::new();
         let vb_net = vb.pp("condnet");
 
-        // 0, 2, 4, 6, 8: Conv1d layers
-            let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, k / 2)?;
+        // 0: Conv1d(4, causal_type='right')
+        // 2, 4, 6, 8: Conv1d(3, causal_type='left')
+        for i in 0..5 {
+            let in_c = if i == 0 { in_channels } else { cond_channels };
+            let vb_layer = vb_net.pp(i * 2);
+            let k = if i == 0 { 4 } else { 3 };
+            // We use padding=0 here and pad manually in forward to achieve causal behavior
+            let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, 0)?;
             condnet.push(layer);
         }
 
@@ -483,7 +449,16 @@ impl F0Predictor {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [Batch, 80, Time]
         let mut h = x.clone();
-        for conv in self.condnet.iter() {
+        for (i, conv) in self.condnet.iter().enumerate() {
+            if i == 0 {
+                // F0 predictor in CosyVoice3.0 uses kernel 4, causal type 'right'
+                // This means pad 3 on RIGHT.
+                h = h.pad_with_zeros(2, 0, 3)?;
+            } else {
+                // Subsequent ones are kernel 3, causal 'left'
+                // This means pad 2 on LEFT.
+                h = h.pad_with_zeros(2, 2, 0)?;
+            }
             h = conv.forward(&h)?;
             h = h.elu(1.0)?; // ELU
         }
@@ -498,7 +473,8 @@ impl F0Predictor {
 
 pub struct HiFTGenerator {
     conv_pre: Conv1d,
-    ups: Vec<candle_nn::ConvTranspose1d>,
+    ups: Vec<Conv1d>,
+    ups_rates: Vec<usize>,
     source_downs: Vec<Conv1d>,
     source_resblocks: Vec<ResBlock>,
     resblocks: Vec<ResBlock>,
@@ -517,9 +493,6 @@ impl HiFTGenerator {
         let ups_rates = &config.upsample_rates;
         let ups_kernels = &config.upsample_kernel_sizes;
         let base_ch = config.base_channels;
-
-        // F0 Predictor
-        let _f0_predictor = F0Predictor::new(config.in_channels, 512, vb.pp("f0_predictor"))?;
 
         // Conv Pre
         // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
@@ -546,8 +519,8 @@ impl HiFTGenerator {
         for (i, (&u, &k)) in ups_rates.iter().zip(ups_kernels).enumerate() {
             let in_c = base_ch / (1 << i);
             let out_c = base_ch / (1 << (i + 1));
-            let pad = (k - u) / 2;
-            let conv = load_conv_transpose1d(vb_ups.pp(i), in_c, out_c, k, u, pad)?;
+            // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
+            let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, 0)?;
             ups.push(conv);
         }
 
@@ -658,7 +631,7 @@ impl HiFTGenerator {
             0.1,
             0.003,
             config.sampling_rate,
-            0.0,
+            config.voiced_threshold,
             vb.pp("m_source"),
         )?;
 
@@ -667,6 +640,7 @@ impl HiFTGenerator {
         Ok(Self {
             conv_pre,
             ups,
+            ups_rates: ups_rates.clone(),
             resblocks,
             source_downs,
             source_resblocks,
@@ -721,11 +695,22 @@ impl HiFTGenerator {
         let num_ups = self.ups.len();
 
         for i in 0..num_ups {
-            x = candle_nn::ops::leaky_relu(&x, 0.1)?; // lrelu_slope=0.1 default
+            x = candle_nn::ops::leaky_relu(&x, 0.1)?; // lrelu_slope=0.1
+
+            // Upsample
+            let u = self.ups_rates[i];
+            let (b, c, l) = x.dims3()?;
+            x = x.unsqueeze(3)?
+                .repeat((1, 1, 1, u))?
+                .reshape((b, c, l * u))?;
+
+            // Causal Padding k-1
+            let k = self.ups[i].weight().dim(2)?;
+            x = x.pad_with_zeros(2, k - 1, 0)?;
             x = self.ups[i].forward(&x)?;
 
-            // Ref padding?
-            // hift.py: if i == num_ups - 1: reflection_pad(x)
+            // Reflection-like padding at the end?
+            // CausalHiFTGenerator.py: self.reflection_pad = nn.ReflectionPad1d((1, 0))
             if i == num_ups - 1 {
                 let left = x.i((.., .., 1..2))?;
                 x = Tensor::cat(&[&left, &x], 2)?;
@@ -740,7 +725,7 @@ impl HiFTGenerator {
             let x_len = x.dim(2)?;
             let si_len = si.dim(2)?;
             let common_len = x_len.min(si_len);
-            let mut x_slice = x.i((.., .., ..common_len))?;
+            let x_slice = x.i((.., .., ..common_len))?;
             let si_slice = si.i((.., .., ..common_len))?;
             x = (x_slice + si_slice)?;
 
@@ -836,6 +821,7 @@ pub struct HiFTConfig {
     pub resblock_dilation_sizes: Vec<Vec<usize>>,
     pub source_resblock_kernel_sizes: Vec<usize>,
     pub source_resblock_dilation_sizes: Vec<Vec<usize>>,
+    pub voiced_threshold: f32,
 }
 
 impl HiFTConfig {
@@ -853,6 +839,7 @@ impl HiFTConfig {
             resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            voiced_threshold: 10.0,
         }
     }
 
