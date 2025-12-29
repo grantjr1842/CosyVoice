@@ -250,6 +250,8 @@ class CosyVoiceFrontEnd:
                         comma_split=False,
                     )
                 )
+                # Prepend <|en|> language tag to ensure English speech generation
+                texts = [f"<|en|>{t}" for t in texts]
         texts = [i for i in texts if not is_only_punctuation(i)]
         return texts if split is True else text
 
