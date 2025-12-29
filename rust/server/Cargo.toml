@@ -7,6 +7,10 @@ edition.workspace = true
 name = "cosyvoice-server"
 path = "src/main.rs"
 
+[lib]
+name = "cosyvoice_rust_backend"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # Workspace dependencies
 shared = { path = "../shared" }
@@ -16,6 +20,12 @@ tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 pyo3.workspace = true
+numpy.workspace = true
+candle-core = { version = "0.8.2" }
+candle-nn = { version = "0.8.2" }
+candle-transformers = { version = "0.8.2" }
+candle-kernels = { version = "0.8.2", optional = true }
+# candle-flash-attn = { version = "0.8.2" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
@@ -25,6 +35,14 @@ thiserror.workspace = true
 hound.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
-
-# Additional
 bytes = "1.9"
+rand = "0.8"
+
+[features]
+default = []
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "candle-kernels",
+]

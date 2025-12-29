@@ -28,6 +28,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Python bridge
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
+numpy = "0.23"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
