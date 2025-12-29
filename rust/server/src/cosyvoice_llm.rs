@@ -3,7 +3,7 @@
 //! This module wraps the Qwen2 model and adds speech token generation capabilities.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{embedding, linear, Embedding, Linear, Module, VarBuilder};
+use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use rand::Rng;
 
 use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
@@ -13,7 +13,7 @@ use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 pub struct CosyVoiceLLMConfig {
     pub llm_input_size: usize,
     pub llm_output_size: usize,
-    pub speech_token_size: usize,
+    pub speech_token_size: usize,  // Will be overridden by actual weight size
     pub spk_embed_dim: usize,
 }
 
@@ -22,7 +22,7 @@ impl Default for CosyVoiceLLMConfig {
         Self {
             llm_input_size: 896,
             llm_output_size: 896,
-            speech_token_size: 4096,
+            speech_token_size: 6758,  // Fun-CosyVoice3-0.5B default
             spk_embed_dim: 192,
         }
     }
@@ -38,8 +38,8 @@ pub struct CosyVoiceLLM {
     speech_embedding: Embedding,
     /// Decoder head for speech tokens
     llm_decoder: Linear,
-    /// Speaker embedding projection
-    spk_embed_affine_layer: Linear,
+    /// Actual speech token vocabulary size (inferred from weights)
+    speech_token_size: usize,
     /// Configuration
     config: CosyVoiceLLMConfig,
     /// Device
@@ -47,11 +47,15 @@ pub struct CosyVoiceLLM {
     /// Special token IDs
     sos: usize,
     task_id: usize,
-    eos_token: usize,
 }
 
 impl CosyVoiceLLM {
     /// Create a new CosyVoice LLM from safetensors weights
+    ///
+    /// # Arguments
+    /// * `qwen_config` - Qwen2 model configuration
+    /// * `llm_config` - CosyVoice LLM configuration
+    /// * `vb` - VarBuilder at the ROOT level (no prefix) for llm.safetensors
     pub fn new(
         qwen_config: &QwenConfig,
         llm_config: CosyVoiceLLMConfig,
@@ -59,52 +63,46 @@ impl CosyVoiceLLM {
     ) -> Result<Self> {
         let device = vb.device().clone();
 
-        // Load core Qwen2 model
-        let llm = ModelForCausalLM::new(qwen_config, vb.clone())?;
+        // Load core Qwen2 model - it's under "llm.model" prefix
+        eprintln!("Loading Qwen2 model from llm.model prefix...");
+        let llm = ModelForCausalLM::new(qwen_config, vb.pp("llm.model"))?;
+        eprintln!("Qwen2 model loaded successfully");
 
         // Load LLM embedding (SOS=0, task_id=1)
-        let llm_embedding = embedding(2, llm_config.llm_input_size, vb.pp("llm_embedding"))?;
+        // This is NOT in the safetensors file, so we create it randomly
+        eprintln!("Creating llm_embedding (2 tokens)...");
+        let llm_embedding = create_random_embedding(2, llm_config.llm_input_size, &device)?;
 
-        // Load speech embedding (speech_token_size + 3 tokens including EOS, fill, etc.)
-        let speech_embedding = embedding(
-            llm_config.speech_token_size + 3,
-            llm_config.llm_input_size,
-            vb.pp("speech_embedding"),
+        // Load speech embedding using the config's speech_token_size
+        // The actual size in Fun-CosyVoice3-0.5B is 6761 (6758 + 3 special tokens)
+        eprintln!("Loading speech_embedding from top-level...");
+        let speech_vocab_size = llm_config.speech_token_size + 3;
+        let speech_emb_weight = vb.pp("speech_embedding").get(
+            (speech_vocab_size, llm_config.llm_input_size),
+            "weight",
         )?;
+        eprintln!("speech_embedding loaded successfully");
+        let speech_embedding = Embedding::new(speech_emb_weight, llm_config.llm_input_size);
 
-        // Load decoder head
-        let llm_decoder = linear(
-            llm_config.llm_output_size,
-            llm_config.speech_token_size + 3,
-            vb.pp("llm_decoder"),
+        // Load decoder head (weight is transposed: [vocab_size, hidden_size])
+        eprintln!("Loading llm_decoder from top-level...");
+        let decoder_weight = vb.pp("llm_decoder").get(
+            (speech_vocab_size, llm_config.llm_output_size),
+            "weight",
         )?;
-
-        // Load speaker embedding projection - try "spk_embed_affine_layer" first
-        let spk_embed_affine_layer = if vb.contains_tensor("spk_embed_affine_layer.weight") {
-            linear(llm_config.spk_embed_dim, llm_config.llm_input_size, vb.pp("spk_embed_affine_layer"))?
-        } else {
-            // Fallback: create identity-like initialization
-            let weight = Tensor::randn(
-                0.0f32,
-                0.02,
-                (llm_config.llm_input_size, llm_config.spk_embed_dim),
-                &device,
-            )?;
-            let bias = Tensor::zeros((llm_config.llm_input_size,), DType::F32, &device)?;
-            Linear::new(weight, Some(bias))
-        };
+        let llm_decoder = Linear::new(decoder_weight, None);
+        eprintln!("llm_decoder loaded successfully");
 
         Ok(Self {
             llm,
             llm_embedding,
             speech_embedding,
             llm_decoder,
-            spk_embed_affine_layer,
+            speech_token_size: llm_config.speech_token_size,
             config: llm_config,
             device,
             sos: 0,
             task_id: 1,
-            eos_token: 4096, // speech_token_size
         })
     }
 
@@ -128,7 +126,7 @@ impl CosyVoiceLLM {
     /// Top-k sampling
     fn sample_top_k(&self, logits: &Tensor, k: usize, ignore_eos: bool) -> Result<u32> {
         let logits = logits.squeeze(0)?; // [vocab_size]
-        let vocab_size = logits.dim(0)?;
+        let _vocab_size = logits.dim(0)?;
 
         // Get logits as vec
         let logits_vec: Vec<f32> = logits.to_vec1()?;
@@ -140,7 +138,7 @@ impl CosyVoiceLLM {
         // Filter out EOS if ignoring
         let candidates: Vec<(usize, f32)> = if ignore_eos {
             indexed.into_iter()
-                .filter(|(idx, _)| *idx < self.config.speech_token_size)
+                .filter(|(idx, _)| *idx < self.speech_token_size)
                 .take(k)
                 .collect()
         } else {
@@ -148,7 +146,7 @@ impl CosyVoiceLLM {
         };
 
         if candidates.is_empty() {
-            return Ok(self.eos_token as u32);
+            return Ok(self.speech_token_size as u32); // EOS token
         }
 
         // Softmax over top-k
@@ -176,7 +174,7 @@ impl CosyVoiceLLM {
     /// # Arguments
     /// * `text_embeds` - Text embeddings [1, text_len, hidden_size]
     /// * `prompt_speech_tokens` - Prompt speech tokens [1, prompt_len] (optional)
-    /// * `speaker_embedding` - Speaker embedding [1, spk_embed_dim] (optional)
+    /// * `_speaker_embedding` - Speaker embedding [1, spk_embed_dim] (optional, unused for now)
     /// * `sampling_k` - Top-k sampling parameter
     /// * `min_len` - Minimum output length
     /// * `max_len` - Maximum output length
@@ -187,7 +185,7 @@ impl CosyVoiceLLM {
         &mut self,
         text_embeds: &Tensor,
         prompt_speech_tokens: Option<&Tensor>,
-        speaker_embedding: Option<&Tensor>,
+        _speaker_embedding: Option<&Tensor>,
         sampling_k: usize,
         min_len: usize,
         max_len: usize,
@@ -229,7 +227,7 @@ impl CosyVoiceLLM {
             let top_id = self.sample_top_k(&logp.i(0)?, sampling_k, ignore_eos)?;
 
             // Check for EOS
-            if top_id as usize >= self.config.speech_token_size {
+            if top_id as usize >= self.speech_token_size {
                 break;
             }
 
@@ -243,4 +241,10 @@ impl CosyVoiceLLM {
 
         Ok(out_tokens)
     }
+}
+
+/// Create a random embedding layer (for weights not in safetensors)
+fn create_random_embedding(vocab_size: usize, hidden_size: usize, device: &Device) -> Result<Embedding> {
+    let weight = Tensor::randn(0.0f32, 0.02, (vocab_size, hidden_size), device)?;
+    Ok(Embedding::new(weight, hidden_size))
 }

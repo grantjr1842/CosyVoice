@@ -14,23 +14,25 @@ use crate::flow::{ConditionalCFM, DiT, FlowConfig};
 /// Configuration for the complete Flow model
 #[derive(Debug, Clone)]
 pub struct CosyVoiceFlowConfig {
-    pub input_size: usize,      // Token embedding dim (512)
-    pub output_size: usize,     // Mel dim (80)
-    pub spk_embed_dim: usize,   // Speaker embedding dim (192)
-    pub vocab_size: usize,      // Speech token vocab (4096)
-    pub token_mel_ratio: usize, // Upsampling ratio (2)
-    pub pre_lookahead_len: usize, // Lookahead context (3)
+    pub input_size: usize,         // Token embedding dim (80 for Fun-CosyVoice3-0.5B)
+    pub output_size: usize,        // Mel dim (80)
+    pub spk_embed_dim: usize,      // Speaker embedding dim (192)
+    pub vocab_size: usize,         // Speech token vocab (6561 for Fun-CosyVoice3-0.5B)
+    pub token_mel_ratio: usize,    // Upsampling ratio (2)
+    pub pre_lookahead_len: usize,  // Lookahead context (3)
+    pub pre_lookahead_channels: usize, // Intermediate channels in pre-lookahead (1024)
 }
 
 impl Default for CosyVoiceFlowConfig {
     fn default() -> Self {
         Self {
-            input_size: 512,
+            input_size: 80,           // Fun-CosyVoice3-0.5B uses 80
             output_size: 80,
             spk_embed_dim: 192,
-            vocab_size: 4096,
+            vocab_size: 6561,          // Fun-CosyVoice3-0.5B uses 6561
             token_mel_ratio: 2,
             pre_lookahead_len: 3,
+            pre_lookahead_channels: 1024,
         }
     }
 }
@@ -157,11 +159,11 @@ impl CosyVoiceFlow {
             vb.pp("spk_embed_affine_layer"),
         )?;
 
-        // Pre-lookahead layer
+        // Pre-lookahead layer with intermediate channels
         let pre_lookahead_layer = PreLookaheadLayer::new(
             vb.pp("pre_lookahead_layer"),
             flow_config.input_size,
-            flow_config.input_size,
+            flow_config.pre_lookahead_channels,
             flow_config.pre_lookahead_len,
         )?;
 

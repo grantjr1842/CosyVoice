@@ -67,7 +67,8 @@ impl NativeTtsEngine {
         };
 
         let llm_config = CosyVoiceLLMConfig::default();
-        let llm = CosyVoiceLLM::new(&qwen_config, llm_config, llm_vb.pp("llm.model"))
+        // Pass root VarBuilder - CosyVoiceLLM::new handles prefixing internally
+        let llm = CosyVoiceLLM::new(&qwen_config, llm_config, llm_vb)
             .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize LLM: {}", e)))?;
         eprintln!("LLM initialized successfully");
 
@@ -81,7 +82,8 @@ impl NativeTtsEngine {
 
         let flow_config = CosyVoiceFlowConfig::default();
         let dit_config = FlowConfig::default();
-        let flow = CosyVoiceFlow::new(flow_config, &dit_config, flow_vb.pp("decoder"))
+        // Pass root VarBuilder - CosyVoiceFlow handles prefixing internally
+        let flow = CosyVoiceFlow::new(flow_config, &dit_config, flow_vb)
             .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize Flow: {}", e)))?;
         eprintln!("Flow initialized successfully");
 
