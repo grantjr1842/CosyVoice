@@ -101,6 +101,7 @@ wget = ">=3.2"
 inflect = ">=7.3.1"
 wetext = ">=0.1.2,<0.2"
 openai-whisper = ">=20231117"
+noisereduce = ">=3.0.0"
 
 # Visualization & logging
 matplotlib = ">=3.7.5"

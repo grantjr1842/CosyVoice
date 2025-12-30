@@ -54,7 +54,13 @@ class CosyVoice3:
     """
 
     def __init__(
-        self, model_dir, load_trt=False, load_vllm=False, fp16=None, trt_concurrent=1
+        self,
+        model_dir,
+        load_trt=False,
+        load_vllm=False,
+        fp16=None,
+        trt_concurrent=1,
+        use_rl=True,
     ):
         """
         Initialize CosyVoice3.
@@ -65,6 +71,7 @@ class CosyVoice3:
             load_vllm: Load vLLM for accelerated LLM inference
             fp16: Use FP16 precision. If None, it will be auto-detected based on GPU capabilities.
             trt_concurrent: Number of concurrent TRT contexts
+            use_rl: Use RL-trained LLM weights for higher quality (default: True)
         """
         if fp16 is None:
             optimizer = GpuOptimizer()
@@ -114,8 +121,16 @@ class CosyVoice3:
         self.model = CosyVoice3Model(
             configs["llm"], configs["flow"], configs["hift"], fp16
         )
+        # Use RL-trained LLM for higher quality if available
+        llm_path = (
+            "{}/llm.rl.pt".format(model_dir)
+            if use_rl and os.path.exists("{}/llm.rl.pt".format(model_dir))
+            else "{}/llm.pt".format(model_dir)
+        )
+        if use_rl and "rl" in llm_path:
+            logging.info("Loading RL-trained LLM for higher audio quality")
         self.model.load(
-            "{}/llm.pt".format(model_dir),
+            llm_path,
             "{}/flow.pt".format(model_dir),
             "{}/hift.pt".format(model_dir),
         )

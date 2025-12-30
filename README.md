@@ -110,6 +110,14 @@ snapshot_download('FunAudioLLM/CosyVoice-ttsfrd', local_dir='pretrained_models/C
 
 - **Language Confusion**: For zero-shot voice cloning, it is recommended to add an explicit instruction to the prompt text, e.g., `"You are a helpful assistant. Please speak in English.<|endofprompt|>"`.
 
+### Audio Quality Optimizations
+
+This repository includes several optimizations for improved audio quality:
+
+- **RL-trained LLM**: Loads `llm.rl.pt` by default for reduced mispronunciations and improved clarity
+- **Tuned sampling**: `top_p=0.7` for more consistent output
+- **Optimized vocoder**: `nsf_voiced_threshold=5` for better voicing detection
+
 ## Basic Usage
 
 ### Voice Cloning Example
