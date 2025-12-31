@@ -536,6 +536,7 @@ impl DiT {
         }
         let norm_out = AdaLayerNormZeroFinal::new(vb.pp("norm_out"), cfg.dim)?;
         let proj_out = linear(cfg.dim, cfg.mel_dim, vb.pp("proj_out"))?;
+
         let rotary_embed = RotaryEmbedding::new(cfg.dim_head, 4096, vb.device())?;
         Ok(Self {
             input_embed,
@@ -653,6 +654,16 @@ impl ConditionalCFM {
         })
     }
 
+    /// Flow matching forward pass with optional noise injection for parity testing.
+    ///
+    /// # Arguments
+    /// * `mu` - Mean tensor from length regulator
+    /// * `mask` - Attention mask
+    /// * `n_timesteps` - ODE solver steps
+    /// * `temperature` - Sampling temperature
+    /// * `spks` - Optional speaker embedding
+    /// * `cond` - Optional conditioning tensor
+    /// * `noise` - Optional pre-generated noise for parity testing (use `None` for random)
     pub fn forward(
         &self,
         mu: &Tensor,
@@ -661,10 +672,49 @@ impl ConditionalCFM {
         temperature: f64,
         spks: Option<&Tensor>,
         cond: Option<&Tensor>,
+        noise: Option<&Tensor>,
     ) -> Result<Tensor> {
         let device = mu.device();
-        let mut x = (mu.randn_like(0.0, 1.0)? * temperature)?;
-        x = (x.zeros_like()?.affine(1.0, 0.1)? * temperature)?;
+        // Use injected noise for parity testing, or generate random noise
+        // Clone inputs to owned handles to allow slicing/realignment
+        let mut mu = mu.clone();
+        let mut mask = mask.clone();
+        let mut cond = cond.cloned(); // Option<Tensor> -> Option<Tensor>
+
+        let mut x = match noise {
+            Some(n) => (n * temperature)?,
+            None => (mu.randn_like(0.0, 1.0)? * temperature)?,
+        };
+        let x_init = x.clone();
+
+        // Align shapes if noise length differs from mu length
+        let x_len = x.dim(2)?;
+        let mu_len = mu.dim(2)?;
+        if x_len != mu_len {
+            let min_len = usize::min(x_len, mu_len);
+            if x_len > min_len {
+                x = x.narrow(2, 0, min_len)?;
+            }
+            if mu_len > min_len {
+                mu = mu.narrow(2, 0, min_len)?;
+            }
+            // mask is [1, 1, T] or [1, T]?
+            if mask.rank() >= 3 && mask.dim(2)? > min_len {
+                 mask = mask.narrow(2, 0, min_len)?;
+            } else if mask.rank() == 2 && mask.dim(1)? > min_len {
+                 mask = mask.narrow(1, 0, min_len)?;
+            }
+
+            if let Some(c) = cond.take() {
+                let c_len = c.dim(2)?;
+                if c_len > min_len {
+                    cond = Some(c.narrow(2, 0, min_len)?);
+                } else {
+                    cond = Some(c);
+                }
+            }
+            // spks is [1, 80]. No time dim usually.
+        }
 
         let mut t_span: Vec<f32> = (0..=n_timesteps)
             .map(|i| i as f32 / n_timesteps as f32)
@@ -673,48 +723,74 @@ impl ConditionalCFM {
             *t = 1.0 - (*t * 0.5 * std::f32::consts::PI).cos();
         }
 
-        let mut t_curr = t_span[0];
-
-        let spks = match spks {
-            Some(s) => s.clone(),
-            None => mu.zeros_like()?,
-        };
-        let cond = match cond {
-            Some(c) => c.clone(),
-            None => mu.zeros_like()?,
-        };
-
+        // 2. ODE Solver Loop (Euler)
         for i in 1..t_span.len() {
-            let dt = t_span[i] - t_curr;
-            let t_tensor = Tensor::from_vec(vec![t_curr, t_curr], 2, device)?;
+            let t_prev = t_span[i - 1];
+            let t_curr = t_span[i];
+            let dt = t_curr - t_prev; // Restore dt
+            let t_tensor = Tensor::from_vec(vec![t_prev, t_prev], (2,), device)?; // [2]
+
+            // CFG Guidance: Batch 2
+            // inputs must be &[&Tensor]
+            // x, mu, mask are owned Tensors -> use &x, &mu, &mask
+            // spks is Option<&Tensor> (arg) -> need to handle
+            // cond is Option<Tensor> (shadowed) -> need to handle
 
             let x_in = Tensor::cat(&[&x, &x], 0)?;
-            let mask_in = Tensor::cat(&[mask, mask], 0)?;
-            let mu_in = Tensor::cat(&[mu, &mu.zeros_like()?], 0)?;
-            let spks_in = Tensor::cat(&[&spks, &spks.zeros_like()?], 0)?;
-            let cond_in = Tensor::cat(&[&cond, &cond.zeros_like()?], 0)?;
+            let mask_in = Tensor::cat(&[&mask, &mask], 0)?;
+            let mu_in = Tensor::cat(&[&mu, &mu.zeros_like()?], 0)?;
 
+            // Handle spks (Option<&Tensor> arg -> Tensor)
+            let spks_tensor = match spks {
+                Some(s) => s.clone(),
+                None => Tensor::zeros((1, 80), DType::F32, device)?,
+            };
+            // Ensure concatenated zeros match spks rank (2) not mu rank (3)
+            let spks_in = Tensor::cat(&[&spks_tensor, &spks_tensor.zeros_like()?], 0)?;
+
+
+            // Handle cond (Option<Tensor>)
+            let cond_in_tensor = if let Some(c) = &cond {
+                 Tensor::cat(&[c, &c.zeros_like()?], 0)?
+            } else {
+                 mu.zeros_like()? // Placeholder if cond is None
+            };
+            // forward expects &Tensor for cond.
+            // cond_in_tensor is always initialized (zeros if None)
             let v = self
                 .estimator
-                .forward(&x_in, &mask_in, &mu_in, &t_tensor, &spks_in, &cond_in)?;
+                .forward(&x_in, &mask_in, &mu_in, &t_tensor, &spks_in, &cond_in_tensor)?;
             let chunks = v.chunk(2, 0)?;
             let (v1, v2) = (&chunks[0], &chunks[1]);
 
-            let v_cfg = (v1.broadcast_mul(
-                &(Tensor::from_vec(vec![self.cfg_strength as f32 + 1.0], 1, device)?),
-            )? - v2
-                .broadcast_mul(&(Tensor::from_vec(vec![self.cfg_strength as f32], 1, device)?))?)?;
+            let cfg_rate = 0.7; // Hardcoded default or use config
+            // v1 * (1.7) - v2 * (0.7)
+            // Use broadcast_mul to be safe with Result vs Tensor return
+            let v1_scaled = v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?))?;
+            let v2_scaled = v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?))?;
+            let v_cfg = (v1_scaled - v2_scaled)?;
 
-            eprintln!(
-                "CFM ADD: x={:?}, v_cfg={:?}, dt={:?}",
-                x.shape(),
-                v_cfg.shape(),
-                dt
-            );
-            x = x.broadcast_add(
-                &(v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], 1, device)?))?),
-            )?;
-            t_curr = t_span[i];
+            let d = v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], (1,), device)?))?;
+            x = (x + d)?;
+        }
+
+        // Debug
+        if std::env::var("SAVE_FLOW_DEBUG").is_ok() {
+            eprintln!("Saving flow debug tensors to rust_flow_debug.safetensors...");
+            let mut debug_map = std::collections::HashMap::new();
+            debug_map.insert("mu".to_string(), mu.clone());
+            debug_map.insert("mask".to_string(), mask.clone());
+            // handle option spks
+            if let Some(s) = spks {
+                debug_map.insert("spks".to_string(), s.clone());
+            }
+            // handle option cond
+            if let Some(c) = cond {
+                 debug_map.insert("cond".to_string(), c);
+            }
+            debug_map.insert("x_init".to_string(), x_init);
+            debug_map.insert("flow_output".to_string(), x.clone());
+            candle_core::safetensors::save(&debug_map, "rust_flow_debug.safetensors")?;
         }
 
         Ok(x)

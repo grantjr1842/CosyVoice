@@ -1,0 +1,64 @@
+{
+  "file1": {
+    "path": "tests/python_inference_metrics/python_reference_output.wav",
+    "stats": {
+      "name": "python_reference_output.wav",
+      "length_samples": 74880,
+      "duration_sec": 3.12,
+      "min": -0.4385729432106018,
+      "max": 0.512549877166748,
+      "mean": -1.0430304428155068e-05,
+      "std": 0.06977272033691406,
+      "rms": 0.06977272033691406,
+      "peak_db": -5.805277155031461,
+      "rms_db": -23.12628563872456,
+      "zero_crossings": 19326
+    },
+    "spectral": {
+      "spectral_centroid_mean": 2066.871168383144,
+      "spectral_centroid_std": 2583.0435810027843,
+      "spectral_flatness_mean": 0.3199794590473175,
+      "spectral_flatness_std": 0.4320213198661804,
+      "spectrogram_mean_db": -89.7697982788086,
+      "spectrogram_std_db": 12.742091178894043,
+      "low_freq_energy_ratio": 0.8262576121970889,
+      "high_freq_energy_ratio": 0.002182275731202507
+    },
+    "issues": []
+  },
+  "file2": {
+    "path": "native_output.wav",
+    "stats": {
+      "name": "native_output.wav",
+      "length_samples": 58996,
+      "duration_sec": 2.4581666666666666,
+      "min": -1.0,
+      "max": 0.999969482421875,
+      "mean": -0.4208340048789978,
+      "std": 0.7922614812850952,
+      "rms": 0.8970950841903687,
+      "peak_db": 8.685889541847346e-08,
+      "rms_db": -0.943230365580332,
+      "zero_crossings": 5543
+    },
+    "spectral": {
+      "spectral_centroid_mean": 1662.178902865503,
+      "spectral_centroid_std": 1073.09419603374,
+      "spectral_flatness_mean": 0.2585076689720154,
+      "spectral_flatness_std": 0.2699662744998932,
+      "spectrogram_mean_db": -58.9600830078125,
+      "spectrogram_std_db": 18.9907283782959,
+      "low_freq_energy_ratio": 0.8055516798428334,
+      "high_freq_energy_ratio": 0.030570050158694902
+    },
+    "issues": [
+      "Possible clipping detected"
+    ]
+  },
+  "comparison": {
+    "mae": 0.004178282804787159,
+    "mse": 0.00010030835255747661,
+    "max_diff": 0.08455288410186768,
+    "correlation": -0.043321018793279105
+  }
+}

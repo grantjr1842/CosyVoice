@@ -96,83 +96,71 @@ impl SineGen {
 
     // We will stick to tensor shapes [Batch, Channels, Length] for Candle Conv1d compatibility.
     // f0 input: [Batch, 1, Length].
-    pub fn forward(&self, f0: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    /// Forward pass with optional noise injection for parity testing.
+    ///
+    /// # Arguments
+    /// * `f0` - Fundamental frequency [Batch, 1, Length]
+    /// * `phase_inject` - Optional pre-generated harmonic phases [Batch, harmonic_num, Length] for parity testing
+    /// * `noise_inject` - Optional pre-generated noise [Batch, harmonic_num+1, Length] for parity testing
+    pub fn forward(
+        &self,
+        f0: &Tensor,
+        _phase_inject: Option<&Tensor>,
+        noise_inject: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         // f0: [Batch, 1, Length]
-
-        let upsample_scale = 480; // [8*5*3*4]
-
         let (b, _, l) = f0.dims3()?;
-        let l_mel = l / upsample_scale;
 
-        // 1. Convert to Mel rate for phase accumulation (SineGen2 behavior)
         let f0_cpu = f0.to_device(&Device::Cpu)?;
         let f0_vec = f0_cpu.flatten_all()?.to_vec1::<f32>()?;
 
-        // Cumsum at Mel rate (SineGen2 behavior)
-        let mut cumsum_upsampled = Vec::with_capacity(b * (self.harmonic_num + 1) * l);
+        // 2. Audio-rate Phase Integration (Cumsum)
+        let num_harmonics = self.harmonic_num + 1;
+        let mut sine_waves_vec = Vec::with_capacity(b * num_harmonics * l);
+
+        let sampling_rate = self.sampling_rate as f32;
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let sine_amp = self.sine_amp as f32;
+
         for i in 0..b {
             let offset_f0 = i * l;
-            for h in 0..=(self.harmonic_num) {
+            for h in 0..num_harmonics {
                 let mult = (h + 1) as f32;
-                let mut sum = 0.0;
-                let mut mels = Vec::with_capacity(l_mel);
-                for j in 0..l_mel {
-                    // Each step is mult * f0 / SR * 480
-                    let freq_step = (f0_vec[offset_f0 + j * upsample_scale] * mult / (self.sampling_rate as f32)) * (upsample_scale as f32);
-                    sum = (sum + freq_step) % 1.0;
-                    mels.push(sum);
-                }
-                // Nearest neighbor upsample (for Causal context)
-                for m in 0..l_mel {
-                    let val = mels[m];
-                    for _ in 0..upsample_scale {
-                        cumsum_upsampled.push(val);
-                    }
+                let mut running_phase = 0.0f32;
+
+                for t in 0..l {
+                    let current_f0 = f0_vec[offset_f0 + t];
+                    let phase_step = current_f0 * mult / sampling_rate;
+                    running_phase += phase_step;
+                    running_phase = running_phase % 1.0;
+                    let val = (running_phase * two_pi).sin() * sine_amp;
+                    sine_waves_vec.push(val);
                 }
             }
         }
 
-        let cumsum = Tensor::from_vec(cumsum_upsampled, (b, self.harmonic_num + 1, l), &f0.device())?;
-        let theta_mat = (cumsum * (2.0 * PI))?;
-        let shape = theta_mat.shape();
-        let _phase_vec = (Tensor::rand(0.0f32, 1.0f32, shape, &self.device)? * two_pi)? - PI;
-        // Zero out fundamental (idx 0) phase?
-        // Python: phase_vec[:, 0, :] = 0
-        // We can slice and cat.
-        // slice(1, 0, 1) -> set to 0?
-        // Or just construct it that way.
-        // Easier: phase_vec is applied everywhere.
-        // Hard to mutate in Candle.
-        // let fundamental_phase = Tensor::zeros(...)
-        // let harmonic_phases = Tensor::rand(...)
-        // let phase_vec = Tensor::cat(...)
-
-        let b = shape.dims()[0];
-        let l = shape.dims()[2];
-        let fund = Tensor::zeros((b, 1, l), DType::F32, &self.device)?;
-        let harm = ((Tensor::rand(0.0f32, 1.0f32, (b, self.harmonic_num, l), &self.device)?
-            * two_pi)?
-            - PI)?;
-        let phase_vec = Tensor::cat(&[&fund, &harm], 1)?; // Concat along dim 1 (channels)
-
-        let sine_waves = ((theta_mat + phase_vec)?.sin()? * self.sine_amp)?;
+        let sine_waves = Tensor::from_vec(
+            sine_waves_vec,
+            (b, num_harmonics, l),
+            &f0.device()
+        )?;
 
         // 4. UV
-        // uv = (f0 > threshold).float()
         let uv = f0.gt(self.voiced_threshold as f64)?.to_dtype(DType::F32)?;
 
         // 5. Noise
-        // noise_amp = uv * noise_std + (1-uv) * sine_amp / 3
         let term1 = (&uv * self.noise_std)?;
         let ones = Tensor::ones_like(&uv)?;
         let term2 = ((&ones - &uv)? * (self.sine_amp / 3.0))?;
         let noise_amp = (term1 + term2)?;
 
-        let noise = Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?; // Broadcast noise_amp over channels
+        // Use injected noise or generate random noise
+        let noise = match noise_inject {
+            Some(n) => n.broadcast_mul(&noise_amp)?,
+            None => Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?,
+        };
 
         // 6. Merge
-        // sine_waves = sine_waves * uv + noise
-        // Check broadcast: sine_waves [B, H+1, L], uv [B, 1, L]. OK.
         let output = ((sine_waves.broadcast_mul(&uv))? + noise.clone())?;
 
         Ok((output.transpose(1, 2)?, uv.transpose(1, 2)?, noise))
@@ -266,9 +254,21 @@ impl SourceModuleHnNSF {
         })
     }
 
-    // forward(f0) -> (sine_merge, noise, uv)
-    pub fn forward(&self, f0: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let (sine_wavs, uv, _) = self.sine_gen.forward(f0)?;
+    /// Forward pass with optional noise injection for parity testing.
+    ///
+    /// # Arguments
+    /// * `f0` - Fundamental frequency [Batch, 1, Length]
+    /// * `phase_inject` - Optional pre-generated harmonic phases for parity testing
+    /// * `sine_noise_inject` - Optional pre-generated sine noise for parity testing
+    /// * `source_noise_inject` - Optional pre-generated source noise for parity testing
+    pub fn forward(
+        &self,
+        f0: &Tensor,
+        phase_inject: Option<&Tensor>,
+        sine_noise_inject: Option<&Tensor>,
+        source_noise_inject: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (sine_wavs, uv, _) = self.sine_gen.forward(f0, phase_inject, sine_noise_inject)?;
 
         // sine_merge = tanh(linear(sine_waves))
         // sine_wavs: [Batch, Length, Harmonics+1]
@@ -277,27 +277,11 @@ impl SourceModuleHnNSF {
         // Transpose to [Batch, 1, Length]
         let sine_merge = sine_merge.transpose(1, 2)?;
 
-        // Noise branch
-        // Python: if training=False, noise = uv * sine_amp / 3 (if causal) or randn.
-        // Assuming inference mode always.
-        // The noise logic in SineGen (noise variable) was:
-        // noise_amp * randn.
-        // SourceModule logic (lines 371-374) overrides logic?
-        // "source for noise branch... if training False... noise = uv * sine_amp / 3".
-        // Wait, self.uv is fixed random if Causal.
-        // If not causal, noise = randn * sine_amp / 3.
-
-        // Let's implement logic consistent with inference mode.
-        // sine_gen.forward output 'noise' which combines uv mask logic.
-        // But SourceModule re-generates noise?
-        // Line 367: sine_wavs, uv, _ = self.l_sin_gen(x)
-        // Line 374: noise = torch.randn_like(uv) * self.sine_amp / 3
-
-        // So SourceModule uses simpler noise logic for 'noise' output, separate from 'sine_merge'.
-        // 'sine_merge' is the harmonic part. 'noise' is the unvoiced part?
-        // Yes.
-
-        let noise = (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?;
+        // Noise branch - use injected noise or generate random noise
+        let noise = match source_noise_inject {
+            Some(n) => (n * (self.sine_gen.sine_amp / 3.0))?,
+            None => (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?,
+        };
 
         Ok((sine_merge, noise, uv))
     }
@@ -434,6 +418,29 @@ impl F0Predictor {
             let k = if i == 0 { 4 } else { 3 };
             // We use padding=0 here and pad manually in forward to achieve causal behavior
             let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, 0)?;
+
+            // Debug weight stats
+            if i == 0 {
+                let w = layer.weight();
+                if let Ok(flat) = w.flatten_all() {
+                    if let Ok(vec) = flat.to_vec1::<f32>() {
+                         let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                         let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                         let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                         eprintln!("    [F0Predictor] Layer 0 weight (after norm): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                    }
+                }
+
+                if let Some(bias) = layer.bias() {
+                    if let Ok(flat) = bias.flatten_all() {
+                        if let Ok(vec) = flat.to_vec1::<f32>() {
+                            let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                            eprintln!("    [F0Predictor] Layer 0 bias: mean={:.6}", mean);
+                        }
+                    }
+                }
+            }
+
             condnet.push(layer);
         }
 
@@ -448,6 +455,8 @@ impl F0Predictor {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [Batch, 80, Time]
+        eprintln!("  [F0Predictor] input shape: {:?}", x.shape());
+
         let mut h = x.clone();
         for (i, conv) in self.condnet.iter().enumerate() {
             if i == 0 {
@@ -461,10 +470,33 @@ impl F0Predictor {
             }
             h = conv.forward(&h)?;
             h = h.elu(1.0)?; // ELU
+
+            // Debug each layer
+            if let Ok(flat) = h.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = vec.iter().sum();
+                    let mean = sum / vec.len() as f32;
+                    eprintln!("    Layer {} after ELU: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                }
+            }
         }
         // h: [Batch, Cond, Time] -> transpose -> [Batch, Time, Cond]
         let h_t = h.transpose(1, 2)?;
         let out = self.classifier.forward(&h_t)?;
+
+        // Debug classifier output
+        if let Ok(flat) = out.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!("    Classifier out (pre-abs): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
+
         // out: [Batch, Time, 1]
         let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
         Ok(f0)
@@ -657,11 +689,36 @@ impl HiFTGenerator {
 
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         // mel: [Batch, 80, Length]
+        eprintln!("\n  [HiFT.forward] Starting...");
+        eprintln!("    input mel shape: {:?}", mel.shape());
+
+        // Print mel stats
+        if let Ok(mel_flat) = mel.flatten_all() {
+            if let Ok(mel_vec) = mel_flat.to_vec1::<f32>() {
+                let min = mel_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = mel_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = mel_vec.iter().sum();
+                let mean = sum / mel_vec.len() as f32;
+                eprintln!("    input mel stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
 
         // 1. F0 Predictor
         let f0 = self.f0_predictor.forward(mel)?; // [Batch, 1, Length_f0]
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
+        eprintln!("    F0 predictor output shape: {:?}", f0.shape());
+
+        // Print F0 stats
+        if let Ok(f0_flat) = f0.flatten_all() {
+            if let Ok(f0_vec) = f0_flat.to_vec1::<f32>() {
+                let min = f0_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = f0_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = f0_vec.iter().sum();
+                let mean = sum / f0_vec.len() as f32;
+                eprintln!("    F0 stats: min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz", min, max, mean);
+            }
+        }
 
         // 2. Upsample F0 to Source Resolution
         // Nearest neighbor upsample: [B, 1, L] -> [B, 1, L, Scale] -> [B, 1, L*Scale]
@@ -670,13 +727,48 @@ impl HiFTGenerator {
             .unsqueeze(3)?
             .repeat((1, 1, 1, self.f0_upsamp_scale))?
             .reshape((b, c, l * self.f0_upsamp_scale))?;
-        eprintln!("HiFT s (upsampled f0) shape: {:?}", s.shape());
+        eprintln!("    upsampled f0 shape: {:?} (scale={})", s.shape(), self.f0_upsamp_scale);
 
         // 3. Source Module
-        let (s_source, _, _) = self.m_source.forward(&s)?; // [B, 1, L_up]
+        let (s_source, _, _) = self.m_source.forward(&s, None, None, None)?; // [B, 1, L_up]
+        eprintln!("    source output shape: {:?}", s_source.shape());
+
+        // Print source stats
+        if let Ok(src_flat) = s_source.flatten_all() {
+            if let Ok(src_vec) = src_flat.to_vec1::<f32>() {
+                let min = src_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = src_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = src_vec.iter().sum();
+                let mean = sum / src_vec.len() as f32;
+                eprintln!("    source stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
 
         // 4. Decode
-        self.decode(mel, &s_source)
+        eprintln!("    Running decode...");
+        let audio = self.decode(mel, &s_source)?;
+
+        // Print final audio stats
+        eprintln!("    [HiFT.forward] output shape: {:?}", audio.shape());
+        if let Ok(audio_flat) = audio.flatten_all() {
+            if let Ok(audio_vec) = audio_flat.to_vec1::<f32>() {
+                let min = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = audio_vec.iter().sum();
+                let mean = sum / audio_vec.len() as f32;
+                eprintln!("    [HiFT.forward] audio stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+
+                // Check for problems
+                if min < -1.0 || max > 1.0 {
+                    eprintln!("    ⚠️  ISSUE: Audio out of [-1, 1] range!");
+                }
+                if mean.abs() > 0.1 {
+                    eprintln!("    ⚠️  ISSUE: Large DC offset: {}", mean);
+                }
+            }
+        }
+
+        Ok(audio)
     }
 
     fn decode(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
@@ -756,55 +848,50 @@ impl HiFTGenerator {
         let mag_log = x.i((.., ..cutoff, ..))?;
         let phase_in = x.i((.., cutoff.., ..))?;
 
+        // Debug conv_post output before exp
+        if let Ok(flat) = mag_log.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!("    [decode] mag_log (before exp): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                if max > 50.0 {
+                    eprintln!("      ⚠️  CRITICAL: mag_log has very large values, exp() will overflow!");
+                }
+            }
+        }
+
         let magnitude = mag_log.exp()?;
-        let phase = phase_in.sin()?; // Redundant sin in python?
-                                     // Python: phase = torch.sin(x[:, mid:, :])
-                                     // Then ISTFT(mag, phase) -> real = mag * cos(phase), img = mag * sin(phase).
-                                     // Since phase input is already sine of something?
-                                     // Wait, "actually, sin is redundancy" comment in python.
-                                     // It implies the network predicts 'phase' value which we treat as angle?
-                                     // No, it predicts x. Phase = sin(x).
-                                     // So Phase Angle is not x.
-                                     // Real part reconstruction uses cos(phase_angle). Imag uses sin(phase_angle).
-                                     // Here `phase` variable IS `sin(angle)`.
-                                     // So we have sin(theta). We need cos(theta).
-                                     // cos = sqrt(1 - sin^2). Sign?
-                                     // If we only predict sin(theta), we lose sign of cos(theta).
-                                     // Maybe HiFT assumes phase is in [-pi/2, pi/2] or something?
-                                     // Or "sin is redundancy" means we just use it as is?
-                                     // Let's check `_istft` in generator.py
-                                     // `real = magnitude * torch.cos(phase)`
-                                     // `img = magnitude * torch.sin(phase)`
-                                     // Wait, if `phase` variable passed to `_istft` is already result of `sin(x)`, then
-                                     // `real = mag * cos(sin(x))`. `img = mag * sin(sin(x))`.
-                                     // This seems weird if `x` is unbounded.
-                                     // If `x` is angle, then `phase = sin(x)`.
-                                     // Then we do `cos(sin(x))`.
-                                     // This seems to be the literal translation.
 
-        // I will implement `stft.forward` taking `magnitude` and `phase_input`.
-        // Logic inside `InverseStftModule::forward` was `mag * phase.cos()`.
-        // If `phase` input is `x` (angle), that is correct.
-        // But here `phase` passed is `sin(x)`.
-        // So I should pass `x` (the angle) to `InverseStft`?
-        // Python: phase = torch.sin(x_slice). _istft(magnitude, phase).
-        // So `_istft` receives `sin(x)`.
-        // inside `_istft`: `real = mag * cos(phase)`.
-        // So it computes `cos(sin(x))`.
-        // This effectively constraints the angle to `sin(x)` which is in [-1, 1] radians?
-        // This acts as a bounded phase constraint?
-        // Yes, likely intended for stability.
+        // Clip magnitude to prevent overflow - Python does: magnitude = torch.clip(magnitude, max=1e2)
+        let max_mag = Tensor::new(&[100.0f32], magnitude.device())?;
+        let magnitude = magnitude.minimum(&max_mag.broadcast_as(magnitude.shape())?)?;
 
-        // So, `InverseStftModule` should take `angle` or `raw_phase_param`?
-        // My `InverseStftModule` takes `phase` and does `.cos()` on it.
-        // If I pass `x.i(cutoff..)`, it will do `cos(x)`.
-        // Python does `cos(sin(x))`.
-        // So I should pass `x.i(cutoff..).sin()?` to my module?
-        // My module does `phase.cos()`.
-        // So `(sin(x)).cos()`.
-        // Yes.
+        let phase = phase_in.sin()?;
 
-        self.stft.forward(&magnitude, &phase)
+        // Debug magnitude after exp
+        if let Ok(flat) = magnitude.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!("    [decode] magnitude (after exp): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
+
+        let audio = self.stft.forward(&magnitude, &phase)?;
+
+        // Clamp audio to [-audio_limit, audio_limit] like Python does
+        // Python: x = torch.clamp(x, -self.audio_limit, self.audio_limit) where audio_limit = 0.99
+        let audio_limit = 0.99f32;
+        let min_val = Tensor::new(&[-audio_limit], audio.device())?;
+        let max_val = Tensor::new(&[audio_limit], audio.device())?;
+        let audio = audio.maximum(&min_val.broadcast_as(audio.shape())?)?;
+        let audio = audio.minimum(&max_val.broadcast_as(audio.shape())?)?;
+
+        Ok(audio)
     }
 }
 
@@ -857,6 +944,7 @@ impl HiFTConfig {
             resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            voiced_threshold: 10.0,
         }
     }
 }

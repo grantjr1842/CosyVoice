@@ -44,7 +44,7 @@ impl TtsEngine {
                 .downcast_into()
                 .map_err(|e| TtsError::InitError(format!("Failed to get sys.path: {}", e)))?;
 
-            path.insert(0, "/home/grant/github/CosyVoice-1/third_party/Matcha-TTS")?;
+            // Matcha-TTS path no longer needed - using cosyvoice.compat.matcha_compat
             path.insert(0, "/home/grant/github/CosyVoice-1")?;
 
             // Import and initialize CosyVoice3

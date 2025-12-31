@@ -190,6 +190,7 @@ impl CosyVoiceFlow {
     /// * `prompt_feat` - Prompt mel features [batch, mel_len, mel_dim]
     /// * `embedding` - Speaker embedding [batch, spk_embed_dim]
     /// * `n_timesteps` - Number of ODE solver steps (default 10)
+    /// * `noise` - Optional pre-generated noise for parity testing (use `None` for random)
     ///
     /// # Returns
     /// Mel spectrogram [batch, mel_dim, mel_len]
@@ -200,27 +201,40 @@ impl CosyVoiceFlow {
         prompt_feat: &Tensor,
         embedding: &Tensor,
         n_timesteps: usize,
+        noise: Option<&Tensor>,
     ) -> Result<Tensor> {
+        eprintln!("\n  [Flow.inference] Starting...");
+        eprintln!("    token shape: {:?}", token.shape());
+        eprintln!("    prompt_token shape: {:?}", prompt_token.shape());
+        eprintln!("    prompt_feat shape: {:?}", prompt_feat.shape());
+        eprintln!("    embedding shape: {:?}", embedding.shape());
+
         // Normalize speaker embedding
         let embedding_norm = l2_normalize(embedding)?;
         let embedding_proj = self.spk_embed_affine_layer.forward(&embedding_norm)?;
+        eprintln!("    embedding_proj shape: {:?}", embedding_proj.shape());
 
         // Concatenate prompt and target tokens
         let combined_token = Tensor::cat(&[prompt_token, token], 1)?;
-        // let token_len = combined_token.dim(1)?;
+        eprintln!("    combined_token shape: {:?}", combined_token.shape());
 
         // Embed tokens
         let token_emb = self.input_embedding.forward(&combined_token)?;
+        eprintln!("    token_emb shape: {:?}", token_emb.shape());
 
         // Apply pre-lookahead layer (finalize mode, no context)
         let h = self.pre_lookahead_layer.forward(&token_emb, None)?;
+        eprintln!("    pre_lookahead output shape: {:?}", h.shape());
 
         // Repeat interleave for token_mel_ratio
         let h = repeat_interleave(&h, self.config.token_mel_ratio, 1)?;
+        eprintln!("    after repeat_interleave shape: {:?}", h.shape());
 
         let prompt_mel_len = prompt_feat.dim(2)?; // [B, D, T], use dim 2
         let total_mel_len = h.dim(1)?;
         let target_mel_len = total_mel_len - prompt_mel_len;
+        eprintln!("    prompt_mel_len={}, total_mel_len={}, target_mel_len={}",
+                 prompt_mel_len, total_mel_len, target_mel_len);
 
         // Build conditioning tensor: [1, 80, total_len]
         let mut conds = Tensor::zeros(
@@ -239,16 +253,28 @@ impl CosyVoiceFlow {
             )?;
             conds = Tensor::cat(&[prompt_feat, &zeros_part], 2)?; // Cat along dim 2
         }
-        // conds is now [batch, mel_dim, mel_len]
-        // No transpose needed
+        eprintln!("    conds shape: {:?}", conds.shape());
 
         // Create mask (all ones for now)
         let mask = Tensor::ones((1, total_mel_len), DType::F32, &self.device)?;
 
         // mu = h transposed
         let mu = h.transpose(1, 2)?; // [batch, hidden_dim, mel_len]
+        eprintln!("    mu (to decoder) shape: {:?}", mu.shape());
+
+        // Print mu statistics
+        if let Ok(mu_flat) = mu.flatten_all() {
+            if let Ok(mu_vec) = mu_flat.to_vec1::<f32>() {
+                let min = mu_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = mu_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = mu_vec.iter().sum();
+                let mean = sum / mu_vec.len() as f32;
+                eprintln!("    mu stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
 
         // Run CFM decoder
+        eprintln!("    Running CFM decoder with {} timesteps...", n_timesteps);
         let feat = self.decoder.forward(
             &mu,
             &mask,
@@ -256,10 +282,46 @@ impl CosyVoiceFlow {
             1.0, // temperature
             Some(&embedding_proj),
             Some(&conds),
+            noise,
         )?;
+        eprintln!("    decoder output shape: {:?}", feat.shape());
+
+        // Print decoder output statistics
+        if let Ok(feat_flat) = feat.flatten_all() {
+            if let Ok(feat_vec) = feat_flat.to_vec1::<f32>() {
+                let min = feat_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = feat_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = feat_vec.iter().sum();
+                let mean = sum / feat_vec.len() as f32;
+                eprintln!("    decoder output stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
 
         // Extract only the target portion (after prompt)
-        let feat = feat.narrow(2, prompt_mel_len, target_mel_len)?;
+        // Clamp length to available dim (in case truncation happened during parity test)
+        let actual_dim = feat.dim(2)?;
+        let available_len = if actual_dim >= prompt_mel_len {
+            actual_dim - prompt_mel_len
+        } else {
+            0
+        };
+        let final_len = usize::min(target_mel_len, available_len);
+        if final_len != target_mel_len {
+            eprintln!("    [Flow.inference] Warning: Output truncated from {} to {}", target_mel_len, final_len);
+        }
+        let feat = feat.narrow(2, prompt_mel_len, final_len)?;
+        eprintln!("    final feat shape: {:?}", feat.shape());
+
+        // Print final mel statistics
+        if let Ok(feat_flat) = feat.flatten_all() {
+            if let Ok(feat_vec) = feat_flat.to_vec1::<f32>() {
+                let min = feat_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = feat_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = feat_vec.iter().sum();
+                let mean = sum / feat_vec.len() as f32;
+                eprintln!("    [Flow.inference] Final mel stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
 
         Ok(feat)
     }
