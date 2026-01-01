@@ -6,9 +6,8 @@ Tests different NSF (Neural Source Filter) parameter combinations
 to find optimal settings for audio quality.
 """
 
-import sys
 
-sys.path.append("third_party/Matcha-TTS")
+# Note: Matcha-TTS path no longer needed - using cosyvoice.compat.matcha_compat
 
 import os
 from pathlib import Path

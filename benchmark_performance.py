@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-import sys
 import time
 
 import numpy as np
 import torch
 
-# Add third_party to path
-sys.path.append("third_party/Matcha-TTS")
+# Note: Matcha-TTS path no longer needed - using cosyvoice.compat.matcha_compat
 from cosyvoice.cli.cosyvoice import AutoModel
 
 
