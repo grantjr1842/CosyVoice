@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod cosyvoice_flow;
 pub mod cosyvoice_llm;
 pub mod flow;
