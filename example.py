@@ -19,11 +19,9 @@ This example demonstrates zero-shot voice cloning using the Fun-CosyVoice3-0.5B-
 The default reference voice is the interstellar-tars voice clip.
 """
 
-import sys
 from pathlib import Path
 
-sys.path.append("third_party/Matcha-TTS")
-
+# Note: Matcha-TTS path no longer needed - using cosyvoice.compat.matcha_compat
 import torchaudio
 
 from cosyvoice.cli.cosyvoice import AutoModel
