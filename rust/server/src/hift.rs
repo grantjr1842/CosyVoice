@@ -3,6 +3,8 @@ use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 use std::f64::consts::PI;
 
+const TWO_PI: f64 = 2.0 * PI;
+
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
 /// Actually, the paper usually uses: x + (1/alpha) * sin(alpha * x)^2 ?
 /// BigVGAN implementation: x + (1 / alpha) * sin(alpha * x) ^ 2
@@ -135,7 +137,7 @@ impl SineGen {
         let cumsum = Tensor::from_vec(cumsum_upsampled, (b, self.harmonic_num + 1, l), &f0.device())?;
         let theta_mat = (cumsum * (2.0 * PI))?;
         let shape = theta_mat.shape();
-        let _phase_vec = (Tensor::rand(0.0f32, 1.0f32, shape, &self.device)? * two_pi)? - PI;
+        let _phase_vec = (Tensor::rand(0.0f32, 1.0f32, shape, &self.device)? * TWO_PI)? - PI;
         // Zero out fundamental (idx 0) phase?
         // Python: phase_vec[:, 0, :] = 0
         // We can slice and cat.
@@ -151,7 +153,7 @@ impl SineGen {
         let l = shape.dims()[2];
         let fund = Tensor::zeros((b, 1, l), DType::F32, &self.device)?;
         let harm = ((Tensor::rand(0.0f32, 1.0f32, (b, self.harmonic_num, l), &self.device)?
-            * two_pi)?
+            * TWO_PI)?
             - PI)?;
         let phase_vec = Tensor::cat(&[&fund, &harm], 1)?; // Concat along dim 1 (channels)
 
@@ -857,6 +859,7 @@ impl HiFTConfig {
             resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            voiced_threshold: 5.0,
         }
     }
 }
