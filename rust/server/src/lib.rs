@@ -123,6 +123,7 @@ impl FlowRust {
                 temperature,
                 spks_tensor.as_ref(),
                 cond_tensor.as_ref(),
+                None, // Use random noise for Python bridge (parity testing not needed here)
             )
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 

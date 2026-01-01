@@ -1,0 +1,434 @@
+{
+  "timings": {
+    "frontend_ms": 16817.10617200588,
+    "llm_ms": 0.0,
+    "flow_ms": 0.0,
+    "hift_ms": 0.0,
+    "total_ms": 21034.37064899481
+  },
+  "shapes": {
+    "text_token_len": 19,
+    "prompt_text_token_len": 14,
+    "prompt_speech_token_len": 87,
+    "generated_speech_token_len": 0,
+    "prompt_mel_shape": [
+      1,
+      174,
+      80
+    ],
+    "generated_mel_shape": [],
+    "audio_samples": 74880,
+    "audio_duration_sec": 3.12
+  },
+  "performance": {
+    "rtf": 6.741785464421413
+  },
+  "tensor_stats": {
+    "frontend_prompt_text_shape": [
+      1,
+      14
+    ],
+    "frontend_prompt_text_dtype": "torch.int32",
+    "frontend_prompt_text_min": 13.0,
+    "frontend_prompt_text_max": 151646.0,
+    "frontend_prompt_text_mean": 14721.21484375,
+    "frontend_prompt_text_std": 39751.71875,
+    "frontend_prompt_text_l2_norm": 153546.703125,
+    "frontend_prompt_text_first_10": [
+      2610.0,
+      525.0,
+      264.0,
+      10950.0,
+      17847.0,
+      13.0,
+      151646.0,
+      1986.0,
+      374.0,
+      264.0
+    ],
+    "frontend_prompt_text_last_10": [
+      17847.0,
+      13.0,
+      151646.0,
+      1986.0,
+      374.0,
+      264.0,
+      5785.0,
+      7743.0,
+      6077.0,
+      13.0
+    ],
+    "frontend_prompt_text_len_shape": [
+      1
+    ],
+    "frontend_prompt_text_len_dtype": "torch.int32",
+    "frontend_prompt_text_len_min": 14.0,
+    "frontend_prompt_text_len_max": 14.0,
+    "frontend_prompt_text_len_mean": 14.0,
+    "frontend_prompt_text_len_std": 0.0,
+    "frontend_prompt_text_len_l2_norm": 14.0,
+    "frontend_prompt_text_len_first_10": [
+      14.0
+    ],
+    "frontend_prompt_text_len_last_10": [],
+    "frontend_llm_prompt_speech_token_shape": [
+      1,
+      87
+    ],
+    "frontend_llm_prompt_speech_token_dtype": "torch.int32",
+    "frontend_llm_prompt_speech_token_min": 28.0,
+    "frontend_llm_prompt_speech_token_max": 6544.0,
+    "frontend_llm_prompt_speech_token_mean": 3040.482666015625,
+    "frontend_llm_prompt_speech_token_std": 2071.024658203125,
+    "frontend_llm_prompt_speech_token_l2_norm": 34251.14453125,
+    "frontend_llm_prompt_speech_token_first_10": [
+      5695.0,
+      488.0,
+      271.0,
+      55.0,
+      28.0,
+      28.0,
+      28.0,
+      108.0,
+      5535.0,
+      5049.0
+    ],
+    "frontend_llm_prompt_speech_token_last_10": [
+      4930.0,
+      4924.0,
+      2485.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0
+    ],
+    "frontend_llm_prompt_speech_token_len_shape": [
+      1
+    ],
+    "frontend_llm_prompt_speech_token_len_dtype": "torch.int32",
+    "frontend_llm_prompt_speech_token_len_min": 87.0,
+    "frontend_llm_prompt_speech_token_len_max": 87.0,
+    "frontend_llm_prompt_speech_token_len_mean": 87.0,
+    "frontend_llm_prompt_speech_token_len_std": 0.0,
+    "frontend_llm_prompt_speech_token_len_l2_norm": 87.0,
+    "frontend_llm_prompt_speech_token_len_first_10": [
+      87.0
+    ],
+    "frontend_llm_prompt_speech_token_len_last_10": [],
+    "frontend_flow_prompt_speech_token_shape": [
+      1,
+      87
+    ],
+    "frontend_flow_prompt_speech_token_dtype": "torch.int32",
+    "frontend_flow_prompt_speech_token_min": 28.0,
+    "frontend_flow_prompt_speech_token_max": 6544.0,
+    "frontend_flow_prompt_speech_token_mean": 3040.482666015625,
+    "frontend_flow_prompt_speech_token_std": 2071.024658203125,
+    "frontend_flow_prompt_speech_token_l2_norm": 34251.14453125,
+    "frontend_flow_prompt_speech_token_first_10": [
+      5695.0,
+      488.0,
+      271.0,
+      55.0,
+      28.0,
+      28.0,
+      28.0,
+      108.0,
+      5535.0,
+      5049.0
+    ],
+    "frontend_flow_prompt_speech_token_last_10": [
+      4930.0,
+      4924.0,
+      2485.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0,
+      29.0
+    ],
+    "frontend_flow_prompt_speech_token_len_shape": [
+      1
+    ],
+    "frontend_flow_prompt_speech_token_len_dtype": "torch.int32",
+    "frontend_flow_prompt_speech_token_len_min": 87.0,
+    "frontend_flow_prompt_speech_token_len_max": 87.0,
+    "frontend_flow_prompt_speech_token_len_mean": 87.0,
+    "frontend_flow_prompt_speech_token_len_std": 0.0,
+    "frontend_flow_prompt_speech_token_len_l2_norm": 87.0,
+    "frontend_flow_prompt_speech_token_len_first_10": [
+      87.0
+    ],
+    "frontend_flow_prompt_speech_token_len_last_10": [],
+    "frontend_prompt_speech_feat_shape": [
+      1,
+      174,
+      80
+    ],
+    "frontend_prompt_speech_feat_dtype": "torch.float32",
+    "frontend_prompt_speech_feat_min": -11.48274040222168,
+    "frontend_prompt_speech_feat_max": 1.3129539489746094,
+    "frontend_prompt_speech_feat_mean": -5.335824012756348,
+    "frontend_prompt_speech_feat_std": 2.804879903793335,
+    "frontend_prompt_speech_feat_l2_norm": 711.2117919921875,
+    "frontend_prompt_speech_feat_first_10": [
+      -8.355220794677734,
+      -8.852104187011719,
+      -9.498546600341797,
+      -9.93497371673584,
+      -9.6405668258667,
+      -9.493346214294434,
+      -9.770249366760254,
+      -9.922115325927734,
+      -9.713583946228027,
+      -9.707013130187988
+    ],
+    "frontend_prompt_speech_feat_last_10": [
+      -10.766850471496582,
+      -10.465015411376953,
+      -10.52119255065918,
+      -10.582118034362793,
+      -10.793838500976562,
+      -10.604185104370117,
+      -10.51939582824707,
+      -10.765204429626465,
+      -10.9745454788208,
+      -10.975922584533691
+    ],
+    "frontend_prompt_speech_feat_len_shape": [
+      1
+    ],
+    "frontend_prompt_speech_feat_len_dtype": "torch.int32",
+    "frontend_prompt_speech_feat_len_min": 174.0,
+    "frontend_prompt_speech_feat_len_max": 174.0,
+    "frontend_prompt_speech_feat_len_mean": 174.0,
+    "frontend_prompt_speech_feat_len_std": 0.0,
+    "frontend_prompt_speech_feat_len_l2_norm": 174.0,
+    "frontend_prompt_speech_feat_len_first_10": [
+      174.0
+    ],
+    "frontend_prompt_speech_feat_len_last_10": [],
+    "frontend_llm_embedding_shape": [
+      1,
+      192
+    ],
+    "frontend_llm_embedding_dtype": "torch.float32",
+    "frontend_llm_embedding_min": -2.1760306358337402,
+    "frontend_llm_embedding_max": 2.3721253871917725,
+    "frontend_llm_embedding_mean": 0.03308825194835663,
+    "frontend_llm_embedding_std": 0.9103074073791504,
+    "frontend_llm_embedding_l2_norm": 12.589051246643066,
+    "frontend_llm_embedding_first_10": [
+      0.7422716617584229,
+      0.4883266091346741,
+      -0.4143049418926239,
+      -0.4000135362148285,
+      1.1038427352905273,
+      -0.23313531279563904,
+      0.048090457916259766,
+      0.977778434753418,
+      0.4239509701728821,
+      0.015700340270996094
+    ],
+    "frontend_llm_embedding_last_10": [
+      -0.15170955657958984,
+      -0.3179558217525482,
+      -1.2559287548065186,
+      0.6326102018356323,
+      -1.2451921701431274,
+      0.7385640144348145,
+      1.1409603357315063,
+      -0.47567155957221985,
+      -0.4740278124809265,
+      0.5538567304611206
+    ],
+    "frontend_flow_embedding_shape": [
+      1,
+      192
+    ],
+    "frontend_flow_embedding_dtype": "torch.float32",
+    "frontend_flow_embedding_min": -2.1760306358337402,
+    "frontend_flow_embedding_max": 2.3721253871917725,
+    "frontend_flow_embedding_mean": 0.03308825194835663,
+    "frontend_flow_embedding_std": 0.9103074073791504,
+    "frontend_flow_embedding_l2_norm": 12.589051246643066,
+    "frontend_flow_embedding_first_10": [
+      0.7422716617584229,
+      0.4883266091346741,
+      -0.4143049418926239,
+      -0.4000135362148285,
+      1.1038427352905273,
+      -0.23313531279563904,
+      0.048090457916259766,
+      0.977778434753418,
+      0.4239509701728821,
+      0.015700340270996094
+    ],
+    "frontend_flow_embedding_last_10": [
+      -0.15170955657958984,
+      -0.3179558217525482,
+      -1.2559287548065186,
+      0.6326102018356323,
+      -1.2451921701431274,
+      0.7385640144348145,
+      1.1409603357315063,
+      -0.47567155957221985,
+      -0.4740278124809265,
+      0.5538567304611206
+    ],
+    "frontend_text_shape": [
+      1,
+      19
+    ],
+    "frontend_text_dtype": "torch.int32",
+    "frontend_text_min": 11.0,
+    "frontend_text_max": 9707.0,
+    "frontend_text_mean": 1445.9473876953125,
+    "frontend_text_std": 2823.69140625,
+    "frontend_text_l2_norm": 13536.716796875,
+    "frontend_text_first_10": [
+      27.0,
+      91.0,
+      268.0,
+      91.0,
+      29.0,
+      9707.0,
+      1879.0,
+      11.0,
+      419.0,
+      374.0
+    ],
+    "frontend_text_last_10": [
+      374.0,
+      264.0,
+      1273.0,
+      315.0,
+      279.0,
+      1467.0,
+      311.0,
+      8806.0,
+      1849.0,
+      13.0
+    ],
+    "frontend_text_len_shape": [
+      1
+    ],
+    "frontend_text_len_dtype": "torch.int32",
+    "frontend_text_len_min": 19.0,
+    "frontend_text_len_max": 19.0,
+    "frontend_text_len_mean": 19.0,
+    "frontend_text_len_std": 0.0,
+    "frontend_text_len_l2_norm": 19.0,
+    "frontend_text_len_first_10": [
+      19.0
+    ],
+    "frontend_text_len_last_10": [],
+    "llm_embedding_shape": [
+      1,
+      192
+    ],
+    "llm_embedding_dtype": "torch.float32",
+    "llm_embedding_min": -2.1760306358337402,
+    "llm_embedding_max": 2.3721253871917725,
+    "llm_embedding_mean": 0.03308825194835663,
+    "llm_embedding_std": 0.9103074073791504,
+    "llm_embedding_l2_norm": 12.589051246643066,
+    "llm_embedding_first_10": [
+      0.7422716617584229,
+      0.4883266091346741,
+      -0.4143049418926239,
+      -0.4000135362148285,
+      1.1038427352905273,
+      -0.23313531279563904,
+      0.048090457916259766,
+      0.977778434753418,
+      0.4239509701728821,
+      0.015700340270996094
+    ],
+    "llm_embedding_last_10": [
+      -0.15170955657958984,
+      -0.3179558217525482,
+      -1.2559287548065186,
+      0.6326102018356323,
+      -1.2451921701431274,
+      0.7385640144348145,
+      1.1409603357315063,
+      -0.47567155957221985,
+      -0.4740278124809265,
+      0.5538567304611206
+    ],
+    "flow_embedding_shape": [
+      1,
+      192
+    ],
+    "flow_embedding_dtype": "torch.float32",
+    "flow_embedding_min": -2.1760306358337402,
+    "flow_embedding_max": 2.3721253871917725,
+    "flow_embedding_mean": 0.03308825194835663,
+    "flow_embedding_std": 0.9103074073791504,
+    "flow_embedding_l2_norm": 12.589051246643066,
+    "flow_embedding_first_10": [
+      0.7422716617584229,
+      0.4883266091346741,
+      -0.4143049418926239,
+      -0.4000135362148285,
+      1.1038427352905273,
+      -0.23313531279563904,
+      0.048090457916259766,
+      0.977778434753418,
+      0.4239509701728821,
+      0.015700340270996094
+    ],
+    "flow_embedding_last_10": [
+      -0.15170955657958984,
+      -0.3179558217525482,
+      -1.2559287548065186,
+      0.6326102018356323,
+      -1.2451921701431274,
+      0.7385640144348145,
+      1.1409603357315063,
+      -0.47567155957221985,
+      -0.4740278124809265,
+      0.5538567304611206
+    ],
+    "final_audio_shape": [
+      1,
+      74880
+    ],
+    "final_audio_dtype": "torch.float32",
+    "final_audio_min": -0.4385729730129242,
+    "final_audio_max": 0.512549877166748,
+    "final_audio_mean": -1.0431998816784471e-05,
+    "final_audio_std": 0.06977318972349167,
+    "final_audio_l2_norm": 19.092727661132812,
+    "final_audio_first_10": [
+      1.096779033105122e-05,
+      4.3132244172738865e-05,
+      2.1201314666541293e-05,
+      -1.206117758556502e-05,
+      1.920143586175982e-05,
+      1.0629732969391625e-05,
+      -2.5422588805668056e-05,
+      3.104887582594529e-05,
+      2.06411841645604e-05,
+      1.1430619451857638e-05
+    ],
+    "final_audio_last_10": [
+      -9.9148164736107e-06,
+      1.037340666698583e-06,
+      1.6272702850983478e-05,
+      2.890240284614265e-05,
+      7.469775937352097e-06,
+      1.8344186173635535e-05,
+      1.79294165718602e-05,
+      1.116853945859475e-05,
+      2.6799998522619717e-05,
+      -1.2880840586149134e-05
+    ]
+  }
+}

@@ -193,6 +193,22 @@ def main():
         # Dummy tokens need to be within vocab range (e.g. < 151936)
         text_ids = torch.tensor([[100, 101, 102]], dtype=torch.long)
 
+    # 5. Noise Tensors for Parity Testing
+    print("Generating Noise Tensors for Parity Testing...")
+    torch.manual_seed(42)  # Fixed seed for reproducibility
+
+    # Flow noise: shape matches mu tensor [1, mel_dim, mel_len]
+    flow_mel_len = flow_feat.shape[2]
+    flow_noise = torch.randn(1, FLOW_N_MELS, flow_mel_len)
+    print(f"Flow Noise Shape: {flow_noise.shape}")
+
+    # HiFT phase injection for SineGen: [batch, harmonic_num, audio_len]
+    # harmonic_num = 8 (from config), audio_len = mel_len * 480 (upsample scale)
+    harmonic_num = 8
+    audio_len = flow_mel_len * 480
+    hift_phase = (torch.rand(1, harmonic_num, audio_len) * 2 * np.pi) - np.pi
+    print(f"HiFT Phase Shape: {hift_phase.shape}")
+
     # Save all to safetensors
     tensors = {
         "speech_token_feat_16k": speech_token_feat.contiguous(),  # [1, 128, T]
@@ -202,10 +218,13 @@ def main():
         # New additions:
         "speech_tokens": speech_tokens_tensor.int().contiguous(),  # [1, T_tokens]
         "speaker_embedding": speaker_embedding_tensor.contiguous(),  # [1, 192]
+        # Parity testing noise tensors:
+        "flow_noise": flow_noise.contiguous(),  # [1, 80, mel_len]
+        "hift_phase": hift_phase.float().contiguous(),  # [1, 8, audio_len]
     }
 
-    save_file(tensors, "test_artifacts.safetensors")
-    print("Saved to test_artifacts.safetensors")
+    save_file(tensors, "tests/test_artifacts.safetensors")
+    print("Saved to tests/test_artifacts.safetensors")
 
 
 if __name__ == "__main__":

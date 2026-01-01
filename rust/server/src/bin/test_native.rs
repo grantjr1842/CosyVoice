@@ -72,34 +72,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nSynthesizing (Direct/Bypassing Frontend)...");
     let start_total = std::time::Instant::now();
 
-    // 1. Embed text tokens
-    println!("Step 1: Embedding text tokens...");
-    let start_embed = std::time::Instant::now();
-    let text_embeds = engine.llm.embed_text_tokens(&text_ids)?;
-    let duration_embed = start_embed.elapsed();
-    println!("   Done in {:?}", duration_embed);
+    if std::env::var("TEST_FLOW_ONLY").unwrap_or_default() == "1" {
+        println!("*** Running FLOW PARITY TEST (Dummy Inputs) ***");
+        let token = Tensor::zeros((1, 50), DType::U32, &device)?;
+        let prompt_token = Tensor::zeros((1, 10), DType::U32, &device)?;
+        let prompt_feat = Tensor::randn(0.0f32, 1.0f32, (1, 80, 10), &device)?;
+        let embedding = Tensor::randn(0.0f32, 1.0f32, (1, 192), &device)?;
 
-    // 2. Full Synthesis
-    println!("Step 2: Full Synthesis (LLM -> Flow -> HiFT)...");
+        println!("Running Flow inference...");
+        engine.flow.inference(&token, &prompt_token, &prompt_feat, &embedding, 10, None)?;
+        println!("Flow test complete. Exiting.");
+        return Ok(());
+    }
+
+    // Load additional artifacts
+    let flow_noise = artifacts.get("flow_noise").expect("Missing flow_noise").to_device(&device)?;
+
+    // We skip LLM generation and use speech_tokens from artifacts to test Flow+HiFT
+    println!("\nSynthesizing (Flow + HiFT from Artifact Tokens)...");
     let start_synth = std::time::Instant::now();
-    let audio_samples = engine.synthesize_full(
-        &text_embeds,
-        Some(&speech_tokens),
-        &flow_feat_24k,
+
+    // Convert speech_tokens tensor (1, 87) to Vec<u32> if needed?
+    // flow.inference takes &Tensor. synthesize_from_tokens takes &Tensor.
+    // So we can pass speech_tokens directly.
+
+    // Create dummy prompt tokens/mel since we are using speech_tokens directly and Flow likely handles them?
+    // Note: Flow inference uses prompt_tokens and prompt_mel for conditioning.
+    // The artifacts typically correspond to a specific prompt.
+    // If we don't have matching prompt artifacts, we might get mismatch?
+    // But `speech_tokens` were generated conditioned on *some* prompt.
+    // Ideally we pass the SAME prompt.
+    // `flow_feat_24k` is target mel.
+    // Artifacts likely include `prompt_speech_24k`?
+    // tests/inspect_artifacts.py showed: flow_feat_24k, flow_noise, speech_tokens, speaker_embedding.
+    // No `prompt_tokens`?
+    // Let's assume zero prompt for now or random, but this might affect Flow output quality?
+    // Wait, if `speech_tokens` were generated with a prompt, Flow expects that prompt.
+    // If artifacts don't have it, we might be stuck.
+    // But let's try with empty prompt (which is valid for Zero-Shot if prompt is effectively handled or if SFT).
+    // Or create dummy zero prompt.
+
+    let empty_prompt_token = Tensor::zeros((1, 0), DType::U32, &device)?;
+    let empty_prompt_mel = Tensor::zeros((1, 80, 0), DType::F32, &device)?;
+
+    let audio_samples = engine.synthesize_from_tokens(
+        &speech_tokens,
+        &empty_prompt_token,
+        &empty_prompt_mel,
         &speaker_embedding,
-        25
+        Some(&flow_noise)
     )?;
+
     let duration_synth = start_synth.elapsed();
-    let duration_total = start_total.elapsed();
-
-    let audio_duration_sec = audio_samples.len() as f64 / 24000.0;
-    let rtf = duration_total.as_secs_f64() / audio_duration_sec;
-
     println!("\n✅ Synthesis complete!");
-    println!("   Total duration: {:?}", duration_total);
-    println!("   Audio duration: {:.2}s", audio_duration_sec);
-    println!("   RTF: {:.4}", rtf);
-    println!("   Generated {} samples.", audio_samples.len());
+    println!("   Audio duration: {:.2}s", audio_samples.len() as f64 / 24000.0);
+    println!("   Time taken: {:?}", duration_synth);
 
     // Save to WAV
     let spec = hound::WavSpec {
@@ -114,8 +141,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.write_sample(sample)?;
     }
     writer.finalize()?;
-
     println!("Saved audio to native_output.wav");
+
+    // 3. Test Direct HiFT (using artifact Mel)
+    println!("\nSynthesizing (Direct HiFT from Artifact Mel)...");
+    // Ensure flow_feat_24k is [1, 80, T]
+    // inspect_artifacts showed [1, 80, 171]. This is correct.
+    let audio_samples_hift = engine.synthesize_from_mel(&flow_feat_24k)?;
+
+    let mut wav_writer_hift = hound::WavWriter::create("native_hift_output.wav", spec)?;
+    for sample in audio_samples_hift {
+        wav_writer_hift.write_sample(sample)?;
+    }
+    wav_writer_hift.finalize()?;
+    println!("Saved direct output to native_hift_output.wav");
 
     Ok(())
 }

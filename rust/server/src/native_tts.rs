@@ -136,6 +136,7 @@ impl NativeTtsEngine {
     /// * `prompt_tokens` - Prompt speech tokens [batch, prompt_len]
     /// * `prompt_mel` - Prompt mel features [batch, mel_len, mel_dim]
     /// * `speaker_embedding` - Speaker embedding [batch, spk_dim]
+    /// * `flow_noise` - Optional pre-generated noise for parity testing (use `None` for random)
     ///
     /// # Returns
     /// Audio samples as i16
@@ -145,30 +146,135 @@ impl NativeTtsEngine {
         prompt_tokens: &Tensor,
         prompt_mel: &Tensor,
         speaker_embedding: &Tensor,
+        flow_noise: Option<&Tensor>,
     ) -> Result<Vec<i16>, NativeTtsError> {
+        // Debug input tensors
+        eprintln!("\n=== SYNTHESIS DEBUG ===");
+        eprintln!("Input speech_tokens shape: {:?}", speech_tokens.shape());
+        eprintln!("Input prompt_tokens shape: {:?}", prompt_tokens.shape());
+        eprintln!("Input prompt_mel shape: {:?}", prompt_mel.shape());
+        eprintln!("Input speaker_embedding shape: {:?}", speaker_embedding.shape());
+
+        // Print tensor statistics helper
+        fn print_tensor_stats(name: &str, t: &Tensor) {
+            if let Ok(flat) = t.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = vec.iter().sum();
+                    let mean = sum / vec.len() as f32;
+                    let variance: f32 = vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
+                    let std = variance.sqrt();
+                    eprintln!("  {} stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}, len={}",
+                             name, min, max, mean, std, vec.len());
+                    if vec.len() >= 10 {
+                        eprintln!("    first_5: {:?}", &vec[..5]);
+                        eprintln!("    last_5:  {:?}", &vec[vec.len()-5..]);
+                    }
+                }
+            }
+        }
+
+        print_tensor_stats("prompt_mel", prompt_mel);
+        print_tensor_stats("speaker_embedding", speaker_embedding);
+
         // 1. Run Flow to get mel spectrogram
-        eprintln!("Running Flow inference...");
+        eprintln!("\n--- Running Flow inference... ---");
         let mel = self.flow.inference(
             speech_tokens,
             prompt_tokens,
             prompt_mel,
             speaker_embedding,
             10, // n_timesteps
+            flow_noise,
         )?;
         eprintln!("Flow output shape: {:?}", mel.shape());
+        print_tensor_stats("flow_output_mel", &mel);
 
         // 2. Run HiFT to get audio
-        eprintln!("Running HiFT inference...");
+        eprintln!("\n--- Running HiFT inference... ---");
         let audio = self.hift.forward(&mel)?;
         eprintln!("HiFT output shape: {:?}", audio.shape());
+        print_tensor_stats("hift_output_audio", &audio);
 
         // 3. Convert to i16 samples
         let audio_vec: Vec<f32> = audio.flatten_all()?.to_vec1()?;
+
+        // Check for issues BEFORE conversion
+        let min_val = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean_val: f32 = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
+
+        if min_val < -1.0 || max_val > 1.0 {
+            eprintln!("⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}", min_val, max_val);
+        }
+        if mean_val.abs() > 0.1 {
+            eprintln!("⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.", mean_val);
+        }
+
+        // DC Removal & Conversion
         let samples: Vec<i16> = audio_vec
             .iter()
-            .map(|&x: &f32| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .map(|&x: &f32| ((x - mean_val) * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect();
 
+        eprintln!("=== END SYNTHESIS DEBUG ===\n");
+
+        Ok(samples)
+    }
+
+    /// Synthesize audio directly from a mel spectrogram (bypassing LLM and Flow)
+    pub fn synthesize_from_mel(
+        &self,
+        mel: &Tensor,
+    ) -> Result<Vec<i16>, NativeTtsError> {
+        eprintln!("\n=== SYNTHESIS FROM MEL DEBUG ===");
+        eprintln!("Input mel shape: {:?}", mel.shape());
+
+        // Print tensor statistics helper (duplicated logic for now)
+        fn print_tensor_stats(name: &str, t: &Tensor) {
+            if let Ok(flat) = t.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = vec.iter().sum();
+                    let mean = sum / vec.len() as f32;
+                    let variance: f32 = vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
+                    let std = variance.sqrt();
+                    eprintln!("  {} stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}, len={}",
+                             name, min, max, mean, std, vec.len());
+                }
+            }
+        }
+
+        print_tensor_stats("input_mel", mel);
+
+        // Run HiFT
+        eprintln!("\n--- Running HiFT inference (Direct Mel)... ---");
+        let audio = self.hift.forward(mel)?;
+        eprintln!("HiFT output shape: {:?}", audio.shape());
+        print_tensor_stats("hift_output_audio", &audio);
+
+        let audio_vec: Vec<f32> = audio.flatten_all()?.to_vec1()?;
+
+        // Check for issues
+        let min_val = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean_val: f32 = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
+
+        if min_val < -1.0 || max_val > 1.0 {
+            eprintln!("⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}", min_val, max_val);
+        }
+        if mean_val.abs() > 0.1 {
+            eprintln!("⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.", mean_val);
+        }
+
+        let samples: Vec<i16> = audio_vec
+            .iter()
+            .map(|&x: &f32| ((x - mean_val) * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect();
+
+        eprintln!("=== END SYNTHESIS FROM MEL DEBUG ===\n");
         Ok(samples)
     }
 
@@ -226,6 +332,7 @@ impl NativeTtsEngine {
             prompt_tokens,
             prompt_mel,
             speaker_embedding,
+            None, // Use random noise in production
         )
     }
 

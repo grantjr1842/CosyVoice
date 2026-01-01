@@ -12,14 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
+
+from cosyvoice.compat.matcha_compat import (
+    BasicTransformerBlock,
+    Block1D,
+    Downsample1D,
+    ResnetBlock1D,
+    SinusoidalPosEmb,
+    TimestepEmbedding,
+    Upsample1D,
+)
 from cosyvoice.utils.common import mask_to_bias
 from cosyvoice.utils.mask import add_optional_chunk_mask
-from matcha.models.components.decoder import SinusoidalPosEmb, Block1D, ResnetBlock1D, Downsample1D, TimestepEmbedding, Upsample1D
-from matcha.models.components.transformer import BasicTransformerBlock
 
 
 class Transpose(torch.nn.Module):
@@ -43,16 +52,23 @@ class CausalConv1d(torch.nn.Conv1d):
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = 'zeros',
+        padding_mode: str = "zeros",
         device=None,
-        dtype=None
+        dtype=None,
     ) -> None:
-        super(CausalConv1d, self).__init__(in_channels, out_channels,
-                                           kernel_size, stride,
-                                           padding=0, dilation=dilation,
-                                           groups=groups, bias=bias,
-                                           padding_mode=padding_mode,
-                                           device=device, dtype=dtype)
+        super(CausalConv1d, self).__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding=0,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype,
+        )
         assert stride == 1
         self.causal_padding = kernel_size - 1
 
@@ -73,7 +89,9 @@ class CausalBlock1D(Block1D):
             nn.Mish(),
         )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         output = self.block(x * mask)
         return output * mask
 
@@ -123,7 +141,9 @@ class ConditionalDecoder(nn.Module):
             input_channel = output_channel
             output_channel = channels[i]
             is_last = i == len(channels) - 1
-            resnet = ResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
+            resnet = ResnetBlock1D(
+                dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
+            )
             transformer_blocks = nn.ModuleList(
                 [
                     BasicTransformerBlock(
@@ -137,14 +157,20 @@ class ConditionalDecoder(nn.Module):
                 ]
             )
             downsample = (
-                Downsample1D(output_channel) if not is_last else nn.Conv1d(output_channel, output_channel, 3, padding=1)
+                Downsample1D(output_channel)
+                if not is_last
+                else nn.Conv1d(output_channel, output_channel, 3, padding=1)
             )
-            self.down_blocks.append(nn.ModuleList([resnet, transformer_blocks, downsample]))
+            self.down_blocks.append(
+                nn.ModuleList([resnet, transformer_blocks, downsample])
+            )
 
         for _ in range(num_mid_blocks):
             input_channel = channels[-1]
             out_channels = channels[-1]
-            resnet = ResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
+            resnet = ResnetBlock1D(
+                dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
+            )
 
             transformer_blocks = nn.ModuleList(
                 [
@@ -242,7 +268,9 @@ class ConditionalDecoder(nn.Module):
             mask_down = masks[-1]
             x = resnet(x, mask_down, t)
             x = rearrange(x, "b c t -> b t c").contiguous()
-            attn_mask = add_optional_chunk_mask(x, mask_down.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1)
+            attn_mask = add_optional_chunk_mask(
+                x, mask_down.bool(), False, False, 0, 0, -1
+            ).repeat(1, x.size(1), 1)
             attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
@@ -260,7 +288,9 @@ class ConditionalDecoder(nn.Module):
         for resnet, transformer_blocks in self.mid_blocks:
             x = resnet(x, mask_mid, t)
             x = rearrange(x, "b c t -> b t c").contiguous()
-            attn_mask = add_optional_chunk_mask(x, mask_mid.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1)
+            attn_mask = add_optional_chunk_mask(
+                x, mask_mid.bool(), False, False, 0, 0, -1
+            ).repeat(1, x.size(1), 1)
             attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
@@ -273,10 +303,12 @@ class ConditionalDecoder(nn.Module):
         for resnet, transformer_blocks, upsample in self.up_blocks:
             mask_up = masks.pop()
             skip = hiddens.pop()
-            x = pack([x[:, :, :skip.shape[-1]], skip], "b * t")[0]
+            x = pack([x[:, :, : skip.shape[-1]], skip], "b * t")[0]
             x = resnet(x, mask_up, t)
             x = rearrange(x, "b c t -> b t c").contiguous()
-            attn_mask = add_optional_chunk_mask(x, mask_up.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1)
+            attn_mask = add_optional_chunk_mask(
+                x, mask_up.bool(), False, False, 0, 0, -1
+            ).repeat(1, x.size(1), 1)
             attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
@@ -332,7 +364,9 @@ class CausalConditionalDecoder(ConditionalDecoder):
             input_channel = output_channel
             output_channel = channels[i]
             is_last = i == len(channels) - 1
-            resnet = CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
+            resnet = CausalResnetBlock1D(
+                dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
+            )
             transformer_blocks = nn.ModuleList(
                 [
                     BasicTransformerBlock(
@@ -346,14 +380,20 @@ class CausalConditionalDecoder(ConditionalDecoder):
                 ]
             )
             downsample = (
-                Downsample1D(output_channel) if not is_last else CausalConv1d(output_channel, output_channel, 3)
+                Downsample1D(output_channel)
+                if not is_last
+                else CausalConv1d(output_channel, output_channel, 3)
             )
-            self.down_blocks.append(nn.ModuleList([resnet, transformer_blocks, downsample]))
+            self.down_blocks.append(
+                nn.ModuleList([resnet, transformer_blocks, downsample])
+            )
 
         for _ in range(num_mid_blocks):
             input_channel = channels[-1]
             out_channels = channels[-1]
-            resnet = CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
+            resnet = CausalResnetBlock1D(
+                dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
+            )
 
             transformer_blocks = nn.ModuleList(
                 [
@@ -437,9 +477,13 @@ class CausalConditionalDecoder(ConditionalDecoder):
             x = resnet(x, mask_down, t)
             x = rearrange(x, "b c t -> b t c").contiguous()
             if streaming is True:
-                attn_mask = add_optional_chunk_mask(x, mask_down.bool(), False, False, 0, self.static_chunk_size, -1)
+                attn_mask = add_optional_chunk_mask(
+                    x, mask_down.bool(), False, False, 0, self.static_chunk_size, -1
+                )
             else:
-                attn_mask = add_optional_chunk_mask(x, mask_down.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1)
+                attn_mask = add_optional_chunk_mask(
+                    x, mask_down.bool(), False, False, 0, 0, -1
+                ).repeat(1, x.size(1), 1)
             attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
@@ -458,9 +502,13 @@ class CausalConditionalDecoder(ConditionalDecoder):
             x = resnet(x, mask_mid, t)
             x = rearrange(x, "b c t -> b t c").contiguous()
             if streaming is True:
-                attn_mask = add_optional_chunk_mask(x, mask_mid.bool(), False, False, 0, self.static_chunk_size, -1)
+                attn_mask = add_optional_chunk_mask(
+                    x, mask_mid.bool(), False, False, 0, self.static_chunk_size, -1
+                )
             else:
-                attn_mask = add_optional_chunk_mask(x, mask_mid.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1)
+                attn_mask = add_optional_chunk_mask(
+                    x, mask_mid.bool(), False, False, 0, 0, -1
+                ).repeat(1, x.size(1), 1)
             attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
@@ -473,13 +521,17 @@ class CausalConditionalDecoder(ConditionalDecoder):
         for resnet, transformer_blocks, upsample in self.up_blocks:
             mask_up = masks.pop()
             skip = hiddens.pop()
-            x = pack([x[:, :, :skip.shape[-1]], skip], "b * t")[0]
+            x = pack([x[:, :, : skip.shape[-1]], skip], "b * t")[0]
             x = resnet(x, mask_up, t)
             x = rearrange(x, "b c t -> b t c").contiguous()
             if streaming is True:
-                attn_mask = add_optional_chunk_mask(x, mask_up.bool(), False, False, 0, self.static_chunk_size, -1)
+                attn_mask = add_optional_chunk_mask(
+                    x, mask_up.bool(), False, False, 0, self.static_chunk_size, -1
+                )
             else:
-                attn_mask = add_optional_chunk_mask(x, mask_up.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1)
+                attn_mask = add_optional_chunk_mask(
+                    x, mask_up.bool(), False, False, 0, 0, -1
+                ).repeat(1, x.size(1), 1)
             attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
