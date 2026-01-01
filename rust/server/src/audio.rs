@@ -308,6 +308,176 @@ pub fn mel_spectrogram_from_file(
     mel_spectrogram(&samples, config, device)
 }
 
+// =============================================================================
+// Audio Post-Processing Functions
+// =============================================================================
+
+/// Configuration for audio post-processing.
+#[derive(Debug, Clone)]
+pub struct PostProcessConfig {
+    /// Normalize audio to target peak level (0.0 to 1.0)
+    pub normalize: bool,
+    /// Target peak level for normalization (default: 0.95)
+    pub target_peak: f32,
+    /// Upsample from 24kHz to 48kHz
+    pub upsample_48k: bool,
+    /// Apply soft clipping to prevent harsh distortion
+    pub soft_clip: bool,
+}
+
+impl Default for PostProcessConfig {
+    fn default() -> Self {
+        Self {
+            normalize: true,
+            target_peak: 0.95,
+            upsample_48k: false,
+            soft_clip: true,
+        }
+    }
+}
+
+/// Normalize audio to a target peak level.
+///
+/// # Arguments
+/// * `samples` - Audio samples (modified in place)
+/// * `target_peak` - Target peak amplitude (0.0 to 1.0)
+///
+/// # Returns
+/// The gain applied
+pub fn normalize_audio(samples: &mut [f32], target_peak: f32) -> f32 {
+    if samples.is_empty() {
+        return 1.0;
+    }
+
+    // Find current peak
+    let current_peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+
+    if current_peak < 1e-6 {
+        return 1.0; // Avoid division by zero for silence
+    }
+
+    // Calculate and apply gain
+    let gain = target_peak / current_peak;
+    for sample in samples.iter_mut() {
+        *sample *= gain;
+    }
+
+    gain
+}
+
+/// Apply soft clipping to prevent harsh digital clipping.
+///
+/// Uses tanh-based soft clipping which compresses values approaching the limit.
+pub fn soft_clip(samples: &mut [f32], threshold: f32) {
+    let inv_threshold = 1.0 / threshold;
+    for sample in samples.iter_mut() {
+        if sample.abs() > threshold {
+            // Soft clip using tanh
+            *sample = sample.signum() * threshold * (*sample * inv_threshold).tanh();
+        }
+    }
+}
+
+/// Upsample audio from 24kHz to 48kHz using linear interpolation.
+///
+/// This is a simple upsampling method. For higher quality, consider
+/// using sinc interpolation or polyphase filters.
+pub fn upsample_2x_linear(samples: &[f32]) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(samples.len() * 2);
+
+    for i in 0..samples.len() - 1 {
+        let s0 = samples[i];
+        let s1 = samples[i + 1];
+        output.push(s0);
+        output.push((s0 + s1) / 2.0); // Linear interpolation
+    }
+    // Handle last sample
+    output.push(samples[samples.len() - 1]);
+    output.push(samples[samples.len() - 1]); // Duplicate last
+
+    output
+}
+
+/// Upsample audio from 24kHz to 48kHz using cubic interpolation.
+///
+/// Higher quality than linear interpolation.
+pub fn upsample_2x_cubic(samples: &[f32]) -> Vec<f32> {
+    if samples.len() < 4 {
+        return upsample_2x_linear(samples);
+    }
+
+    let mut output = Vec::with_capacity(samples.len() * 2);
+
+    // Pad first sample
+    output.push(samples[0]);
+    output.push((samples[0] + samples[1]) / 2.0);
+
+    for i in 1..samples.len() - 2 {
+        let s_m1 = samples[i - 1];
+        let s_0 = samples[i];
+        let s_1 = samples[i + 1];
+        let s_2 = samples[i + 2];
+
+        output.push(s_0);
+
+        // Cubic interpolation at t=0.5
+        let t = 0.5f32;
+        let interpolated = s_0 + 0.5 * t * (s_1 - s_m1 + t * (2.0 * s_m1 - 5.0 * s_0 + 4.0 * s_1 - s_2 + t * (3.0 * (s_0 - s_1) + s_2 - s_m1)));
+        output.push(interpolated);
+    }
+
+    // Handle last samples
+    let n = samples.len();
+    output.push(samples[n - 2]);
+    output.push((samples[n - 2] + samples[n - 1]) / 2.0);
+    output.push(samples[n - 1]);
+    output.push(samples[n - 1]);
+
+    output
+}
+
+/// Apply full post-processing pipeline to audio samples.
+///
+/// # Arguments
+/// * `samples` - Input audio samples (consumed)
+/// * `config` - Post-processing configuration
+///
+/// # Returns
+/// Processed audio samples and the new sample rate
+pub fn post_process_audio(mut samples: Vec<f32>, config: &PostProcessConfig) -> (Vec<f32>, u32) {
+    let mut sample_rate = 24000u32;
+
+    // 1. Normalize
+    if config.normalize {
+        normalize_audio(&mut samples, config.target_peak);
+    }
+
+    // 2. Soft clip
+    if config.soft_clip {
+        soft_clip(&mut samples, 0.99);
+    }
+
+    // 3. Upsample (if requested)
+    if config.upsample_48k {
+        samples = upsample_2x_cubic(&samples);
+        sample_rate = 48000;
+    }
+
+    (samples, sample_rate)
+}
+
+/// Convert f32 samples to i16 for WAV output.
+pub fn samples_to_i16(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +533,98 @@ mod tests {
 
         assert_eq!(mel.nrows(), config.num_mels);
         assert!(mel.ncols() > 0);
+    }
+
+    #[test]
+    fn test_normalize_audio() {
+        let mut samples = vec![0.5, -0.3, 0.2, -0.1];
+        let gain = normalize_audio(&mut samples, 0.95);
+
+        // Peak should now be 0.95
+        let peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+        assert!((peak - 0.95).abs() < 1e-6);
+        assert!(gain > 1.0); // Should have increased volume
+    }
+
+    #[test]
+    fn test_soft_clip() {
+        let mut samples = vec![1.5, -1.2, 0.5, -0.3];
+        soft_clip(&mut samples, 0.99);
+
+        // All values should be within [-0.99, 0.99] range after clipping
+        for &s in &samples {
+            assert!(s.abs() <= 0.99);
+        }
+        // Values below threshold should be unchanged
+        assert!((samples[2] - 0.5).abs() < 1e-6);
+        assert!((samples[3] - (-0.3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_upsample_2x_linear() {
+        let samples = vec![0.0, 1.0, 0.0, -1.0];
+        let upsampled = upsample_2x_linear(&samples);
+
+        // Should be roughly 2x length
+        assert_eq!(upsampled.len(), 8);
+        // Original samples should be preserved at even indices
+        assert!((upsampled[0] - 0.0).abs() < 1e-6);
+        assert!((upsampled[2] - 1.0).abs() < 1e-6);
+        // Interpolated values at odd indices
+        assert!((upsampled[1] - 0.5).abs() < 1e-6); // (0.0 + 1.0) / 2
+    }
+
+    #[test]
+    fn test_upsample_2x_cubic() {
+        let samples: Vec<f32> = (0..100).map(|i| (i as f32 * 0.1).sin()).collect();
+        let upsampled = upsample_2x_cubic(&samples);
+
+        // Should be roughly 2x length
+        assert!(upsampled.len() >= samples.len() * 2 - 2);
+    }
+
+    #[test]
+    fn test_post_process_audio_default() {
+        let samples: Vec<f32> = (0..24000).map(|i| 0.3 * (i as f32 * 0.1).sin()).collect();
+        let config = PostProcessConfig::default();
+
+        let (processed, sample_rate) = post_process_audio(samples, &config);
+
+        // Default doesn't upsample
+        assert_eq!(sample_rate, 24000);
+        // Should normalize to 0.95 peak
+        let peak = processed.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+        assert!((peak - 0.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_post_process_audio_with_upsample() {
+        let samples: Vec<f32> = (0..24000).map(|i| 0.5 * (i as f32 * 0.1).sin()).collect();
+        let config = PostProcessConfig {
+            upsample_48k: true,
+            ..Default::default()
+        };
+
+        let (processed, sample_rate) = post_process_audio(samples, &config);
+
+        // Should upsample to 48kHz
+        assert_eq!(sample_rate, 48000);
+        // Length should approximately double
+        assert!(processed.len() >= 24000 * 2 - 10);
+    }
+
+    #[test]
+    fn test_samples_to_i16() {
+        let samples = vec![0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5];
+        let i16_samples = samples_to_i16(&samples);
+
+        assert_eq!(i16_samples[0], 0);
+        assert_eq!(i16_samples[1], 16383); // 0.5 * 32767
+        assert_eq!(i16_samples[2], -16383);
+        assert_eq!(i16_samples[3], 32767);
+        assert_eq!(i16_samples[4], -32767);
+        // Values > 1.0 should be clamped
+        assert_eq!(i16_samples[5], 32767);
+        assert_eq!(i16_samples[6], -32768);
     }
 }
