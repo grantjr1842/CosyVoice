@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         // This test requires model files to exist
-        let result = NativeTtsEngine::new("pretrained_models/Fun-CosyVoice3-0.5B");
+        let result = NativeTtsEngine::new("pretrained_models/Fun-CosyVoice3-0.5B", None);
         match result {
             Ok(_) => println!("Engine created successfully"),
             Err(e) => println!("Engine creation failed (expected if models missing): {}", e),

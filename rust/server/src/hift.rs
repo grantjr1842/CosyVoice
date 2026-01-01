@@ -3,6 +3,8 @@ use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 use std::f64::consts::PI;
 
+const TWO_PI: f64 = 2.0 * PI;
+
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
 /// Actually, the paper usually uses: x + (1/alpha) * sin(alpha * x)^2 ?
 /// BigVGAN implementation: x + (1 / alpha) * sin(alpha * x) ^ 2
@@ -944,7 +946,7 @@ impl HiFTConfig {
             resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
-            voiced_threshold: 10.0,
+            voiced_threshold: 5.0,
         }
     }
 }
