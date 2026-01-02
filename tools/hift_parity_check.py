@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 
 
-def run(cmd, env=None):
+def run(cmd, env=None, cwd=None):
     print(f"+ {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, env=env)
+    subprocess.run(cmd, check=True, env=env, cwd=cwd)
 
 
 def main() -> None:
@@ -38,7 +38,7 @@ def main() -> None:
     if not args.skip_rust:
         env = os.environ.copy()
         env.setdefault("SAVE_HIFT_DEBUG", "1")
-        run(rust_cmd, env=env)
+        run(rust_cmd, env=env, cwd=repo_root / "rust")
 
     run([sys.executable, str(compare_script), "--tolerance", str(args.tolerance)])
 
