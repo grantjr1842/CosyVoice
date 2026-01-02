@@ -1,6 +1,7 @@
 use candle_core::{Device, Result, Tensor};
 use std::f64::consts::PI;
 
+#[allow(dead_code)]
 pub struct STFT {
     n_fft: usize,
     hop_length: usize,
@@ -30,6 +31,7 @@ impl STFT {
     /// Returns: (magnitude, phase) or (real, imag)?
     /// HiFT expects: pure STFT return.
     /// Returns: (real, imag) each of shape [Batch, Freq, Frames]
+    #[allow(dead_code)]
     fn forward(&self, _x: &Tensor) -> Result<(Tensor, Tensor)> {
         // 1. Pad signal if needed (reflection padding is usually handled outside or assume input is padded)
         // For HiFT, input 's' is source excitation, usually matches hop size logic.
@@ -55,6 +57,23 @@ pub struct StftModule {
     filters_real: Tensor, // [n_fft/2 + 1, 1, n_fft]
     filters_imag: Tensor, // [n_fft/2 + 1, 1, n_fft]
     _device: Device,
+}
+
+fn reflect_pad_1d(x: &Tensor, pad: usize) -> Result<Tensor> {
+    if pad == 0 {
+        return Ok(x.clone());
+    }
+    let len = x.dim(2)?;
+    if len <= pad {
+        return Err(candle_core::Error::Msg(format!(
+            "Cannot reflect-pad length {} with pad {}",
+            len, pad
+        )));
+    }
+
+    let left = x.narrow(2, 1, pad)?.flip(&[2])?;
+    let right = x.narrow(2, len - pad - 1, pad)?.flip(&[2])?;
+    Tensor::cat(&[&left, x, &right], 2)
 }
 
 impl StftModule {
@@ -87,8 +106,10 @@ impl StftModule {
         } else {
              x.clone()
         };
+        let pad = self._n_fft / 2;
+        let x_padded = reflect_pad_1d(&x_unsqueezed, pad)?;
 
-        let real = x_unsqueezed.conv1d(
+        let real = x_padded.conv1d(
             &self.filters_real,
             0,
             self.hop_length,
@@ -96,7 +117,7 @@ impl StftModule {
             1, // groups
         )?;
 
-        let imag = x_unsqueezed.conv1d(&self.filters_imag, 0, self.hop_length, 1, 1)?;
+        let imag = x_padded.conv1d(&self.filters_imag, 0, self.hop_length, 1, 1)?;
 
         // Output: [Batch, Freq, Frames]
         Ok((real, imag))
@@ -110,16 +131,21 @@ pub struct InverseStftModule {
     _hop_length: usize,
     conv_real: ConvTranspose1d,
     conv_imag: ConvTranspose1d,
+    window_sq: Vec<f32>,
     _device: Device,
 }
 
 impl InverseStftModule {
     pub fn new(n_fft: usize, hop_length: usize, device: &Device) -> Result<Self> {
-        let _window = hann_window(n_fft, device)?; // [n_fft]
-
         let n_bins = n_fft / 2 + 1;
         let mut real_weights = Vec::with_capacity(n_bins * n_fft);
         let mut imag_weights = Vec::with_capacity(n_bins * n_fft);
+        let mut window_sq = Vec::with_capacity(n_fft);
+
+        for n in 0..n_fft {
+            let win_val = 0.5 * (1.0 - (2.0 * PI * n as f64 / n_fft as f64).cos());
+            window_sq.push((win_val * win_val) as f32);
+        }
 
         // We construct weights for ConvTranspose1d: [InCh, OutCh/Group, Kernel]
         // InCh = n_bins, OutCh = 1, Kernel = n_fft.
@@ -175,6 +201,7 @@ impl InverseStftModule {
             _hop_length: hop_length,
             conv_real,
             conv_imag,
+            window_sq,
             _device: device.clone(),
         })
     }
@@ -195,9 +222,34 @@ impl InverseStftModule {
         // Sum components
         let y = (y_real + y_imag)?;
 
-        // Output might be padded due to Centered STFT assumptions in PyTorch?
-        // HiFT generator output is `x`. User handles cropping.
-        Ok(y)
+        let n_frames = magnitude.dim(2)?;
+        let out_len = y.dim(2)?;
+        let hop = self._hop_length;
+        let n_fft = self._n_fft;
+
+        let mut window_sum = vec![0f32; out_len];
+        for frame in 0..n_frames {
+            let start = frame * hop;
+            if start + n_fft > out_len {
+                break;
+            }
+            for n in 0..n_fft {
+                window_sum[start + n] += self.window_sq[n];
+            }
+        }
+
+        let window_sum = Tensor::from_vec(window_sum, (1, 1, out_len), magnitude.device())?;
+        let window_sum = window_sum.broadcast_as(y.shape())?;
+        let eps = Tensor::new(&[1e-8f32], magnitude.device())?;
+        let window_sum = window_sum.maximum(&eps.broadcast_as(window_sum.shape())?)?;
+        let y = y.broadcast_div(&window_sum)?;
+
+        let pad = n_fft / 2;
+        if out_len > 2 * pad {
+            y.narrow(2, pad, out_len - 2 * pad)
+        } else {
+            Ok(y)
+        }
     }
 }
 
