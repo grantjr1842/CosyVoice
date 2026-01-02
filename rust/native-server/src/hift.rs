@@ -3,6 +3,252 @@ use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 use rand::Rng;
 use std::collections::HashMap;
+use std::path::Path;
+#[cfg(feature = "f0-libtorch")]
+use tch::{CModule, Device as TchDevice, Kind as TchKind, Tensor as TchTensor};
+
+struct HiftParitySeeds {
+    rand_ini: Option<Vec<f32>>,
+    sine_noise_cache: Option<Tensor>,
+    source_noise_cache: Option<Tensor>,
+}
+
+fn load_hift_parity_seeds_from_env() -> Result<Option<HiftParitySeeds>> {
+    let path = match std::env::var("HIFT_PARITY_SEEDS_PATH") {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let path = Path::new(&path);
+    if !path.exists() {
+        eprintln!(
+            "    [HiFT] Parity seeds path not found: {}",
+            path.display()
+        );
+        return Ok(None);
+    }
+
+    let cpu = Device::Cpu;
+    let mut tensors = candle_core::safetensors::load(path, &cpu)?;
+    let rand_ini = if let Some(t) = tensors.remove("rand_ini") {
+        Some(t.flatten_all()?.to_vec1::<f32>()?)
+    } else {
+        None
+    };
+    let sine_noise_cache = tensors.remove("sine_noise_cache");
+    let source_noise_cache = tensors.remove("source_noise_cache");
+
+    if rand_ini.is_none() && sine_noise_cache.is_none() && source_noise_cache.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(HiftParitySeeds {
+        rand_ini,
+        sine_noise_cache,
+        source_noise_cache,
+    }))
+}
+
+fn load_hift_f0_override_from_env(device: &Device) -> Result<Option<Tensor>> {
+    let path = match std::env::var("HIFT_F0_OVERRIDE_PATH") {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let path = Path::new(&path);
+    if !path.exists() {
+        eprintln!(
+            "    [HiFT] F0 override path not found: {}",
+            path.display()
+        );
+        return Ok(None);
+    }
+
+    let cpu = Device::Cpu;
+    let mut tensors = candle_core::safetensors::load(path, &cpu)?;
+    let f0 = match tensors.remove("f0_output") {
+        Some(tensor) => tensor,
+        None => {
+            eprintln!(
+                "    [HiFT] F0 override missing f0_output in {}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+
+    let f0 = match f0.rank() {
+        1 => f0.unsqueeze(0)?.unsqueeze(0)?,
+        2 => f0.unsqueeze(1)?,
+        3 => {
+            let (_b, c, t) = f0.dims3()?;
+            if c == 1 {
+                f0
+            } else if t == 1 {
+                f0.transpose(1, 2)?
+            } else {
+                return Err(candle_core::Error::Msg(format!(
+                    "f0_output must have channel dim 1 or last dim 1, got {:?}",
+                    f0.shape()
+                )));
+            }
+        }
+        _ => {
+            return Err(candle_core::Error::Msg(format!(
+                "f0_output must be rank 1-3, got rank {}",
+                f0.rank()
+            )))
+        }
+    };
+
+    Ok(Some(f0.to_device(device)?))
+}
+
+#[cfg(feature = "f0-libtorch")]
+struct TchF0Predictor {
+    module: CModule,
+}
+
+#[cfg(feature = "f0-libtorch")]
+impl TchF0Predictor {
+    fn new(path: &Path) -> Result<Self> {
+        let module = CModule::load(path).map_err(|err| {
+            candle_core::Error::Msg(format!(
+                "Failed to load torchscript f0 predictor from {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        Ok(Self { module })
+    }
+
+    fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        let mel_cpu = mel.to_device(&Device::Cpu)?;
+        let (b, c, t) = mel_cpu.dims3()?;
+        let mel_vec = mel_cpu.flatten_all()?.to_vec1::<f32>()?;
+        let input =
+            TchTensor::from_slice(&mel_vec).reshape(&[b as i64, c as i64, t as i64]);
+        let output = tch::no_grad(|| self.module.forward_ts(&[input])).map_err(|err| {
+            candle_core::Error::Msg(format!("Torchscript f0 forward failed: {}", err))
+        })?;
+
+        let output = output.to_device(TchDevice::Cpu).to_kind(TchKind::Float);
+        let sizes = output.size();
+        let (out_b, out_t) = match sizes.as_slice() {
+            [ob, ot] => (*ob as usize, *ot as usize),
+            [ob, ot, 1] => (*ob as usize, *ot as usize),
+            _ => {
+                return Err(candle_core::Error::Msg(format!(
+                    "Torchscript f0 output shape {:?} not supported",
+                    sizes
+                )))
+            }
+        };
+        let out_len = out_b * out_t;
+        let mut out_vec = vec![0f32; out_len];
+        output
+            .view([-1])
+            .f_copy_data(&mut out_vec, out_len)
+            .map_err(|err| {
+                candle_core::Error::Msg(format!("Torchscript f0 copy failed: {}", err))
+            })?;
+
+        Tensor::from_vec(out_vec, (out_b, 1, out_t), mel.device())
+    }
+}
+
+#[cfg(feature = "f0-libtorch")]
+fn load_hift_f0_torchscript_from_env() -> Result<Option<TchF0Predictor>> {
+    let path = match std::env::var("HIFT_F0_TORCHSCRIPT_PATH") {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let path = Path::new(&path);
+    if !path.exists() {
+        eprintln!(
+            "    [HiFT] Torchscript f0 path not found: {}",
+            path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(TchF0Predictor::new(path)?))
+}
+
+fn load_hift_s_stft_override_from_env(device: &Device) -> Result<Option<(Tensor, Tensor)>> {
+    let path = match std::env::var("HIFT_S_STFT_OVERRIDE_PATH") {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let path = Path::new(&path);
+    if !path.exists() {
+        eprintln!(
+            "    [HiFT] s_stft override path not found: {}",
+            path.display()
+        );
+        return Ok(None);
+    }
+
+    let cpu = Device::Cpu;
+    let mut tensors = candle_core::safetensors::load(path, &cpu)?;
+    let mut real = match tensors.remove("s_stft_real") {
+        Some(tensor) => tensor,
+        None => {
+            eprintln!(
+                "    [HiFT] s_stft override missing s_stft_real in {}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let mut imag = match tensors.remove("s_stft_imag") {
+        Some(tensor) => tensor,
+        None => {
+            eprintln!(
+                "    [HiFT] s_stft override missing s_stft_imag in {}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+
+    real = match real.rank() {
+        2 => real.unsqueeze(0)?,
+        3 => real,
+        _ => {
+            return Err(candle_core::Error::Msg(format!(
+                "s_stft_real must be rank 2-3, got rank {}",
+                real.rank()
+            )))
+        }
+    };
+    imag = match imag.rank() {
+        2 => imag.unsqueeze(0)?,
+        3 => imag,
+        _ => {
+            return Err(candle_core::Error::Msg(format!(
+                "s_stft_imag must be rank 2-3, got rank {}",
+                imag.rank()
+            )))
+        }
+    };
+
+    if real.shape() != imag.shape() {
+        if real.rank() == 3 && imag.rank() == 3 {
+            let (rb, rf, rt) = real.dims3()?;
+            let (ib, ifreq, it) = imag.dims3()?;
+            if rb == ib && rf == it && rt == ifreq {
+                imag = imag.transpose(1, 2)?;
+            }
+        }
+    }
+    if real.shape() != imag.shape() {
+        return Err(candle_core::Error::Msg(format!(
+            "s_stft_real and s_stft_imag shape mismatch: {:?} vs {:?}",
+            real.shape(),
+            imag.shape()
+        )));
+    }
+
+    Ok(Some((real.to_device(device)?, imag.to_device(device)?)))
+}
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
 /// Actually, the paper usually uses: x + (1/alpha) * sin(alpha * x)^2 ?
@@ -51,6 +297,7 @@ pub struct SineGen {
     use_interpolated: bool,
     causal: bool,
     rand_ini: Option<Vec<f32>>,
+    sine_noise_cache: Option<Tensor>,
 }
 
 impl SineGen {
@@ -62,12 +309,25 @@ impl SineGen {
         voiced_threshold: f32,
         upsample_scale: usize,
         causal: bool,
+        rand_ini_override: Option<Vec<f32>>,
+        sine_noise_cache: Option<Tensor>,
         _vb: VarBuilder,
     ) -> Result<Self> {
         let use_interpolated = sampling_rate != 22050;
-        let rand_ini = if causal {
+        let num = harmonic_num + 1;
+        let mut rand_ini = if causal { rand_ini_override } else { None };
+        if let Some(values) = rand_ini.as_ref() {
+            if values.len() != num {
+                eprintln!(
+                    "    [SineGen] rand_ini length {} does not match {}, ignoring override.",
+                    values.len(),
+                    num
+                );
+                rand_ini = None;
+            }
+        }
+        if causal && rand_ini.is_none() {
             let mut rng = rand::thread_rng();
-            let num = harmonic_num + 1;
             let mut values = Vec::with_capacity(num);
             for h in 0..num {
                 if h == 0 {
@@ -76,10 +336,9 @@ impl SineGen {
                     values.push(rng.gen::<f32>());
                 }
             }
-            Some(values)
-        } else {
-            None
-        };
+            rand_ini = Some(values);
+        }
+        let sine_noise_cache = if causal { sine_noise_cache } else { None };
         Ok(Self {
             harmonic_num,
             sine_amp,
@@ -90,7 +349,64 @@ impl SineGen {
             use_interpolated,
             causal,
             rand_ini,
+            sine_noise_cache,
         })
+    }
+
+    fn cached_sine_noise(
+        &self,
+        b: usize,
+        l: usize,
+        num_harmonics: usize,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let cache = match &self.sine_noise_cache {
+            Some(cache) => cache,
+            None => return Ok(None),
+        };
+        let mut cache = cache.to_device(device)?;
+        if cache.rank() != 3 {
+            return Err(candle_core::Error::Msg(format!(
+                "sine_noise_cache must be 3D, got rank {}",
+                cache.rank()
+            )));
+        }
+        let (cb, c1, c2) = cache.dims3()?;
+        if c2 == num_harmonics {
+            if c1 < l {
+                return Err(candle_core::Error::Msg(format!(
+                    "sine_noise_cache too short: need {}, have {}",
+                    l, c1
+                )));
+            }
+            cache = cache.narrow(1, 0, l)?;
+            cache = cache.transpose(1, 2)?;
+        } else if c1 == num_harmonics {
+            if c2 < l {
+                return Err(candle_core::Error::Msg(format!(
+                    "sine_noise_cache too short: need {}, have {}",
+                    l, c2
+                )));
+            }
+            cache = cache.narrow(2, 0, l)?;
+        } else {
+            return Err(candle_core::Error::Msg(format!(
+                "sine_noise_cache dims do not match num_harmonics {} (got {:?})",
+                num_harmonics,
+                (c1, c2)
+            )));
+        }
+
+        if cb == 1 && b > 1 {
+            cache = cache.repeat((b, 1, 1))?;
+        } else if cb != b {
+            return Err(candle_core::Error::Msg(format!(
+                "sine_noise_cache batch mismatch: cache {}, input {}",
+                cb, b
+            )));
+        }
+
+        Ok(Some(cache))
     }
 
     // forward(f0) -> (sine_waves, uv, noise)
@@ -252,7 +568,21 @@ impl SineGen {
         // Use injected noise or generate random noise
         let noise = match noise_inject {
             Some(n) => n.broadcast_mul(&noise_amp)?,
-            None => Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?,
+            None => {
+                if self.causal {
+                    if let Some(cache) =
+                        self.cached_sine_noise(b, l, num_harmonics, f0.device())?
+                    {
+                        cache.broadcast_mul(&noise_amp)?
+                    } else {
+                        Tensor::randn_like(&sine_waves, 0.0, 1.0)?
+                            .broadcast_mul(&noise_amp)?
+                    }
+                } else {
+                    Tensor::randn_like(&sine_waves, 0.0, 1.0)?
+                        .broadcast_mul(&noise_amp)?
+                }
+            }
         };
 
         // 6. Merge
@@ -343,7 +673,7 @@ pub struct SourceModuleHnNSF {
     sine_gen: SineGen,
     l_linear: candle_nn::Linear,
     causal: bool,
-    noise_cache: Option<Vec<f32>>,
+    noise_cache: Option<Tensor>,
 }
 
 impl SourceModuleHnNSF {
@@ -356,7 +686,17 @@ impl SourceModuleHnNSF {
         upsample_scale: usize,
         causal: bool,
         vb: VarBuilder,
+        parity_seeds: Option<HiftParitySeeds>,
     ) -> Result<Self> {
+        let (rand_ini_override, sine_noise_cache, source_noise_cache) = match parity_seeds {
+            Some(seeds) => (
+                seeds.rand_ini,
+                seeds.sine_noise_cache,
+                seeds.source_noise_cache,
+            ),
+            None => (None, None, None),
+        };
+
         let sine_gen = SineGen::new(
             harmonic_num,
             sine_amp,
@@ -365,6 +705,8 @@ impl SourceModuleHnNSF {
             voiced_threshold,
             upsample_scale,
             causal,
+            rand_ini_override,
+            sine_noise_cache,
             vb.clone(),
         )?;
         // l_linear: Linear(harmonic_num + 1, 1)
@@ -373,13 +715,17 @@ impl SourceModuleHnNSF {
         let l_linear = candle_nn::linear(harmonic_num + 1, 1, vb.pp("l_linear"))?;
 
         let noise_cache = if causal {
-            let mut rng = rand::thread_rng();
-            let len = sampling_rate.saturating_mul(300);
-            let mut values = Vec::with_capacity(len);
-            for _ in 0..len {
-                values.push(rng.gen::<f32>());
+            if let Some(cache) = source_noise_cache {
+                Some(cache)
+            } else {
+                let mut rng = rand::thread_rng();
+                let len = sampling_rate.saturating_mul(300);
+                let mut values = Vec::with_capacity(len);
+                for _ in 0..len {
+                    values.push(rng.gen::<f32>());
+                }
+                Some(Tensor::from_vec(values, (1, len, 1), &Device::Cpu)?)
             }
-            Some(values)
         } else {
             None
         };
@@ -392,20 +738,13 @@ impl SourceModuleHnNSF {
         })
     }
 
-    /// Forward pass with optional noise injection for parity testing.
-    ///
-    /// # Arguments
-    /// * `f0` - Fundamental frequency [Batch, 1, Length]
-    /// * `phase_inject` - Optional pre-generated harmonic phases for parity testing
-    /// * `sine_noise_inject` - Optional pre-generated sine noise for parity testing
-    /// * `source_noise_inject` - Optional pre-generated source noise for parity testing
-    pub fn forward(
+    fn forward_with_sine(
         &self,
         f0: &Tensor,
         phase_inject: Option<&Tensor>,
         sine_noise_inject: Option<&Tensor>,
         source_noise_inject: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let (sine_wavs, uv, _) = self.sine_gen.forward(f0, phase_inject, sine_noise_inject)?;
 
         // sine_merge = tanh(linear(sine_waves))
@@ -423,21 +762,64 @@ impl SourceModuleHnNSF {
                 let cache = self.noise_cache.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("Missing causal noise cache".into())
                 })?;
-                if len > cache.len() {
+                let mut noise_tensor = cache.to_device(uv.device())?;
+                if noise_tensor.rank() == 2 {
+                    noise_tensor = noise_tensor.unsqueeze(2)?;
+                }
+                if noise_tensor.rank() != 3 {
                     return Err(candle_core::Error::Msg(format!(
-                        "Noise cache too small: need {}, have {}",
-                        len,
-                        cache.len()
+                        "Noise cache must be 3D, got rank {}",
+                        noise_tensor.rank()
                     )));
                 }
-                let noise_vec = cache[..len].to_vec();
-                let noise_tensor = Tensor::from_vec(noise_vec, (1, len, 1), uv.device())?;
+                let (cb, cl, cc) = noise_tensor.dims3()?;
+                if cc != 1 {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache expected last dim 1, got {}",
+                        cc
+                    )));
+                }
+                if len > cl {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache too small: need {}, have {}",
+                        len, cl
+                    )));
+                }
+                noise_tensor = noise_tensor.narrow(1, 0, len)?;
+                if cb == 1 && uv.dim(0)? > 1 {
+                    noise_tensor = noise_tensor.repeat((uv.dim(0)?, 1, 1))?;
+                } else if cb != uv.dim(0)? {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache batch mismatch: cache {}, input {}",
+                        cb,
+                        uv.dim(0)?
+                    )));
+                }
                 let noise_tensor = noise_tensor.broadcast_as(uv.shape())?;
                 (noise_tensor * (self.sine_gen.sine_amp / 3.0))?
             }
             None => (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?,
         };
 
+        Ok((sine_merge, noise, uv, sine_wavs))
+    }
+
+    /// Forward pass with optional noise injection for parity testing.
+    ///
+    /// # Arguments
+    /// * `f0` - Fundamental frequency [Batch, 1, Length]
+    /// * `phase_inject` - Optional pre-generated harmonic phases for parity testing
+    /// * `sine_noise_inject` - Optional pre-generated sine noise for parity testing
+    /// * `source_noise_inject` - Optional pre-generated source noise for parity testing
+    pub fn forward(
+        &self,
+        f0: &Tensor,
+        phase_inject: Option<&Tensor>,
+        sine_noise_inject: Option<&Tensor>,
+        source_noise_inject: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (sine_merge, noise, uv, _sine_wavs) =
+            self.forward_with_sine(f0, phase_inject, sine_noise_inject, source_noise_inject)?;
         Ok((sine_merge, noise, uv))
     }
 }
@@ -588,7 +970,14 @@ impl F0Predictor {
         }
         // h: [Batch, Cond, Time] -> transpose -> [Batch, Time, Cond]
         let h_t = h.transpose(1, 2)?;
-        let out = self.classifier.forward(&h_t)?;
+        let out = if std::env::var("HIFT_F0_MANUAL_LINEAR")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            self.linear_manual(&h_t)?
+        } else {
+            self.classifier.forward(&h_t)?
+        };
 
         // Debug classifier output
         if let Ok(flat) = out.flatten_all() {
@@ -604,6 +993,100 @@ impl F0Predictor {
         // out: [Batch, Time, 1]
         let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
         Ok(f0)
+    }
+
+    pub fn forward_with_debug(
+        &self,
+        x: &Tensor,
+        debug: &mut HashMap<String, Tensor>,
+    ) -> Result<Tensor> {
+        // x: [Batch, 80, Time]
+        eprintln!("  [F0Predictor] input shape: {:?}", x.shape());
+
+        let mut h = x.clone();
+        for (i, conv) in self.condnet.iter().enumerate() {
+            if i == 0 {
+                // F0 predictor in CosyVoice3.0 uses kernel 4, causal type 'right'
+                // This means pad 3 on RIGHT.
+                h = h.pad_with_zeros(2, 0, 3)?;
+            } else {
+                // Subsequent ones are kernel 3, causal 'left'
+                // This means pad 2 on LEFT.
+                h = h.pad_with_zeros(2, 2, 0)?;
+            }
+            h = conv.forward(&h)?;
+            h = h.elu(1.0)?; // ELU
+            debug.insert(format!("f0_layer{}", i), h.clone());
+
+            if let Ok(flat) = h.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = vec.iter().sum();
+                    let mean = sum / vec.len() as f32;
+                    eprintln!("    Layer {} after ELU: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                }
+            }
+        }
+        // h: [Batch, Cond, Time] -> transpose -> [Batch, Time, Cond]
+        let h_t = h.transpose(1, 2)?;
+        let out = if std::env::var("HIFT_F0_MANUAL_LINEAR")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            self.linear_manual(&h_t)?
+        } else {
+            self.classifier.forward(&h_t)?
+        };
+        debug.insert("f0_classifier_pre_abs".to_string(), out.clone());
+
+        if let Ok(flat) = out.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!("    Classifier out (pre-abs): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+            }
+        }
+
+        // out: [Batch, Time, 1]
+        let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
+        Ok(f0)
+    }
+
+    fn linear_manual(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, t, c) = x.dims3()?;
+        let (out_c, in_c) = self.classifier.weight().dims2()?;
+        if out_c != 1 || in_c != c {
+            return self.classifier.forward(x);
+        }
+        if !x.device().is_cpu() {
+            return self.classifier.forward(x);
+        }
+
+        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
+        let w_vec = self.classifier.weight().flatten_all()?.to_vec1::<f32>()?;
+        let bias = if let Some(bias) = self.classifier.bias() {
+            let b_vec = bias.flatten_all()?.to_vec1::<f32>()?;
+            b_vec.get(0).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let mut out = vec![0f32; b * t];
+        for bi in 0..b {
+            for ti in 0..t {
+                let mut acc = bias;
+                let base = (bi * t + ti) * c;
+                for ci in 0..c {
+                    acc += x_vec[base + ci] * w_vec[ci];
+                }
+                out[bi * t + ti] = acc;
+            }
+        }
+
+        Tensor::from_vec(out, (b, t, 1), x.device())
     }
 }
 
@@ -621,6 +1104,10 @@ pub struct HiFTGenerator {
     f0_upsamp_scale: usize,
     num_kernels: usize,
     m_source: SourceModuleHnNSF,
+    #[cfg(feature = "f0-libtorch")]
+    f0_predictor_tch: Option<TchF0Predictor>,
+    #[cfg(not(feature = "f0-libtorch"))]
+    f0_predictor_tch: Option<()>,
 }
 
 impl HiFTGenerator {
@@ -773,6 +1260,7 @@ impl HiFTGenerator {
         let f0_upsamp_scale = ups_rates.iter().product::<usize>() * config.istft_params_hop_len;
 
         // Source
+        let parity_seeds = load_hift_parity_seeds_from_env()?;
         let m_source = SourceModuleHnNSF::new(
             config.nb_harmonics,
             0.1,
@@ -782,9 +1270,14 @@ impl HiFTGenerator {
             f0_upsamp_scale,
             true,
             vb.pp("m_source"),
+            parity_seeds,
         )?;
 
         let f0_predictor = F0Predictor::new(config.in_channels, base_ch, vb.pp("f0_predictor"))?;
+        #[cfg(feature = "f0-libtorch")]
+        let f0_predictor_tch = load_hift_f0_torchscript_from_env()?;
+        #[cfg(not(feature = "f0-libtorch"))]
+        let f0_predictor_tch = None;
 
         Ok(Self {
             conv_pre,
@@ -800,6 +1293,7 @@ impl HiFTGenerator {
             m_source,
             f0_predictor,
             f0_upsamp_scale,
+            f0_predictor_tch,
         })
     }
 
@@ -820,7 +1314,24 @@ impl HiFTGenerator {
         }
 
         // 1. F0 Predictor
-        let f0 = self.f0_predictor.forward(mel)?; // [Batch, 1, Length_f0]
+        let f0 = if let Some(f0_override) = load_hift_f0_override_from_env(mel.device())? {
+            eprintln!("    [HiFT] Using f0 override from HIFT_F0_OVERRIDE_PATH");
+            f0_override
+        } else {
+            #[cfg(feature = "f0-libtorch")]
+            {
+                if let Some(f0_tch) = self.f0_predictor_tch.as_ref() {
+                    eprintln!("    [HiFT] Using torchscript f0 predictor");
+                    f0_tch.forward(mel)?
+                } else {
+                    self.f0_predictor.forward(mel)?
+                }
+            }
+            #[cfg(not(feature = "f0-libtorch"))]
+            {
+                self.f0_predictor.forward(mel)?
+            }
+        }; // [Batch, 1, Length_f0]
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
         eprintln!("    F0 predictor output shape: {:?}", f0.shape());
@@ -891,7 +1402,24 @@ impl HiFTGenerator {
         let mut debug = HashMap::new();
         debug.insert("input_mel".to_string(), mel.clone());
 
-        let f0 = self.f0_predictor.forward(mel)?;
+        let f0 = if let Some(f0_override) = load_hift_f0_override_from_env(mel.device())? {
+            eprintln!("    [HiFT] Using f0 override from HIFT_F0_OVERRIDE_PATH");
+            f0_override
+        } else {
+            #[cfg(feature = "f0-libtorch")]
+            {
+                if let Some(f0_tch) = self.f0_predictor_tch.as_ref() {
+                    eprintln!("    [HiFT] Using torchscript f0 predictor");
+                    f0_tch.forward(mel)?
+                } else {
+                    self.f0_predictor.forward_with_debug(mel, &mut debug)?
+                }
+            }
+            #[cfg(not(feature = "f0-libtorch"))]
+            {
+                self.f0_predictor.forward_with_debug(mel, &mut debug)?
+            }
+        };
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?;
         if let Ok(f0_no_channel) = f0.squeeze(1) {
@@ -907,10 +1435,99 @@ impl HiFTGenerator {
             .reshape((b, c, l * self.f0_upsamp_scale))?;
         debug.insert("source_s".to_string(), s.transpose(1, 2)?);
 
-        let (sine_merge, noise, uv) = self.m_source.forward(&s, None, None, None)?;
+        let (sine_merge, noise, uv, sine_waves) =
+            self.m_source.forward_with_sine(&s, None, None, None)?;
         debug.insert("sine_merge".to_string(), sine_merge.transpose(1, 2)?);
+        debug.insert("sine_waves".to_string(), sine_waves.clone());
         debug.insert("noise".to_string(), noise.clone());
         debug.insert("uv".to_string(), uv.clone());
+        if let Some(rand_ini) = self.m_source.sine_gen.rand_ini.as_ref() {
+            let rand_ini_tensor =
+                Tensor::from_vec(rand_ini.clone(), (1, rand_ini.len()), mel.device())?;
+            debug.insert("rand_ini".to_string(), rand_ini_tensor);
+        }
+        if let Some(cache) = self.m_source.sine_gen.sine_noise_cache.as_ref() {
+            let s_len = s.dim(2)?;
+            let bsz = s.dim(0)?;
+            let num_harmonics = self.m_source.sine_gen.harmonic_num + 1;
+            let mut cache = cache.to_device(mel.device())?;
+            if cache.rank() != 3 {
+                return Err(candle_core::Error::Msg(format!(
+                    "sine_noise_cache must be 3D, got rank {}",
+                    cache.rank()
+                )));
+            }
+            let (cb, c1, c2) = cache.dims3()?;
+            let mut cache = if c2 == num_harmonics {
+                if c1 < s_len {
+                    return Err(candle_core::Error::Msg(format!(
+                        "sine_noise_cache too short: need {}, have {}",
+                        s_len, c1
+                    )));
+                }
+                cache.narrow(1, 0, s_len)?
+            } else if c1 == num_harmonics {
+                if c2 < s_len {
+                    return Err(candle_core::Error::Msg(format!(
+                        "sine_noise_cache too short: need {}, have {}",
+                        s_len, c2
+                    )));
+                }
+                cache.narrow(2, 0, s_len)?.transpose(1, 2)?
+            } else {
+                return Err(candle_core::Error::Msg(format!(
+                    "sine_noise_cache dims do not match num_harmonics {} (got {:?})",
+                    num_harmonics,
+                    (c1, c2)
+                )));
+            };
+            if cb == 1 && bsz > 1 {
+                cache = cache.repeat((bsz, 1, 1))?;
+            } else if cb != bsz {
+                return Err(candle_core::Error::Msg(format!(
+                    "sine_noise_cache batch mismatch: cache {}, input {}",
+                    cb, bsz
+                )));
+            }
+            debug.insert("sine_noise_cache".to_string(), cache);
+        }
+        if let Some(cache) = self.m_source.noise_cache.as_ref() {
+            let uv_len = uv.dim(1)?;
+            let bsz = uv.dim(0)?;
+            let mut cache = cache.to_device(mel.device())?;
+            if cache.rank() == 2 {
+                cache = cache.unsqueeze(2)?;
+            }
+            if cache.rank() != 3 {
+                return Err(candle_core::Error::Msg(format!(
+                    "source_noise_cache must be 3D, got rank {}",
+                    cache.rank()
+                )));
+            }
+            let (cb, cl, cc) = cache.dims3()?;
+            if cc != 1 {
+                return Err(candle_core::Error::Msg(format!(
+                    "source_noise_cache expected last dim 1, got {}",
+                    cc
+                )));
+            }
+            if cl < uv_len {
+                return Err(candle_core::Error::Msg(format!(
+                    "source_noise_cache too short: need {}, have {}",
+                    uv_len, cl
+                )));
+            }
+            let mut cache = cache.narrow(1, 0, uv_len)?;
+            if cb == 1 && bsz > 1 {
+                cache = cache.repeat((bsz, 1, 1))?;
+            } else if cb != bsz {
+                return Err(candle_core::Error::Msg(format!(
+                    "source_noise_cache batch mismatch: cache {}, input {}",
+                    cb, bsz
+                )));
+            }
+            debug.insert("source_noise_cache".to_string(), cache);
+        }
 
         let audio = self.decode_internal(mel, &sine_merge, Some(&mut debug))?;
         let final_audio = if audio.rank() == 3 && audio.dim(1)? == 1 {
@@ -955,7 +1572,14 @@ impl HiFTGenerator {
         // Wait, self.stft is INVERSE. We need ANALYSIS STFT.
         // I need to add `analysis_stft` to struct.
         // For now, let's assume I added it.
-        let (s_real, s_imag) = self.analysis_stft.transform(s)?; // [Batch, Freq, Frames]
+        let (s_real, s_imag) = if let Some((real, imag)) =
+            load_hift_s_stft_override_from_env(s.device())?
+        {
+            eprintln!("    [HiFT] Using s_stft override from HIFT_S_STFT_OVERRIDE_PATH");
+            (real, imag)
+        } else {
+            self.analysis_stft.transform(s)?
+        }; // [Batch, Freq, Frames]
         if let Some(debug_map) = debug.as_mut() {
             debug_map.insert("s_stft_real".to_string(), s_real.clone());
             debug_map.insert("s_stft_imag".to_string(), s_imag.clone());
@@ -972,6 +1596,9 @@ impl HiFTGenerator {
 
         for i in 0..num_ups {
             x = candle_nn::ops::leaky_relu(&x, 0.1)?; // lrelu_slope=0.1
+            if let Some(debug_map) = debug.as_mut() {
+                debug_map.insert(format!("upsample_{}_pre", i), x.clone());
+            }
 
             // Upsample
             let u = self.ups_rates[i];
@@ -991,11 +1618,20 @@ impl HiFTGenerator {
                 let left = x.i((.., .., 1..2))?;
                 x = Tensor::cat(&[&left, &x], 2)?;
             }
+            if let Some(debug_map) = debug.as_mut() {
+                debug_map.insert(format!("upsample_{}_out", i), x.clone());
+            }
 
             // Fusion
             // si = source_downs[i](s_stft)
-            let si = self.source_downs[i].forward(&s_stft)?;
-            let si = self.source_resblocks[i].forward(&si)?;
+            let si_down = self.source_downs[i].forward(&s_stft)?;
+            if let Some(debug_map) = debug.as_mut() {
+                debug_map.insert(format!("source_down_{}_out", i), si_down.clone());
+            }
+            let si = self.source_resblocks[i].forward(&si_down)?;
+            if let Some(debug_map) = debug.as_mut() {
+                debug_map.insert(format!("source_resblock_{}_out", i), si.clone());
+            }
 
             // Robust slice to handle boundary effects
             let x_len = x.dim(2)?;
@@ -1004,12 +1640,18 @@ impl HiFTGenerator {
             let x_slice = x.i((.., .., ..common_len))?;
             let si_slice = si.i((.., .., ..common_len))?;
             x = (x_slice + si_slice)?;
+            if let Some(debug_map) = debug.as_mut() {
+                debug_map.insert(format!("fusion_{}_out", i), x.clone());
+            }
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
             for j in 0..self.num_kernels {
                 let idx = i * self.num_kernels + j;
                 let out = self.resblocks[idx].forward(&x)?;
+                if let Some(debug_map) = debug.as_mut() {
+                    debug_map.insert(format!("resblock_{}_{}_out", i, j), out.clone());
+                }
                 match xs {
                     None => xs = Some(out),
                     Some(prev) => xs = Some((prev + out)?),
@@ -1018,10 +1660,19 @@ impl HiFTGenerator {
             if let Some(val) = xs {
                 x = (val / (self.num_kernels as f64))?;
             }
+            if let Some(debug_map) = debug.as_mut() {
+                debug_map.insert(format!("resblock_{}_out", i), x.clone());
+            }
         }
 
-        x = candle_nn::ops::leaky_relu(&x, 0.1)?; // Default slope
+        x = candle_nn::ops::leaky_relu(&x, 0.01)?; // Default slope matches PyTorch
+        if let Some(debug_map) = debug.as_mut() {
+            debug_map.insert("post_lrelu_out".to_string(), x.clone());
+        }
         x = self.conv_post.forward(&x)?;
+        if let Some(debug_map) = debug.as_mut() {
+            debug_map.insert("conv_post_out".to_string(), x.clone());
+        }
 
         // ISTFT Input: [B, n_fft+2, T]
         // Magnitude = exp(x[:, :mid])
@@ -1053,6 +1704,10 @@ impl HiFTGenerator {
         let magnitude = magnitude.minimum(&max_mag.broadcast_as(magnitude.shape())?)?;
 
         let phase = phase_in.sin()?;
+        if let Some(debug_map) = debug.as_mut() {
+            debug_map.insert("magnitude".to_string(), magnitude.clone());
+            debug_map.insert("phase".to_string(), phase.clone());
+        }
 
         // Debug magnitude after exp
         if let Ok(flat) = magnitude.flatten_all() {
@@ -1066,6 +1721,9 @@ impl HiFTGenerator {
         }
 
         let audio = self.stft.forward(&magnitude, &phase)?;
+        if let Some(debug_map) = debug.as_mut() {
+            debug_map.insert("istft_audio".to_string(), audio.clone());
+        }
         self.maybe_clamp_audio(audio)
     }
 }
