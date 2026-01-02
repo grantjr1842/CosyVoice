@@ -2,7 +2,6 @@
 
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use candle_core::{Device, Tensor, DType};
-use candle_nn::VarBuilder;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,19 +57,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Unpack artifacts and move to device
     let flow_feat_24k = artifacts.get("flow_feat_24k").expect("Missing flow_feat_24k").to_device(&device)?;
-    let text_ids = artifacts.get("text_ids").expect("Missing text_ids").to_dtype(DType::U32)?.to_device(&device)?;
+    let _text_ids = artifacts.get("text_ids").expect("Missing text_ids").to_dtype(DType::U32)?.to_device(&device)?;
 
     // New artifacts for bypassing frontend
     let speech_tokens = artifacts.get("speech_tokens").expect("Missing speech_tokens in artifacts. Did you upgrade generate_test_artifacts.py?").to_dtype(DType::U32)?.to_device(&device)?;
     let speaker_embedding = artifacts.get("speaker_embedding").expect("Missing speaker_embedding in artifacts.").to_device(&device)?;
 
     // Initialize Engine
-    let mut engine = NativeTtsEngine::new(&model_dir, Some(device.clone()))?;
+    let engine = NativeTtsEngine::new(&model_dir, Some(device.clone()))?;
     println!("\n✅ Engine loaded successfully!");
 
     // Run synthesis
     println!("\nSynthesizing (Direct/Bypassing Frontend)...");
-    let start_total = std::time::Instant::now();
+    let _start_total = std::time::Instant::now();
 
     if std::env::var("TEST_FLOW_ONLY").unwrap_or_default() == "1" {
         println!("*** Running FLOW PARITY TEST (Dummy Inputs) ***");

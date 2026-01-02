@@ -87,7 +87,7 @@ impl TtsEngine {
             let mut all_samples: Vec<i16> = Vec::new();
 
             // Iterate over the generator
-            for result in generator.iter()? {
+            for result in generator.try_iter()? {
                 let output = result?;
                 let speech_tensor = output.get_item("tts_speech")?;
 
@@ -136,7 +136,7 @@ impl TtsEngine {
             let mut all_samples: Vec<i16> = Vec::new();
 
             // Iterate over the generator
-            for result in generator.iter()? {
+            for result in generator.try_iter()? {
                 let output = result?;
                 let speech_tensor = output.get_item("tts_speech")?;
 
@@ -175,6 +175,7 @@ impl TtsEngine {
         })
     }
 
+    #[allow(dead_code)]
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

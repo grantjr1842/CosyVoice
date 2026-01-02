@@ -1,9 +1,6 @@
 // use crate::utils::StftModule; // Commented out until used
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
-use std::f64::consts::PI;
-
-const TWO_PI: f64 = 2.0 * PI;
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
 /// Actually, the paper usually uses: x + (1/alpha) * sin(alpha * x)^2 ?
@@ -47,11 +44,7 @@ pub struct SineGen {
     sine_amp: f64,
     noise_std: f64,
     sampling_rate: f64,
-    harmonic_range: Tensor, // [1, 1, harmonic_num + 1] -> broadcastable to [Batch, Len, Harmonics] ?
-    // Check shapes. Python: F_mat is [Batch, Harmonics, Length]
-    // My harmonic_range should be [1, Harmonics, 1] for broadcasting against f0 [Batch, 1, Length]?
     voiced_threshold: f32,
-    device: Device,
 }
 
 impl SineGen {
@@ -61,22 +54,14 @@ impl SineGen {
         noise_std: f64,
         sampling_rate: usize,
         voiced_threshold: f32,
-        vb: VarBuilder,
+        _vb: VarBuilder,
     ) -> Result<Self> {
-        let dev = vb.device();
-        // harmonic_range: [1.0, 2.0, ... H+1]
-        let range: Vec<f32> = (1..=harmonic_num + 1).map(|x| x as f32).collect();
-        // Shape: [1, Harmonics, 1] so we can mul with f0 [Batch, 1, Length] -> [Batch, Harmonics, Length]
-        let harmonic_range = Tensor::from_vec(range, (1, harmonic_num + 1, 1), dev)?;
-
         Ok(Self {
             harmonic_num,
             sine_amp,
             noise_std,
             sampling_rate: sampling_rate as f64,
-            harmonic_range,
             voiced_threshold,
-            device: dev.clone(),
         })
     }
 
@@ -224,7 +209,6 @@ fn load_conv1d(
 pub struct SourceModuleHnNSF {
     sine_gen: SineGen,
     l_linear: candle_nn::Linear,
-    l_tanh: bool, // Just a flag/marker effectively
 }
 
 impl SourceModuleHnNSF {
@@ -252,7 +236,6 @@ impl SourceModuleHnNSF {
         Ok(Self {
             sine_gen,
             l_linear,
-            l_tanh: true,
         })
     }
 
@@ -352,6 +335,7 @@ impl Module for ResBlock {
     }
 }
 
+#[allow(dead_code)]
 fn load_conv_transpose1d(
     vb: VarBuilder,
     in_c: usize,
@@ -519,7 +503,6 @@ pub struct HiFTGenerator {
     f0_upsamp_scale: usize,
     num_kernels: usize,
     m_source: SourceModuleHnNSF,
-    device: Device,
 }
 
 impl HiFTGenerator {
@@ -550,7 +533,7 @@ impl HiFTGenerator {
         // Ups
         let mut ups = Vec::new();
         let vb_ups = vb.pp("ups");
-        for (i, (&u, &k)) in ups_rates.iter().zip(ups_kernels).enumerate() {
+        for (i, (&_u, &k)) in ups_rates.iter().zip(ups_kernels).enumerate() {
             let in_c = base_ch / (1 << i);
             let out_c = base_ch / (1 << (i + 1));
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
@@ -685,7 +668,6 @@ impl HiFTGenerator {
             m_source,
             f0_predictor,
             f0_upsamp_scale: ups_rates.iter().product::<usize>() * config.istft_params_hop_len,
-            device: vb.device().clone(),
         })
     }
 

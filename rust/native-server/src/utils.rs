@@ -1,6 +1,7 @@
 use candle_core::{Device, Result, Tensor};
 use std::f64::consts::PI;
 
+#[allow(dead_code)]
 pub struct STFT {
     n_fft: usize,
     hop_length: usize,
@@ -30,6 +31,7 @@ impl STFT {
     /// Returns: (magnitude, phase) or (real, imag)?
     /// HiFT expects: pure STFT return.
     /// Returns: (real, imag) each of shape [Batch, Freq, Frames]
+    #[allow(dead_code)]
     fn forward(&self, _x: &Tensor) -> Result<(Tensor, Tensor)> {
         // 1. Pad signal if needed (reflection padding is usually handled outside or assume input is padded)
         // For HiFT, input 's' is source excitation, usually matches hop size logic.
