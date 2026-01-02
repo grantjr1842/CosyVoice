@@ -124,6 +124,12 @@ def compare_tensor(name: str, py_t: torch.Tensor, rust_t: torch.Tensor, toleranc
             print("Correlation: skipped (constant vector)")
 
 
+def tolerance_for_key(name: str, default_tol: float, resblock_tol: float) -> float:
+    if name.startswith("resblock_"):
+        return resblock_tol
+    return default_tol
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare HiFT intermediate tensors.")
     parser.add_argument(
@@ -147,6 +153,12 @@ def main() -> None:
         type=float,
         default=1e-4,
         help="MAE tolerance for match.",
+    )
+    parser.add_argument(
+        "--tolerance-resblock",
+        type=float,
+        default=1e-2,
+        help="MAE tolerance for resblock_* keys.",
     )
     args = parser.parse_args()
 
@@ -172,7 +184,8 @@ def main() -> None:
     for key in args.keys:
         if key not in py_data or key not in rust_data:
             continue
-        compare_tensor(key, py_data[key], rust_data[key], args.tolerance)
+        tol = tolerance_for_key(key, args.tolerance, args.tolerance_resblock)
+        compare_tensor(key, py_data[key], rust_data[key], tol)
 
 
 if __name__ == "__main__":

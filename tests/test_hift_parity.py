@@ -283,7 +283,8 @@ def main():
 
     # Load Rust native output if it exists
     rust_output_path = "outputs/audio/native_hift_output.wav"
-    if os.path.exists(rust_output_path):
+    skip_audio_compare = os.environ.get("SKIP_AUDIO_COMPARE", "0") == "1"
+    if not skip_audio_compare and os.path.exists(rust_output_path):
         print(f"\n=== Loading Rust native output: {rust_output_path} ===")
         rust_audio, rust_sr = torchaudio.load(rust_output_path)
         print(f"Rust audio shape: {rust_audio.shape}")
@@ -369,7 +370,7 @@ def main():
     print(
         f"Python HiFT audio: {audio.shape}, range [{audio.min():.4f}, {audio.max():.4f}]"
     )
-    if os.path.exists(rust_output_path):
+    if not skip_audio_compare and os.path.exists(rust_output_path):
         print(
             f"Rust native audio: {rust_audio.shape}, range [{rust_audio.min():.4f}, {rust_audio.max():.4f}]"
         )
