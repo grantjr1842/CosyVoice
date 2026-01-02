@@ -15,20 +15,21 @@ use std::{
     env,
     net::SocketAddr,
     sync::Arc,
-    time::Instant,
     path::PathBuf,
+    time::Instant,
 };
 use tokio::signal;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error, warn};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use candle_core::{Device, Tensor, DType};
+use candle_core::{Device, Tensor};
 
 use shared::{config, ErrorResponse, HealthResponse, SynthesizeRequest};
 
-use cosyvoice_native_server::tts::{NativeTtsEngine, NativeTtsError};
+use cosyvoice_native_server::tts::NativeTtsEngine;
 use cosyvoice_native_server::audio::{self, MelConfig};
+use cosyvoice_native_server::text_frontend::text_normalize_english;
 
 // Use jemalloc for better memory allocation performance
 #[global_allocator]
@@ -39,7 +40,6 @@ struct AppState {
     // Engine is wrapped in Mutex because OnnxFrontend requires mutable access
     tts: Mutex<NativeTtsEngine>,
     tokenizer: tokenizers::Tokenizer,
-    model_dir: String,
 }
 
 #[tokio::main]
@@ -89,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         tts: Mutex::new(tts),
         tokenizer,
-        model_dir,
     });
 
     // Build router
@@ -127,116 +126,180 @@ async fn synthesize_handler(
         "Synthesizing speech (Native)"
     );
 
-    // TODO: Implement full synthesis logic
-    // This requires:
-    // 1. Text -> Tokens (using Tokenizer)
-    // 2. Audio -> Mel/Fbank (using audio module)
-    // 3. Call tts.synthesize_instruct (or similar)
-
-    // For now, let's verify we can process the inputs
-
-    // 1. Text Tokenization
-    // CosyVoice expects [sos, text_tokens, task_id, prompt_tokens]
-    // The tokenizer encoding usually gives the text part.
-    // Need to handle SOS/task_id separately or check how NativeTtsEngine expects them.
-    // NativeTtsEngine::synthesize_instruct takes `text_tokens: &Tensor`.
-    // It calls `llm.embed_text_tokens`.
-    // The `llm.generate` method inside `synthesize_full` constructs [sos, text, task_id...].
-    // So we just need the text tokens here.
-
-    let text_encoding = match state.tokenizer.encode(request.text.clone(), true) {
-        Ok(enc) => enc,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Tokenizer error: {}", e)),
-    };
-    let text_ids: Vec<u32> = text_encoding.get_ids().iter().map(|&id| id).collect();
-
-    // 2. Prompt Audio Processing
-    if request.prompt_audio.is_none() {
-         return error_response(StatusCode::BAD_REQUEST, "prompt_audio is required".to_string());
+    if request.text.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "text is required".to_string());
     }
-    let prompt_path = request.prompt_audio.as_ref().unwrap();
 
-    // Load audio
-    // We need to do this potentially blocking IO?
-    /*
-    let (audio_samples, sample_rate) = match audio::load_wav(prompt_path) {
-        Ok(res) => res,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load audio: {}", e)),
+    let prompt_audio = match request.prompt_audio.as_deref() {
+        Some(path) => path.to_string(),
+        None => return error_response(StatusCode::BAD_REQUEST, "prompt_audio is required".to_string()),
     };
-    */
-    // Since we are inside async handler, we should avoid blocking.
-    // But for MVP, let's just do it. Or wrap in spawn_blocking.
 
-    let prompt_path_clone = prompt_path.clone();
-    let text_ids_clone = text_ids.clone();
-    let state_clone = state.clone();
-    let speed = request.speed;
+    let prompt_text = match request.prompt_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => text.to_string(),
+        Some(_) => return error_response(StatusCode::BAD_REQUEST, "prompt_text is empty".to_string()),
+        None => request
+            .speaker
+            .clone()
+            .unwrap_or_else(|| "Speak naturally in English.".to_string()),
+    };
 
-    // Run heavy lifting in spawn_blocking?
-    // Problem: `tts` is inside Mutex (async mutex). We can't easily move the locked guard into blocking thread.
-    // But `NativeTtsEngine` uses Candle which might be CPU intensive (or GPU).
-    // If GPU, it's async-ish (kernels launch), but synchronization happens.
-    // Ideally we lock, run, unlock.
+    let prompt_segments = match text_normalize_english(&prompt_text, &state.tokenizer, false, true) {
+        Ok(segments) => segments,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Prompt text normalize error: {e}")),
+    };
+    let prompt_text = match prompt_segments.into_iter().next() {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => return error_response(StatusCode::BAD_REQUEST, "prompt_text normalized to empty".to_string()),
+    };
+    let prompt_tokens = match encode_tokens(&state.tokenizer, &prompt_text) {
+        Ok(tokens) => tokens,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let prompt_text_len = prompt_tokens.len();
 
-    // Let's load audio first (blocking IO)
-    let load_audio_result = tokio::task::spawn_blocking(move || {
-        audio::load_wav(prompt_path_clone)
-    }).await;
+    let mut tts_segments = match text_normalize_english(&request.text, &state.tokenizer, true, true) {
+        Ok(segments) => segments,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Text normalize error: {e}")),
+    };
+    tts_segments.retain(|segment| !segment.trim().is_empty());
+    if tts_segments.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "text normalized to empty".to_string());
+    }
 
-    let (audio_samples, sample_rate) = match load_audio_result {
+    let load_audio_result = tokio::task::spawn_blocking(move || audio::load_wav(prompt_audio)).await;
+    let (prompt_samples, prompt_sr) = match load_audio_result {
         Ok(Ok(res)) => res,
-        Ok(Err(e)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load audio: {}", e)),
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {}", e)),
+        Ok(Err(e)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load audio: {e}")),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {e}")),
     };
 
-    // We have audio samples.
-    // Need to compute Mel (24k) and Fbank (16k or whatever OnnxFrontend expects?)
-    // OnnxFrontend expects 16k for Campplus/SpeechTokenizer?
-    // Let's check `OnnxFrontend` usage in `native_tts.rs`.
-    // `process_prompt_tensors(prompt_speech_16k, prompt_fbank)`
-    // `prompt_speech_16k`: [1, 128, T] mel? No, "prompt_speech_16k for Tokenizer".
-    // `tokenize_speech` takes `mel: &Tensor` [batch, 128, frames].
-    // So we need to compute MEL spectrograms.
-
-    // Configs:
-    // Flow/HiFT use 24k audio.
-    // SpeechTokenizer/Campplus use 16k audio?
-    // We need to resample if loaded at 24k (CosyVoice3 default).
-    // Or if loaded at 16k.
-
-    // Assuming prompt audio can be anything, strict resampling is needed.
-    // For now, assume 24k for Flow.
-    // If `sample_rate` != 24000, we need to resample.
-
-    // TODO: Implement Resampling. For now, fail if not 24k or 22050 (if that's what we want).
-
-    // Lock the engine
-    let mut tts = state_clone.tts.lock().await;
-    let device = tts.device.clone();
-
-    // Convert text tokens to Tensor
-    let text_tensor = match Tensor::from_vec(text_ids_clone, (1, text_ids.len()), &device) {
-         Ok(t) => t,
-         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Tensor error: {}", e)),
+    let prompt_16k = match audio::resample_audio(&prompt_samples, prompt_sr, 16000) {
+        Ok(samples) => samples,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Resample to 16k failed: {e}")),
+    };
+    let prompt_24k = match audio::resample_audio(&prompt_samples, prompt_sr, 24000) {
+        Ok(samples) => samples,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Resample to 24k failed: {e}")),
     };
 
-    // Calculate Mel/Fbank
-    // We need 24k Mel for Flow
-    // We need 16k Mel for Tokenizer (SpeechTokenizer) ??
-    // We need 16k Fbank for Speaker Embedding (Campplus) ??
+    let prompt_speech_16k = match audio::whisper_log_mel_spectrogram(&prompt_16k, &Device::Cpu) {
+        Ok(mel) => mel,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Whisper mel failed: {e}")),
+    };
+    let prompt_fbank = match audio::kaldi_fbank(&prompt_16k, 16000, &Device::Cpu) {
+        Ok(fbank) => fbank,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Fbank failed: {e}")),
+    };
 
-    // Let's assume input audio is 24k.
-    // We need to resample to 16k for frontend.
-    // Since we don't have a resampler in `audio.rs` yet (only upsample 2x),
-    // we might need to rely on external tools or add a resampler.
+    let device = {
+        let tts = state.tts.lock().await;
+        tts.device.clone()
+    };
 
-    // For MVP validation, we will skip implementation of full synthesis in `main.rs`
-    // and return a 501 Not Implemented with a message.
-    // The goal of this task is "Separation". The functional Native Server is a larger task.
+    let mut prompt_speech_24k = match audio::mel_spectrogram(&prompt_24k, &MelConfig::cosyvoice3(), &device) {
+        Ok(mel) => mel,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("24k mel failed: {e}")),
+    };
 
-    return ((StatusCode::NOT_IMPLEMENTED), "Native synthesis not fully implemented yet (needs resampling/frontend integration in main.rs)").into_response();
+    let mut tts = state.tts.lock().await;
+    let (mut prompt_speech_tokens, speaker_embedding) = match tts.process_prompt_tensors(&prompt_speech_16k, &prompt_fbank) {
+        Ok(res) => res,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Prompt processing failed: {e}")),
+    };
 
-    // ... (Remainder of synthesis logic would go here)
+    let mel_len = match prompt_speech_24k.dim(2) {
+        Ok(len) => len,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Prompt mel shape error: {e}")),
+    };
+    let token_len = match prompt_speech_tokens.dim(1) {
+        Ok(len) => len,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Prompt token shape error: {e}")),
+    };
+    let aligned_token_len = usize::min(mel_len / 2, token_len);
+    if aligned_token_len == 0 {
+        return error_response(StatusCode::BAD_REQUEST, "prompt audio produced no usable tokens".to_string());
+    }
+
+    if aligned_token_len != token_len {
+        prompt_speech_24k = match prompt_speech_24k.narrow(2, 0, aligned_token_len * 2) {
+            Ok(mel) => mel,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Prompt mel align failed: {e}")),
+        };
+        prompt_speech_tokens = match prompt_speech_tokens.narrow(1, 0, aligned_token_len) {
+            Ok(tokens) => tokens,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Prompt token align failed: {e}")),
+        };
+    }
+
+    let sample_rate = tts.sample_rate;
+    let mut all_samples: Vec<i16> = Vec::new();
+    for segment in tts_segments {
+        let tts_tokens = match encode_tokens(&state.tokenizer, &segment) {
+            Ok(tokens) => tokens,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+
+        let mut text_tokens = Vec::with_capacity(prompt_text_len + tts_tokens.len());
+        text_tokens.extend_from_slice(&prompt_tokens);
+        text_tokens.extend_from_slice(&tts_tokens);
+
+        let text_tensor = match Tensor::from_vec(
+            text_tokens,
+            (1, prompt_text_len + tts_tokens.len()),
+            &device,
+        ) {
+            Ok(t) => t,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Text tensor error: {e}")),
+        };
+        let text_embeds = match tts.llm.embed_text_tokens(&text_tensor) {
+            Ok(embeds) => embeds,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Text embed error: {e}")),
+        };
+
+        let segment_samples = match tts.synthesize_full_with_prompt_len(
+            &text_embeds,
+            prompt_text_len,
+            Some(&prompt_speech_tokens),
+            &prompt_speech_24k,
+            &speaker_embedding,
+            25,
+        ) {
+            Ok(samples) => samples,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Synthesis failed: {e}")),
+        };
+
+        all_samples.extend_from_slice(&segment_samples);
+    }
+
+    let duration = start.elapsed();
+    let audio_duration = all_samples.len() as f32 / sample_rate as f32;
+    if audio_duration > 0.0 {
+        let rtf = duration.as_secs_f32() / audio_duration;
+        histogram!("tts_synthesis_duration_seconds").record(duration.as_secs_f64());
+        histogram!("tts_rtf").record(rtf as f64);
+    }
+
+    let wav_data = encode_wav_i16(&all_samples, sample_rate);
+    let mut response = (StatusCode::OK, wav_data).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("audio/wav"),
+    );
+    if let Ok(duration_header) = header::HeaderValue::try_from(audio_duration.to_string()) {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-audio-duration"),
+            duration_header,
+        );
+    }
+    response
+}
+
+fn encode_tokens(tokenizer: &tokenizers::Tokenizer, text: &str) -> Result<Vec<u32>, String> {
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| format!("Tokenizer encode failed: {e}"))?;
+    Ok(encoding.get_ids().to_vec())
 }
 
 fn error_response(code: StatusCode, message: String) -> Response {
@@ -248,6 +311,29 @@ fn error_response(code: StatusCode, message: String) -> Response {
         }),
     )
         .into_response()
+}
+
+/// Encode audio samples (i16) to WAV format.
+fn encode_wav_i16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buffer);
+        let mut writer = hound::WavWriter::new(cursor, spec).expect("Failed to create WAV writer");
+
+        for &sample in samples {
+            writer.write_sample(sample).expect("Failed to write sample");
+        }
+        writer.finalize().expect("Failed to finalize WAV");
+    }
+
+    buffer
 }
 
 async fn health_handler() -> Json<HealthResponse> {
