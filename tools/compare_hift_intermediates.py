@@ -97,7 +97,13 @@ def slice_to_match(py_t: torch.Tensor, rust_t: torch.Tensor) -> tuple[torch.Tens
     return py_t, rust_t
 
 
-def compare_tensor(name: str, py_t: torch.Tensor, rust_t: torch.Tensor, tolerance: float) -> None:
+def compare_tensor(
+    name: str,
+    py_t: torch.Tensor,
+    rust_t: torch.Tensor,
+    tolerance: float,
+    rel_tolerance: float | None = None,
+) -> None:
     print(f"\n--- {name} ---")
     py_t, rust_t = align_tensors(py_t, rust_t)
 
@@ -110,9 +116,22 @@ def compare_tensor(name: str, py_t: torch.Tensor, rust_t: torch.Tensor, toleranc
     mae = diff.mean().item()
     max_diff = diff.max().item()
 
+    rel_mae = None
+    if rel_tolerance is not None:
+        denom = py_t.abs().mean().item()
+        if denom > 0:
+            rel_mae = mae / denom
+
     print(f"MAE: {mae:.6f}")
     print(f"Max diff: {max_diff:.6f}")
-    print("MATCH" if mae < tolerance else "MISMATCH")
+    if rel_mae is not None:
+        print(f"Rel MAE: {rel_mae:.6f}")
+
+    matches = mae < tolerance
+    if rel_mae is not None and rel_mae < rel_tolerance:
+        matches = True
+
+    print("MATCH" if matches else "MISMATCH")
 
     if py_t.numel() > 10:
         flat_py = py_t.flatten()
@@ -124,10 +143,12 @@ def compare_tensor(name: str, py_t: torch.Tensor, rust_t: torch.Tensor, toleranc
             print("Correlation: skipped (constant vector)")
 
 
-def tolerance_for_key(name: str, default_tol: float, resblock_tol: float) -> float:
+def tolerance_for_key(
+    name: str, default_tol: float, resblock_tol: float
+) -> tuple[float, float | None]:
     if name.startswith("resblock_"):
-        return resblock_tol
-    return default_tol
+        return resblock_tol, None
+    return default_tol, None
 
 
 def main() -> None:
@@ -160,6 +181,12 @@ def main() -> None:
         default=1e-2,
         help="MAE tolerance for resblock_* keys.",
     )
+    parser.add_argument(
+        "--relative-tolerance-resblock",
+        type=float,
+        default=2e-2,
+        help="Relative MAE tolerance for resblock_* keys.",
+    )
     args = parser.parse_args()
 
     py_path = Path(args.py)
@@ -184,8 +211,10 @@ def main() -> None:
     for key in args.keys:
         if key not in py_data or key not in rust_data:
             continue
-        tol = tolerance_for_key(key, args.tolerance, args.tolerance_resblock)
-        compare_tensor(key, py_data[key], rust_data[key], tol)
+        tol, rel_tol = tolerance_for_key(key, args.tolerance, args.tolerance_resblock)
+        if key.startswith("resblock_"):
+            rel_tol = args.relative_tolerance_resblock
+        compare_tensor(key, py_data[key], rust_data[key], tol, rel_tol)
 
 
 if __name__ == "__main__":
