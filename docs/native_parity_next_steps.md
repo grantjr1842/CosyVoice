@@ -59,3 +59,9 @@ Suggested commands:
 - `pixi run example`
 - `cargo run -p cosyvoice-native-server --bin native_example --release --features cuda`
 - `pixi run python compare_audio.py output/voice_clone_0_0.wav output/native_voice_clone_0_0.wav`
+
+Quick HiFT parity check:
+- `pixi run python tools/hift_parity_check.py`
+  - Uses `tests/test_hift_parity.py` and `test_native` to regenerate intermediates.
+  - Compares intermediates via `tools/compare_hift_intermediates.py` and runs `tests/analyze_audio.py` on outputs.
+  - Use `--skip-rust` or `--skip-python` to reuse existing artifacts.
