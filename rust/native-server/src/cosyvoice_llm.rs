@@ -83,31 +83,49 @@ impl CosyVoiceLLM {
         let llm = ModelForCausalLM::new(qwen_config, vb.pp("llm.model"))?;
         eprintln!("Qwen2 model loaded successfully");
 
-        // Load speech embedding using the config's speech token sizes.
+        // Load speech embedding using weights to infer vocab size.
         eprintln!("Loading speech_embedding from top-level...");
-        let speech_vocab_size = llm_config.speech_token_size + llm_config.speech_extra_tokens;
-        let speech_emb_weight = vb.pp("speech_embedding").get(
-            (speech_vocab_size, llm_config.llm_input_size),
-            "weight",
-        )?;
+        let speech_emb_weight = vb.pp("speech_embedding").get_unchecked("weight")?;
+        let (speech_vocab_size, speech_emb_dim) = speech_emb_weight.dims2()?;
+        if speech_emb_dim != llm_config.llm_input_size {
+            return Err(candle_core::Error::msg(format!(
+                "speech_embedding dim mismatch: expected {}, got {}",
+                llm_config.llm_input_size, speech_emb_dim
+            )));
+        }
+        if speech_vocab_size < llm_config.sampling_vocab_size {
+            return Err(candle_core::Error::msg(format!(
+                "speech_embedding vocab too small: {} < sampling_vocab_size {}",
+                speech_vocab_size, llm_config.sampling_vocab_size
+            )));
+        }
         eprintln!("speech_embedding loaded successfully");
         let speech_embedding = Embedding::new(speech_emb_weight, llm_config.llm_input_size);
 
         // Load decoder head (weight is transposed: [vocab_size, hidden_size])
         eprintln!("Loading llm_decoder from top-level...");
-        let decoder_weight = vb.pp("llm_decoder").get(
-            (speech_vocab_size, llm_config.llm_output_size),
-            "weight",
-        )?;
+        let decoder_weight = vb.pp("llm_decoder").get_unchecked("weight")?;
+        let (decoder_vocab_size, decoder_hidden) = decoder_weight.dims2()?;
+        if decoder_hidden != llm_config.llm_output_size {
+            return Err(candle_core::Error::msg(format!(
+                "llm_decoder dim mismatch: expected {}, got {}",
+                llm_config.llm_output_size, decoder_hidden
+            )));
+        }
+        if decoder_vocab_size != speech_vocab_size {
+            return Err(candle_core::Error::msg(format!(
+                "llm_decoder vocab mismatch: expected {}, got {}",
+                speech_vocab_size, decoder_vocab_size
+            )));
+        }
         let llm_decoder = Linear::new(decoder_weight, None);
         eprintln!("llm_decoder loaded successfully");
 
-        let use_speech_special_tokens = llm_config.speech_extra_tokens > 3;
+        let extra_tokens = speech_vocab_size - llm_config.sampling_vocab_size;
+        let use_speech_special_tokens = extra_tokens >= 3;
         let (llm_embedding, sos, task_id) = if use_speech_special_tokens {
             let sos = llm_config.sampling_vocab_size;
-            let task_id = llm_config
-                .sampling_vocab_size
-                .saturating_add(2);
+            let task_id = llm_config.sampling_vocab_size.saturating_add(2);
             if task_id >= speech_vocab_size {
                 return Err(candle_core::Error::msg(
                     "special token ids exceed speech vocab size; check llm config",
@@ -115,8 +133,25 @@ impl CosyVoiceLLM {
             }
             (None, sos, task_id)
         } else {
-            eprintln!("Creating llm_embedding (2 tokens)...");
-            let llm_embedding = create_random_embedding(2, llm_config.llm_input_size, &device)?;
+            let llm_embedding = if vb.pp("llm_embedding").contains_tensor("weight") {
+                let llm_emb_weight = vb.pp("llm_embedding").get_unchecked("weight")?;
+                let (llm_vocab_size, llm_emb_dim) = llm_emb_weight.dims2()?;
+                if llm_emb_dim != llm_config.llm_input_size {
+                    return Err(candle_core::Error::msg(format!(
+                        "llm_embedding dim mismatch: expected {}, got {}",
+                        llm_config.llm_input_size, llm_emb_dim
+                    )));
+                }
+                if llm_vocab_size < 2 {
+                    return Err(candle_core::Error::msg(
+                        "llm_embedding vocab too small for sos/task_id",
+                    ));
+                }
+                Embedding::new(llm_emb_weight, llm_config.llm_input_size)
+            } else {
+                eprintln!("Creating llm_embedding (2 tokens)...");
+                create_random_embedding(2, llm_config.llm_input_size, &device)?
+            };
             (Some(llm_embedding), 0, 1)
         };
 

@@ -59,6 +59,23 @@ fn rust_token_lengths(tokenizer: &Tokenizer, segments: &[String]) -> Result<Vec<
         .collect()
 }
 
+fn assert_parity(
+    text: &str,
+    tokenizer: &Tokenizer,
+    tokenizer_path: &str,
+    split: bool,
+) -> Result<()> {
+    let rust_segments = text_normalize_english(text, tokenizer, split, true)?;
+    let py_output = run_python(text, tokenizer_path, split)?;
+
+    assert_eq!(rust_segments, py_output.segments);
+
+    let rust_lengths = rust_token_lengths(tokenizer, &rust_segments)?;
+    assert_eq!(rust_lengths, py_output.token_lengths);
+
+    Ok(())
+}
+
 #[test]
 fn english_text_normalize_parity() -> Result<()> {
     if std::env::var("COSYVOICE_PY_PARITY").is_err() {
@@ -77,14 +94,10 @@ fn english_text_normalize_parity() -> Result<()> {
         .map_err(|e| anyhow!("Failed to load tokenizer: {e}"))?;
 
     let text = "Hello! I have 2 dogs. This is a longer sentence to exercise splitting. ".repeat(12);
+    assert_parity(&text, &tokenizer, &tokenizer_path, true)?;
 
-    let rust_segments = text_normalize_english(&text, &tokenizer, true, true)?;
-    let py_output = run_python(&text, &tokenizer_path, true)?;
-
-    assert_eq!(rust_segments, py_output.segments);
-
-    let rust_lengths = rust_token_lengths(&tokenizer, &rust_segments)?;
-    assert_eq!(rust_lengths, py_output.token_lengths);
+    let prompt_text = "Please speak in English.<|endofprompt|>Testing special tokens.";
+    assert_parity(prompt_text, &tokenizer, &tokenizer_path, false)?;
 
     Ok(())
 }

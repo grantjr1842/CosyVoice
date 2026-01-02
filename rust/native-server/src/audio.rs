@@ -475,7 +475,11 @@ pub fn mel_spectrogram(audio: &[f32], config: &MelConfig, device: &Device) -> Re
 
     // Convert to tensor: (num_mels, n_frames) -> (1, num_mels, n_frames)
     let (num_mels, n_frames) = (mel.nrows(), mel.ncols());
-    let data: Vec<f32> = mel.into_raw_vec();
+    let (data, offset) = mel.into_raw_vec_and_offset();
+    let data: Vec<f32> = match offset {
+        Some(0) | None => data,
+        Some(offset) => data.into_iter().skip(offset).collect(),
+    };
 
     let tensor = Tensor::from_vec(data, (1, num_mels, n_frames), device)?;
     Ok(tensor)
@@ -521,7 +525,7 @@ fn kaldi_mel_filterbank(
     if num_bins <= 3 {
         return Err(anyhow!("num_bins must be > 3"));
     }
-    if window_length_padded % 2 != 0 {
+    if !window_length_padded.is_multiple_of(2) {
         return Err(anyhow!("window_length_padded must be even"));
     }
 

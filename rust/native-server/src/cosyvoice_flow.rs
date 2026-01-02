@@ -300,11 +300,7 @@ impl CosyVoiceFlow {
         // Extract only the target portion (after prompt)
         // Clamp length to available dim (in case truncation happened during parity test)
         let actual_dim = feat.dim(2)?;
-        let available_len = if actual_dim >= prompt_mel_len {
-            actual_dim - prompt_mel_len
-        } else {
-            0
-        };
+        let available_len = actual_dim.saturating_sub(prompt_mel_len);
         let final_len = usize::min(target_mel_len, available_len);
         if final_len != target_mel_len {
             eprintln!("    [Flow.inference] Warning: Output truncated from {} to {}", target_mel_len, final_len);

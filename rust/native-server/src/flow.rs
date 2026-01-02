@@ -653,6 +653,7 @@ impl ConditionalCFM {
     /// * `spks` - Optional speaker embedding
     /// * `cond` - Optional conditioning tensor
     /// * `noise` - Optional pre-generated noise for parity testing (use `None` for random)
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         mu: &Tensor,

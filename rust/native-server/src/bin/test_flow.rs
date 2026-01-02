@@ -1,6 +1,6 @@
 // Minimal test to isolate AdaLayerNormZero and DiTBlock forward issues
 use candle_core::{Device, Result, Tensor, DType};
-use candle_nn::{layer_norm_no_bias, linear, LayerNorm, Linear, VarBuilder, Module};
+use candle_nn::{layer_norm_no_bias, linear, VarBuilder, Module};
 use std::collections::HashMap;
 
 fn main() -> Result<()> {

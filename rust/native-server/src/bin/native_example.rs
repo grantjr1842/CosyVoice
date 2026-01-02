@@ -19,7 +19,7 @@ fn encode_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     let encoding = tokenizer
         .encode(text, true)
         .map_err(|e| anyhow!("Tokenizer encode failed: {}", e))?;
-    Ok(encoding.get_ids().iter().map(|&id| id as u32).collect())
+    Ok(encoding.get_ids().to_vec())
 }
 
 fn save_wav(path: &Path, samples: &[i16], sample_rate: u32) -> Result<()> {

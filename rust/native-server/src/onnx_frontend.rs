@@ -3,10 +3,12 @@
 //! This module handles:
 //! - Speech tokenization (mel → speech tokens)
 //! - Speaker embedding extraction (audio → embedding)
-//! using the ONNX Runtime via the `ort` crate.
+//!
+//! Uses the ONNX Runtime via the `ort` crate.
 
 use candle_core::{Device, Tensor};
 // Import ExecutionProvider trait
+#[cfg(feature = "cuda")]
 use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
 use ort::inputs;
 use ort::session::{builder::GraphOptimizationLevel, Session};
