@@ -38,6 +38,7 @@ def main() -> None:
     if not args.skip_rust:
         env = os.environ.copy()
         env.setdefault("SAVE_HIFT_DEBUG", "1")
+        env.setdefault("TEST_HIFT_ONLY", "1")
         env.setdefault(
             "COSYVOICE_MODEL_DIR",
             str(repo_root / "pretrained_models" / "Fun-CosyVoice3-0.5B"),
