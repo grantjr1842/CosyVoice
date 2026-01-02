@@ -7,7 +7,7 @@ use std::path::Path;
 #[cfg(feature = "f0-libtorch")]
 use tch::{CModule, Device as TchDevice, Kind as TchKind, Tensor as TchTensor};
 
-struct HiftParitySeeds {
+pub(crate) struct HiftParitySeeds {
     rand_ini: Option<Vec<f32>>,
     sine_noise_cache: Option<Tensor>,
     source_noise_cache: Option<Tensor>,
@@ -300,7 +300,7 @@ pub struct SineGen {
     sine_noise_cache: Option<Tensor>,
 }
 
-struct SineGenDebug {
+pub(crate) struct SineGenDebug {
     rad_down: Option<Tensor>,
     phase_up: Option<Tensor>,
 }
@@ -596,7 +596,7 @@ impl SineGen {
         Ok((output.transpose(1, 2)?, uv.transpose(1, 2)?, noise))
     }
 
-    pub fn forward_with_debug(
+    pub(crate) fn forward_with_debug(
         &self,
         f0: &Tensor,
         _phase_inject: Option<&Tensor>,
@@ -868,7 +868,7 @@ pub struct SourceModuleHnNSF {
 }
 
 impl SourceModuleHnNSF {
-    pub fn new(
+    pub(crate) fn new(
         harmonic_num: usize,
         sine_amp: f64,
         noise_std: f64,
@@ -1710,7 +1710,7 @@ impl HiFTGenerator {
             let s_len = s.dim(2)?;
             let bsz = s.dim(0)?;
             let num_harmonics = self.m_source.sine_gen.harmonic_num + 1;
-            let mut cache = cache.to_device(mel.device())?;
+            let cache = cache.to_device(mel.device())?;
             if cache.rank() != 3 {
                 return Err(candle_core::Error::Msg(format!(
                     "sine_noise_cache must be 3D, got rank {}",
