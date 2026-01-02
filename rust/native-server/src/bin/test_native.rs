@@ -2,7 +2,6 @@
 
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use candle_core::{Device, Tensor, DType};
-use candle_nn::VarBuilder;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,20 +57,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Unpack artifacts and move to device
     let flow_feat_24k = artifacts.get("flow_feat_24k").expect("Missing flow_feat_24k").to_device(&device)?;
-    let text_ids = artifacts.get("text_ids").expect("Missing text_ids").to_dtype(DType::U32)?.to_device(&device)?;
+    let _text_ids = artifacts.get("text_ids").expect("Missing text_ids").to_dtype(DType::U32)?.to_device(&device)?;
 
     // New artifacts for bypassing frontend
     let speech_tokens = artifacts.get("speech_tokens").expect("Missing speech_tokens in artifacts. Did you upgrade generate_test_artifacts.py?").to_dtype(DType::U32)?.to_device(&device)?;
     let speaker_embedding = artifacts.get("speaker_embedding").expect("Missing speaker_embedding in artifacts.").to_device(&device)?;
 
     // Initialize Engine
-    let mut engine = NativeTtsEngine::new(&model_dir, Some(device.clone()))?;
+    let engine = NativeTtsEngine::new(&model_dir, Some(device.clone()))?;
     println!("\n✅ Engine loaded successfully!");
 
     // Run synthesis
     println!("\nSynthesizing (Direct/Bypassing Frontend)...");
-    let start_total = std::time::Instant::now();
-
+    let hift_only = std::env::var("TEST_HIFT_ONLY").unwrap_or_default() == "1";
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 24000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
     if std::env::var("TEST_FLOW_ONLY").unwrap_or_default() == "1" {
         println!("*** Running FLOW PARITY TEST (Dummy Inputs) ***");
         let token = Tensor::zeros((1, 50), DType::U32, &device)?;
@@ -85,70 +89,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Load additional artifacts
-    let flow_noise = artifacts.get("flow_noise").expect("Missing flow_noise").to_device(&device)?;
+    if !hift_only {
+        // Load additional artifacts
+        let flow_noise = artifacts
+            .get("flow_noise")
+            .expect("Missing flow_noise")
+            .to_device(&device)?;
 
-    // We skip LLM generation and use speech_tokens from artifacts to test Flow+HiFT
-    println!("\nSynthesizing (Flow + HiFT from Artifact Tokens)...");
-    let start_synth = std::time::Instant::now();
+        // We skip LLM generation and use speech_tokens from artifacts to test Flow+HiFT
+        println!("\nSynthesizing (Flow + HiFT from Artifact Tokens)...");
+        let start_synth = std::time::Instant::now();
 
-    // Convert speech_tokens tensor (1, 87) to Vec<u32> if needed?
-    // flow.inference takes &Tensor. synthesize_from_tokens takes &Tensor.
-    // So we can pass speech_tokens directly.
+        // Convert speech_tokens tensor (1, 87) to Vec<u32> if needed?
+        // flow.inference takes &Tensor. synthesize_from_tokens takes &Tensor.
+        // So we can pass speech_tokens directly.
 
-    // Create dummy prompt tokens/mel since we are using speech_tokens directly and Flow likely handles them?
-    // Note: Flow inference uses prompt_tokens and prompt_mel for conditioning.
-    // The artifacts typically correspond to a specific prompt.
-    // If we don't have matching prompt artifacts, we might get mismatch?
-    // But `speech_tokens` were generated conditioned on *some* prompt.
-    // Ideally we pass the SAME prompt.
-    // `flow_feat_24k` is target mel.
-    // Artifacts likely include `prompt_speech_24k`?
-    // tests/inspect_artifacts.py showed: flow_feat_24k, flow_noise, speech_tokens, speaker_embedding.
-    // No `prompt_tokens`?
-    // Let's assume zero prompt for now or random, but this might affect Flow output quality?
-    // Wait, if `speech_tokens` were generated with a prompt, Flow expects that prompt.
-    // If artifacts don't have it, we might be stuck.
-    // But let's try with empty prompt (which is valid for Zero-Shot if prompt is effectively handled or if SFT).
-    // Or create dummy zero prompt.
+        // Create dummy prompt tokens/mel since we are using speech_tokens directly and Flow likely handles them?
+        // Note: Flow inference uses prompt_tokens and prompt_mel for conditioning.
+        // The artifacts typically correspond to a specific prompt.
+        // If we don't have matching prompt artifacts, we might get mismatch?
+        // But `speech_tokens` were generated conditioned on *some* prompt.
+        // Ideally we pass the SAME prompt.
+        // `flow_feat_24k` is target mel.
+        // Artifacts likely include `prompt_speech_24k`?
+        // tests/inspect_artifacts.py showed: flow_feat_24k, flow_noise, speech_tokens, speaker_embedding.
+        // No `prompt_tokens`?
+        // Let's assume zero prompt for now or random, but this might affect Flow output quality?
+        // Wait, if `speech_tokens` were generated with a prompt, Flow expects that prompt.
+        // If artifacts don't have it, we might be stuck.
+        // But let's try with empty prompt (which is valid for Zero-Shot if prompt is effectively handled or if SFT).
+        // Or create dummy zero prompt.
 
-    let empty_prompt_token = Tensor::zeros((1, 0), DType::U32, &device)?;
-    let empty_prompt_mel = Tensor::zeros((1, 80, 0), DType::F32, &device)?;
+        let empty_prompt_token = Tensor::zeros((1, 0), DType::U32, &device)?;
+        let empty_prompt_mel = Tensor::zeros((1, 80, 0), DType::F32, &device)?;
 
-    let audio_samples = engine.synthesize_from_tokens(
-        &speech_tokens,
-        &empty_prompt_token,
-        &empty_prompt_mel,
-        &speaker_embedding,
-        Some(&flow_noise)
-    )?;
+        let mel = engine.flow.inference(
+            &speech_tokens,
+            &empty_prompt_token,
+            &empty_prompt_mel,
+            &speaker_embedding,
+            10, // n_timesteps
+            Some(&flow_noise),
+        )?;
 
-    let duration_synth = start_synth.elapsed();
-    println!("\n✅ Synthesis complete!");
-    println!("   Audio duration: {:.2}s", audio_samples.len() as f64 / 24000.0);
-    println!("   Time taken: {:?}", duration_synth);
+        let audio = engine.hift.forward(&mel)?;
+        let audio_samples: Vec<f32> = audio.flatten_all()?.to_vec1()?;
 
-    // Save to WAV
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: 24000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
+        let duration_synth = start_synth.elapsed();
+        println!("\n✅ Synthesis complete!");
+        println!(
+            "   Audio duration: {:.2}s",
+            audio_samples.len() as f64 / 24000.0
+        );
+        println!("   Time taken: {:?}", duration_synth);
 
-    let _ = std::fs::create_dir_all("outputs/audio");
-    let mut writer = hound::WavWriter::create("outputs/audio/native_output.wav", spec)?;
-    for sample in audio_samples {
-        writer.write_sample(sample)?;
+        // Save to WAV
+        let _ = std::fs::create_dir_all("outputs/audio");
+        let mut writer = hound::WavWriter::create("outputs/audio/native_output.wav", spec)?;
+        for sample in audio_samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+        println!("Saved audio to outputs/audio/native_output.wav");
+    } else {
+        println!("Skipping Flow + HiFT from tokens (TEST_HIFT_ONLY=1).");
     }
-    writer.finalize()?;
-    println!("Saved audio to outputs/audio/native_output.wav");
 
     // 3. Test Direct HiFT (using artifact Mel)
     println!("\nSynthesizing (Direct HiFT from Artifact Mel)...");
     // Ensure flow_feat_24k is [1, 80, T]
     // inspect_artifacts showed [1, 80, 171]. This is correct.
-    let audio_samples_hift = engine.synthesize_from_mel(&flow_feat_24k)?;
+    let save_hift_debug = std::env::var("SAVE_HIFT_DEBUG")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+
+    let (audio_hift, debug_map) = if save_hift_debug {
+        let (audio, debug) = engine.hift.forward_with_debug(&flow_feat_24k)?;
+        (audio, Some(debug))
+    } else {
+        (engine.hift.forward(&flow_feat_24k)?, None)
+    };
+
+    let audio_samples_hift: Vec<f32> = audio_hift.flatten_all()?.to_vec1()?;
 
     let mut wav_writer_hift = hound::WavWriter::create("outputs/audio/native_hift_output.wav", spec)?;
     for sample in audio_samples_hift {
@@ -156,6 +178,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     wav_writer_hift.finalize()?;
     println!("Saved direct output to outputs/audio/native_hift_output.wav");
+
+    if let Some(debug_map) = debug_map {
+        let mut cpu_map = std::collections::HashMap::new();
+        for (name, tensor) in debug_map {
+            cpu_map.insert(name, tensor.to_device(&cpu)?);
+        }
+        let _ = std::fs::create_dir_all("outputs/debug");
+        candle_core::safetensors::save(&cpu_map, "outputs/debug/rust_intermediates.safetensors")?;
+        println!("Saved HiFT debug tensors to outputs/debug/rust_intermediates.safetensors");
+    }
 
     Ok(())
 }
