@@ -1,9 +1,7 @@
 // use crate::utils::StftModule; // Commented out until used
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
-use std::f64::consts::PI;
-
-const TWO_PI: f64 = 2.0 * PI;
+use std::collections::HashMap;
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
 /// Actually, the paper usually uses: x + (1/alpha) * sin(alpha * x)^2 ?
@@ -47,11 +45,7 @@ pub struct SineGen {
     sine_amp: f64,
     noise_std: f64,
     sampling_rate: f64,
-    harmonic_range: Tensor, // [1, 1, harmonic_num + 1] -> broadcastable to [Batch, Len, Harmonics] ?
-    // Check shapes. Python: F_mat is [Batch, Harmonics, Length]
-    // My harmonic_range should be [1, Harmonics, 1] for broadcasting against f0 [Batch, 1, Length]?
     voiced_threshold: f32,
-    device: Device,
 }
 
 impl SineGen {
@@ -61,22 +55,14 @@ impl SineGen {
         noise_std: f64,
         sampling_rate: usize,
         voiced_threshold: f32,
-        vb: VarBuilder,
+        _vb: VarBuilder,
     ) -> Result<Self> {
-        let dev = vb.device();
-        // harmonic_range: [1.0, 2.0, ... H+1]
-        let range: Vec<f32> = (1..=harmonic_num + 1).map(|x| x as f32).collect();
-        // Shape: [1, Harmonics, 1] so we can mul with f0 [Batch, 1, Length] -> [Batch, Harmonics, Length]
-        let harmonic_range = Tensor::from_vec(range, (1, harmonic_num + 1, 1), dev)?;
-
         Ok(Self {
             harmonic_num,
             sine_amp,
             noise_std,
             sampling_rate: sampling_rate as f64,
-            harmonic_range,
             voiced_threshold,
-            device: dev.clone(),
         })
     }
 
@@ -134,7 +120,7 @@ impl SineGen {
                     let current_f0 = f0_vec[offset_f0 + t];
                     let phase_step = current_f0 * mult / sampling_rate;
                     running_phase += phase_step;
-                    running_phase = running_phase % 1.0;
+                    running_phase %= 1.0;
                     let val = (running_phase * two_pi).sin() * sine_amp;
                     sine_waves_vec.push(val);
                 }
@@ -144,7 +130,7 @@ impl SineGen {
         let sine_waves = Tensor::from_vec(
             sine_waves_vec,
             (b, num_harmonics, l),
-            &f0.device()
+            f0.device()
         )?;
 
         // 4. UV
@@ -169,8 +155,9 @@ impl SineGen {
     }
 }
 
-fn get_padding(kernel_size: usize, dilation: usize) -> usize {
-    (kernel_size - 1) * dilation / 2
+fn causal_padding(kernel_size: usize, dilation: usize) -> usize {
+    let numerator = kernel_size * dilation - dilation;
+    (numerator / 2) * 2 + (kernel_size + 1) % 2
 }
 
 fn load_conv1d(
@@ -221,10 +208,33 @@ fn load_conv1d(
     Ok(Conv1d::new(weight, bias, cfg))
 }
 
+struct PaddedConv1d {
+    conv: Conv1d,
+    pad_left: usize,
+    pad_right: usize,
+}
+
+impl PaddedConv1d {
+    fn new(conv: Conv1d, pad_left: usize, pad_right: usize) -> Self {
+        Self {
+            conv,
+            pad_left,
+            pad_right,
+        }
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if self.pad_left == 0 && self.pad_right == 0 {
+            return self.conv.forward(xs);
+        }
+        let padded = xs.pad_with_zeros(2, self.pad_left, self.pad_right)?;
+        self.conv.forward(&padded)
+    }
+}
+
 pub struct SourceModuleHnNSF {
     sine_gen: SineGen,
     l_linear: candle_nn::Linear,
-    l_tanh: bool, // Just a flag/marker effectively
 }
 
 impl SourceModuleHnNSF {
@@ -252,7 +262,6 @@ impl SourceModuleHnNSF {
         Ok(Self {
             sine_gen,
             l_linear,
-            l_tanh: true,
         })
     }
 
@@ -290,8 +299,8 @@ impl SourceModuleHnNSF {
 }
 
 pub struct ResBlock {
-    convs1: Vec<Conv1d>,
-    convs2: Vec<Conv1d>,
+    convs1: Vec<PaddedConv1d>,
+    convs2: Vec<PaddedConv1d>,
     acti1: Vec<Snake>,
     acti2: Vec<Snake>,
 }
@@ -314,15 +323,13 @@ impl ResBlock {
         let vb_a2 = vb.pp("activations2");
 
         for (i, &dil) in dilations.iter().enumerate() {
-            let pad1 = get_padding(kernel_size, dil);
-            // convs1[i]
-            let c1 = load_conv1d(vb_c1.pp(i), channels, channels, kernel_size, 1, dil, pad1)?;
-            convs1.push(c1);
+            let pad1 = causal_padding(kernel_size, dil);
+            let c1 = load_conv1d(vb_c1.pp(i), channels, channels, kernel_size, 1, dil, 0)?;
+            convs1.push(PaddedConv1d::new(c1, pad1, 0));
 
-            let pad2 = get_padding(kernel_size, 1);
-            // convs2[i]
-            let c2 = load_conv1d(vb_c2.pp(i), channels, channels, kernel_size, 1, 1, pad2)?;
-            convs2.push(c2);
+            let pad2 = causal_padding(kernel_size, 1);
+            let c2 = load_conv1d(vb_c2.pp(i), channels, channels, kernel_size, 1, 1, 0)?;
+            convs2.push(PaddedConv1d::new(c2, pad2, 0));
 
             // acti
             acti1.push(Snake::new(channels, vb_a1.pp(i))?);
@@ -350,55 +357,6 @@ impl Module for ResBlock {
         }
         Ok(x)
     }
-}
-
-fn load_conv_transpose1d(
-    vb: VarBuilder,
-    in_c: usize,
-    out_c: usize,
-    k: usize,
-    stride: usize,
-    padding: usize,
-) -> Result<candle_nn::ConvTranspose1d> {
-    let weight = if vb.contains_tensor("weight_g") {
-        let g = vb.get((out_c, 1, 1), "weight_g")?;
-        let v = vb.get((out_c, in_c, k), "weight_v")?;
-        let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-        let scale = (g / norm)?;
-        v.broadcast_mul(&scale)?
-    } else if vb.contains_tensor("weight.original0") {
-        let g = vb.get((out_c, 1, 1), "weight.original0")?;
-        let v = vb.get((out_c, in_c, k), "weight.original1")?;
-        let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-        let scale = (g / norm)?;
-        v.broadcast_mul(&scale)?
-    } else if vb.contains_tensor("parametrizations.weight.original0") {
-        let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
-        let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
-        let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-        let scale = (g / norm)?;
-        v.broadcast_mul(&scale)?
-    } else {
-        vb.get((out_c, in_c, k), "weight")?
-    };
-
-    let weight = weight.transpose(0, 1)?; // Candle expects [In, Out, Kernel] for ConvTranspose1d
-
-    let bias = if vb.contains_tensor("bias") {
-        Some(vb.get(out_c, "bias")?)
-    } else {
-        None
-    };
-
-    let cfg = candle_nn::ConvTranspose1dConfig {
-        padding,
-        output_padding: 0,
-        stride,
-        dilation: 1,
-        groups: 1,
-    };
-
-    Ok(candle_nn::ConvTranspose1d::new(weight, bias, cfg))
 }
 
 pub struct F0Predictor {
@@ -506,20 +464,19 @@ impl F0Predictor {
 }
 
 pub struct HiFTGenerator {
-    conv_pre: Conv1d,
+    conv_pre: PaddedConv1d,
     ups: Vec<Conv1d>,
     ups_rates: Vec<usize>,
-    source_downs: Vec<Conv1d>,
+    source_downs: Vec<PaddedConv1d>,
     source_resblocks: Vec<ResBlock>,
     resblocks: Vec<ResBlock>,
-    conv_post: Conv1d,
+    conv_post: PaddedConv1d,
     f0_predictor: F0Predictor,
     stft: crate::utils::InverseStftModule,
     analysis_stft: crate::utils::StftModule,
     f0_upsamp_scale: usize,
     num_kernels: usize,
     m_source: SourceModuleHnNSF,
-    device: Device,
 }
 
 impl HiFTGenerator {
@@ -530,27 +487,34 @@ impl HiFTGenerator {
 
         // Conv Pre
         // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
-        let conv_pre_k = if vb.pp("conv_pre").contains_tensor("weight.original1") {
-             5
-        } else if vb.pp("conv_pre").contains_tensor("parametrizations.weight.original1") {
-             5
+        let conv_pre_k = if vb.pp("conv_pre").contains_tensor("weight.original1")
+            || vb.pp("conv_pre")
+                .contains_tensor("parametrizations.weight.original1")
+        {
+            5
         } else {
-             13
+            13
         };
-        let conv_pre = load_conv1d(
+        let conv_pre_raw = load_conv1d(
             vb.pp("conv_pre"),
             config.in_channels,
             base_ch,
             conv_pre_k,
             1,
             1,
-            conv_pre_k / 2,
+            0,
         )?;
+        let conv_pre = if conv_pre_k == 5 {
+            PaddedConv1d::new(conv_pre_raw, 0, conv_pre_k - 1)
+        } else {
+            let pad = conv_pre_k / 2;
+            PaddedConv1d::new(conv_pre_raw, pad, pad)
+        };
 
         // Ups
         let mut ups = Vec::new();
         let vb_ups = vb.pp("ups");
-        for (i, (&u, &k)) in ups_rates.iter().zip(ups_kernels).enumerate() {
+        for (i, (&_u, &k)) in ups_rates.iter().zip(ups_kernels).enumerate() {
             let in_c = base_ch / (1 << i);
             let out_c = base_ch / (1 << (i + 1));
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
@@ -604,9 +568,11 @@ impl HiFTGenerator {
 
             // source_down
             let sd = if u == 1 {
-                load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, 0)?
+                let conv = load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, 0)?;
+                PaddedConv1d::new(conv, 0, 0)
             } else {
-                load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, u / 2)?
+                let conv = load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, 0)?;
+                PaddedConv1d::new(conv, u.saturating_sub(1), 0)
             };
             source_downs.push(sd);
 
@@ -638,15 +604,16 @@ impl HiFTGenerator {
 
         // Post
         let last_ch = base_ch / (1 << num_ups);
-        let conv_post = load_conv1d(
+        let conv_post_raw = load_conv1d(
             vb.pp("conv_post"),
             last_ch,
             config.istft_params_n_fft + 2,
             7,
             1,
             1,
-            3,
+            0,
         )?;
+        let conv_post = PaddedConv1d::new(conv_post_raw, causal_padding(7, 1), 0);
 
         let stft = crate::utils::InverseStftModule::new(
             config.istft_params_n_fft,
@@ -685,7 +652,6 @@ impl HiFTGenerator {
             m_source,
             f0_predictor,
             f0_upsamp_scale: ups_rates.iter().product::<usize>() * config.istft_params_hop_len,
-            device: vb.device().clone(),
         })
     }
 
@@ -773,7 +739,68 @@ impl HiFTGenerator {
         Ok(audio)
     }
 
+    pub fn forward_with_debug(&self, mel: &Tensor) -> Result<(Tensor, HashMap<String, Tensor>)> {
+        let mut debug = HashMap::new();
+        debug.insert("input_mel".to_string(), mel.clone());
+
+        let f0 = self.f0_predictor.forward(mel)?;
+        let mel_len = mel.dim(2)?;
+        let f0 = f0.narrow(2, 0, mel_len)?;
+        if let Ok(f0_no_channel) = f0.squeeze(1) {
+            debug.insert("f0_output".to_string(), f0_no_channel);
+        } else {
+            debug.insert("f0_output".to_string(), f0.clone());
+        }
+
+        let (b, c, l) = f0.dims3()?;
+        let s = f0
+            .unsqueeze(3)?
+            .repeat((1, 1, 1, self.f0_upsamp_scale))?
+            .reshape((b, c, l * self.f0_upsamp_scale))?;
+        debug.insert("source_s".to_string(), s.transpose(1, 2)?);
+
+        let (sine_merge, noise, uv) = self.m_source.forward(&s, None, None, None)?;
+        debug.insert("sine_merge".to_string(), sine_merge.transpose(1, 2)?);
+        debug.insert("noise".to_string(), noise.clone());
+        debug.insert("uv".to_string(), uv.clone());
+
+        let audio = self.decode_internal(mel, &sine_merge, Some(&mut debug))?;
+        let final_audio = if audio.rank() == 3 && audio.dim(1)? == 1 {
+            audio.squeeze(1)?
+        } else {
+            audio.clone()
+        };
+        debug.insert("final_audio".to_string(), final_audio);
+
+        Ok((audio, debug))
+    }
+
+    fn maybe_clamp_audio(&self, audio: Tensor) -> Result<Tensor> {
+        let disable = std::env::var("HIFT_DISABLE_CLAMP")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        if disable {
+            return Ok(audio);
+        }
+
+        let audio_limit = 0.99f32;
+        let min_val = Tensor::new(&[-audio_limit], audio.device())?;
+        let max_val = Tensor::new(&[audio_limit], audio.device())?;
+        let audio = audio.maximum(&min_val.broadcast_as(audio.shape())?)?;
+        let audio = audio.minimum(&max_val.broadcast_as(audio.shape())?)?;
+        Ok(audio)
+    }
+
     fn decode(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
+        self.decode_internal(x, s, None)
+    }
+
+    fn decode_internal(
+        &self,
+        x: &Tensor,
+        s: &Tensor,
+        mut debug: Option<&mut HashMap<String, Tensor>>,
+    ) -> Result<Tensor> {
         // s STFT logic for fusion
         // s: [Batch, 1, Time]
         // We need STFT of s.
@@ -781,10 +808,17 @@ impl HiFTGenerator {
         // I need to add `analysis_stft` to struct.
         // For now, let's assume I added it.
         let (s_real, s_imag) = self.analysis_stft.transform(s)?; // [Batch, Freq, Frames]
+        if let Some(debug_map) = debug.as_mut() {
+            debug_map.insert("s_stft_real".to_string(), s_real.clone());
+            debug_map.insert("s_stft_imag".to_string(), s_imag.clone());
+        }
         let s_stft = Tensor::cat(&[&s_real, &s_imag], 1)?; // [Batch, 2*Freq, Frames]
 
         // x (mel): [Batch, 80, Length]
         let mut x = self.conv_pre.forward(x)?;
+        if let Some(debug_map) = debug.as_mut() {
+            debug_map.insert("conv_pre_out".to_string(), x.clone());
+        }
 
         let num_ups = self.ups.len();
 
@@ -884,16 +918,7 @@ impl HiFTGenerator {
         }
 
         let audio = self.stft.forward(&magnitude, &phase)?;
-
-        // Clamp audio to [-audio_limit, audio_limit] like Python does
-        // Python: x = torch.clamp(x, -self.audio_limit, self.audio_limit) where audio_limit = 0.99
-        let audio_limit = 0.99f32;
-        let min_val = Tensor::new(&[-audio_limit], audio.device())?;
-        let max_val = Tensor::new(&[audio_limit], audio.device())?;
-        let audio = audio.maximum(&min_val.broadcast_as(audio.shape())?)?;
-        let audio = audio.minimum(&max_val.broadcast_as(audio.shape())?)?;
-
-        Ok(audio)
+        self.maybe_clamp_audio(audio)
     }
 }
 
