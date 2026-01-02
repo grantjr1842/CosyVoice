@@ -22,7 +22,6 @@ DEFAULT_KEYS = [
     "source_s",
     "sine_waves",
     "sine_rad_down",
-    "sine_phase_up",
     "sine_merge",
     "noise",
     "uv",

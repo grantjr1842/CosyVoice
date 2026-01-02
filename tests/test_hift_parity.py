@@ -59,16 +59,29 @@ def compute_sinegen2_debug(l_sin_gen, f0: torch.Tensor) -> tuple[torch.Tensor, t
         mode="linear",
         align_corners=False,
     ).transpose(1, 2)
-    phase = torch.cumsum(rad_down, dim=1) * 2 * torch.pi
-
-    phase_input = phase.transpose(1, 2) * upsample_scale
     if causal:
-        phase_up = F.interpolate(
-            phase_input,
-            scale_factor=upsample_scale,
-            mode="nearest",
-        ).transpose(1, 2)
+        bsz, down_len, harmonics = rad_down.shape
+        phase_up = torch.zeros(
+            (bsz, down_len * upsample_scale, harmonics),
+            device=rad_down.device,
+            dtype=rad_down.dtype,
+        )
+        scale = torch.tensor(
+            2 * torch.pi * upsample_scale,
+            device=rad_down.device,
+            dtype=rad_down.dtype,
+        )
+        for b in range(bsz):
+            for h in range(harmonics):
+                acc = torch.tensor(0.0, device=rad_down.device, dtype=rad_down.dtype)
+                for t in range(down_len):
+                    acc = acc + rad_down[b, t, h]
+                    phase_val = acc * scale
+                    start = t * upsample_scale
+                    phase_up[b, start : start + upsample_scale, h] = phase_val
     else:
+        phase = torch.cumsum(rad_down, dim=1) * 2 * torch.pi
+        phase_input = phase.transpose(1, 2) * upsample_scale
         phase_up = F.interpolate(
             phase_input,
             scale_factor=upsample_scale,
