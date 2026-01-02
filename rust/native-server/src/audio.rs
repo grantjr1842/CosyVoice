@@ -3,12 +3,17 @@
 //! Provides mel spectrogram computation and audio I/O without Python dependencies.
 
 use anyhow::{anyhow, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{npy::NpzTensors, Device, Tensor};
 use hound::WavReader;
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use realfft::RealFftPlanner;
+use rubato::{
+    calculate_cutoff, Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
 use std::f64::consts::PI;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Configuration for mel spectrogram computation.
 #[derive(Debug, Clone)]
@@ -166,6 +171,196 @@ pub fn load_wav(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
     Ok((samples, sample_rate))
 }
 
+const WHISPER_N_FFT: usize = 400;
+const WHISPER_HOP_LENGTH: usize = 160;
+const WHISPER_N_MELS: usize = 128;
+
+static WHISPER_MEL_FILTERS_128: OnceLock<(Vec<f32>, usize, usize)> = OnceLock::new();
+
+/// Resample audio using a windowed-sinc interpolator (rubato).
+pub fn resample_audio(samples: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
+    if src_rate == dst_rate {
+        return Ok(samples.to_vec());
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(anyhow!("Invalid sample rate: {} -> {}", src_rate, dst_rate));
+    }
+
+    let ratio = dst_rate as f64 / src_rate as f64;
+    let sinc_len = 128;
+    let window = WindowFunction::Blackman2;
+    let params = SincInterpolationParameters {
+        sinc_len,
+        f_cutoff: calculate_cutoff(sinc_len, window),
+        interpolation: SincInterpolationType::Quadratic,
+        oversampling_factor: 256,
+        window,
+    };
+
+    let chunk_size = 1024;
+    let mut resampler = SincFixedIn::<f32>::new(ratio, 1.1, params, chunk_size, 1)
+        .map_err(|e| anyhow!("Resampler init failed: {e}"))?;
+
+    let mut out = Vec::new();
+    let mut input_slices = vec![samples];
+    let mut outbuffer = vec![vec![0.0f32; resampler.output_frames_max()]];
+
+    while input_slices[0].len() >= resampler.input_frames_next() {
+        let (nbr_in, nbr_out) = resampler
+            .process_into_buffer(&input_slices, &mut outbuffer, None)
+            .map_err(|e| anyhow!("Resampler process failed: {e}"))?;
+        input_slices[0] = &input_slices[0][nbr_in..];
+        out.extend_from_slice(&outbuffer[0][..nbr_out]);
+    }
+
+    if !input_slices[0].is_empty() {
+        let (_nbr_in, nbr_out) = resampler
+            .process_partial_into_buffer(Some(&input_slices), &mut outbuffer, None)
+            .map_err(|e| anyhow!("Resampler final chunk failed: {e}"))?;
+        out.extend_from_slice(&outbuffer[0][..nbr_out]);
+    }
+
+    let none_input: Option<&[&[f32]]> = None;
+    let (_nbr_in, nbr_out) = resampler
+        .process_partial_into_buffer(none_input, &mut outbuffer, None)
+        .map_err(|e| anyhow!("Resampler flush failed: {e}"))?;
+    out.extend_from_slice(&outbuffer[0][..nbr_out]);
+
+    Ok(out)
+}
+
+fn reflect_pad(samples: &[f32], pad: usize) -> Result<Vec<f32>> {
+    if pad == 0 {
+        return Ok(samples.to_vec());
+    }
+    if samples.len() <= pad {
+        return Err(anyhow!(
+            "Cannot reflect-pad {} samples with pad {}",
+            samples.len(),
+            pad
+        ));
+    }
+    let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
+    for i in 0..pad {
+        let idx = pad - i;
+        padded.push(samples[idx]);
+    }
+    padded.extend_from_slice(samples);
+    for i in 0..pad {
+        let idx = samples.len() - 2 - i;
+        padded.push(samples[idx]);
+    }
+    Ok(padded)
+}
+
+fn load_whisper_mel_filters_128() -> Result<&'static (Vec<f32>, usize, usize)> {
+    if let Some(filters) = WHISPER_MEL_FILTERS_128.get() {
+        return Ok(filters);
+    }
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("mel_filters.npz");
+    let npz = NpzTensors::new(&path)?;
+    let tensor = npz
+        .get("mel_128")?
+        .ok_or_else(|| anyhow!("mel_128 not found in {:?}", path))?;
+    let (n_mels, n_freq) = tensor.dims2()?;
+    let data = tensor.flatten_all()?.to_vec1::<f32>()?;
+    let _ = WHISPER_MEL_FILTERS_128.set((data, n_mels, n_freq));
+    WHISPER_MEL_FILTERS_128
+        .get()
+        .ok_or_else(|| anyhow!("Failed to cache mel_128 filters"))
+}
+
+/// Compute Whisper-style log-mel spectrogram (n_mels=128, 16kHz).
+///
+/// Returns tensor of shape (1, 128, frames).
+pub fn whisper_log_mel_spectrogram(samples: &[f32], device: &Device) -> Result<Tensor> {
+    if samples.len() < WHISPER_N_FFT {
+        return Err(anyhow!("Audio too short for Whisper STFT"));
+    }
+
+    let padded = reflect_pad(samples, WHISPER_N_FFT / 2)?;
+    let total_frames = (padded.len() - WHISPER_N_FFT) / WHISPER_HOP_LENGTH + 1;
+    if total_frames == 0 {
+        return Err(anyhow!("No frames available for Whisper STFT"));
+    }
+    let out_frames = total_frames.saturating_sub(1);
+    if out_frames == 0 {
+        return Err(anyhow!("Whisper STFT produced no usable frames"));
+    }
+
+    let window = create_hann_window(WHISPER_N_FFT);
+    let n_freq = WHISPER_N_FFT / 2 + 1;
+
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(WHISPER_N_FFT);
+    let mut scratch = vec![Default::default(); fft.get_scratch_len()];
+    let mut magnitudes = vec![0.0f32; out_frames * n_freq];
+
+    for frame_idx in 0..total_frames {
+        let start = frame_idx * WHISPER_HOP_LENGTH;
+        let mut frame: Vec<f32> = (0..WHISPER_N_FFT)
+            .map(|i| padded[start + i] * window[i])
+            .collect();
+
+        let mut spectrum = vec![Default::default(); n_freq];
+        fft.process_with_scratch(&mut frame, &mut spectrum, &mut scratch)
+            .map_err(|e| anyhow!("FFT error: {:?}", e))?;
+
+        if frame_idx == total_frames - 1 {
+            break;
+        }
+
+        let out_idx = frame_idx;
+        for (bin_idx, c) in spectrum.iter().enumerate() {
+            let mag = c.re * c.re + c.im * c.im;
+            magnitudes[out_idx * n_freq + bin_idx] = mag;
+        }
+    }
+
+    let (mel_filters, n_mels, filter_bins) = {
+        let filters = load_whisper_mel_filters_128()?;
+        (filters.0.as_slice(), filters.1, filters.2)
+    };
+    if n_mels != WHISPER_N_MELS || filter_bins != n_freq {
+        return Err(anyhow!(
+            "Whisper mel filter shape mismatch: expected {}x{}, got {}x{}",
+            WHISPER_N_MELS,
+            n_freq,
+            n_mels,
+            filter_bins
+        ));
+    }
+
+    let mut log_spec = vec![0.0f32; n_mels * out_frames];
+    let mut max_log = f32::NEG_INFINITY;
+    for frame in 0..out_frames {
+        for mel in 0..n_mels {
+            let mut sum = 0.0f32;
+            let filter_row = &mel_filters[mel * n_freq..(mel + 1) * n_freq];
+            let mags = &magnitudes[frame * n_freq..(frame + 1) * n_freq];
+            for (f, m) in filter_row.iter().zip(mags.iter()) {
+                sum += f * m;
+            }
+            let log_val = sum.max(1e-10).log10();
+            log_spec[mel * out_frames + frame] = log_val;
+            if log_val > max_log {
+                max_log = log_val;
+            }
+        }
+    }
+
+    let floor = max_log - 8.0;
+    for v in log_spec.iter_mut() {
+        let clipped = (*v).max(floor);
+        *v = (clipped + 4.0) / 4.0;
+    }
+
+    Tensor::from_vec(log_spec, (1, n_mels, out_frames), device).map_err(Into::into)
+}
+
 /// Compute Short-Time Fourier Transform (STFT).
 ///
 /// Returns magnitude spectrogram as (n_frames, n_fft/2 + 1) array.
@@ -306,6 +501,164 @@ pub fn mel_spectrogram_from_file(
     }
 
     mel_spectrogram(&samples, config, device)
+}
+
+// =============================================================================
+// Kaldi-style Fbank (for Campplus speaker embedding)
+// =============================================================================
+
+fn kaldi_mel_scale(freq: f64) -> f64 {
+    1127.0 * (1.0 + freq / 700.0).ln()
+}
+
+fn kaldi_mel_filterbank(
+    num_bins: usize,
+    window_length_padded: usize,
+    sample_freq: f64,
+    low_freq: f64,
+    high_freq: f64,
+) -> Result<Vec<f32>> {
+    if num_bins <= 3 {
+        return Err(anyhow!("num_bins must be > 3"));
+    }
+    if window_length_padded % 2 != 0 {
+        return Err(anyhow!("window_length_padded must be even"));
+    }
+
+    let nyquist = 0.5 * sample_freq;
+    let mut high_freq = high_freq;
+    if high_freq <= 0.0 {
+        high_freq += nyquist;
+    }
+    if !(0.0 <= low_freq && low_freq < nyquist && 0.0 < high_freq && high_freq <= nyquist) {
+        return Err(anyhow!(
+            "Bad mel freq bounds: low={} high={} nyquist={}",
+            low_freq,
+            high_freq,
+            nyquist
+        ));
+    }
+
+    let fft_bin_width = sample_freq / window_length_padded as f64;
+    let mel_low = kaldi_mel_scale(low_freq);
+    let mel_high = kaldi_mel_scale(high_freq);
+    let mel_delta = (mel_high - mel_low) / (num_bins + 1) as f64;
+
+    let num_fft_bins = window_length_padded / 2;
+    let mut bins = vec![0.0f32; num_bins * (num_fft_bins + 1)];
+
+    for mel_bin in 0..num_bins {
+        let left_mel = mel_low + mel_bin as f64 * mel_delta;
+        let center_mel = mel_low + (mel_bin + 1) as f64 * mel_delta;
+        let right_mel = mel_low + (mel_bin + 2) as f64 * mel_delta;
+
+        for fft_bin in 0..num_fft_bins {
+            let freq = fft_bin_width * fft_bin as f64;
+            let mel = kaldi_mel_scale(freq);
+            let up = (mel - left_mel) / (center_mel - left_mel);
+            let down = (right_mel - mel) / (right_mel - center_mel);
+            let val = up.min(down).max(0.0);
+            bins[mel_bin * (num_fft_bins + 1) + fft_bin] = val as f32;
+        }
+    }
+
+    Ok(bins)
+}
+
+fn create_povey_window(size: usize) -> Vec<f32> {
+    if size <= 1 {
+        return vec![1.0];
+    }
+    (0..size)
+        .map(|i| {
+            let angle = 2.0 * PI * i as f64 / (size as f64 - 1.0);
+            let hann = 0.5 - 0.5 * angle.cos();
+            hann.powf(0.85) as f32
+        })
+        .collect()
+}
+
+/// Compute Kaldi-compatible log-fbank features (num_mel_bins=80, 16kHz).
+///
+/// Returns tensor of shape (1, frames, 80).
+pub fn kaldi_fbank(samples: &[f32], sample_rate: u32, device: &Device) -> Result<Tensor> {
+    let window_size = (sample_rate as f64 * 0.025) as usize;
+    let window_shift = (sample_rate as f64 * 0.01) as usize;
+    let padded_window_size = window_size.next_power_of_two();
+
+    if samples.len() < window_size {
+        return Err(anyhow!("Audio too short for Kaldi fbank"));
+    }
+
+    let num_frames = 1 + (samples.len() - window_size) / window_shift;
+    let num_mel_bins = 80;
+    let num_freq_bins = padded_window_size / 2 + 1;
+
+    let mel_filters = kaldi_mel_filterbank(
+        num_mel_bins,
+        padded_window_size,
+        sample_rate as f64,
+        20.0,
+        0.0,
+    )?;
+
+    let window = create_povey_window(window_size);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(padded_window_size);
+    let mut scratch = vec![Default::default(); fft.get_scratch_len()];
+
+    let mut feats = vec![0.0f32; num_frames * num_mel_bins];
+    let mut spectrum = vec![Default::default(); num_freq_bins];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * window_shift;
+        let mut frame = vec![0.0f32; padded_window_size];
+        let slice = &samples[start..start + window_size];
+
+        let mean = slice.iter().copied().sum::<f32>() / window_size as f32;
+        for i in 0..window_size {
+            let mut v = slice[i] - mean;
+            if i > 0 {
+                v -= 0.97 * (slice[i - 1] - mean);
+            } else {
+                v *= 1.0 - 0.97;
+            }
+            frame[i] = v * window[i];
+        }
+
+        fft.process_with_scratch(&mut frame, &mut spectrum, &mut scratch)
+            .map_err(|e| anyhow!("FFT error: {:?}", e))?;
+
+        let mut power = vec![0.0f32; num_freq_bins];
+        for (i, c) in spectrum.iter().enumerate() {
+            power[i] = c.re * c.re + c.im * c.im;
+        }
+
+        for mel in 0..num_mel_bins {
+            let filter_row = &mel_filters[mel * num_freq_bins..(mel + 1) * num_freq_bins];
+            let mut sum = 0.0f32;
+            for (f, p) in filter_row.iter().zip(power.iter()) {
+                sum += f * p;
+            }
+            let log_val = sum.max(f32::EPSILON).ln();
+            feats[frame_idx * num_mel_bins + mel] = log_val;
+        }
+    }
+
+    // Mean-normalize across frames (per mel bin)
+    for mel in 0..num_mel_bins {
+        let mut mean = 0.0f32;
+        for frame in 0..num_frames {
+            mean += feats[frame * num_mel_bins + mel];
+        }
+        mean /= num_frames as f32;
+        for frame in 0..num_frames {
+            let idx = frame * num_mel_bins + mel;
+            feats[idx] -= mean;
+        }
+    }
+
+    Tensor::from_vec(feats, (1, num_frames, num_mel_bins), device).map_err(Into::into)
 }
 
 // =============================================================================

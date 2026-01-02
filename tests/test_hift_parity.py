@@ -58,6 +58,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    with open("test_hift_debug.log", "w") as log:
+        log.write(f"Device: {device}\n")
+
     # Load HiFT
     print("\nLoading HiFT model...")
     hift = configs["hift"]
@@ -70,9 +73,15 @@ def main():
     hift.load_state_dict(hift_state_dict, strict=True)
     hift.to(device).eval()
     print("HiFT loaded!")
+    with open("test_hift_debug.log", "a") as log:
+        log.write(f"HiFT device check: {next(hift.parameters()).device}\n")
 
     # Move mel to device
     mel = flow_feat_24k.to(device)
+    log_path = Path("outputs/logs/test_hift_debug.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as log:
+        log.write(f"Mel device: {mel.device}\n")
 
     # Run Python HiFT inference
     print("\n=== Running Python HiFT ===")
@@ -85,16 +94,16 @@ def main():
     )
 
     # Save for comparison
-    output_dir = Path("tests/hift_parity")
+    output_dir = Path("outputs/audio/hift_parity")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     torchaudio.save(str(output_dir / "python_hift_output.wav"), audio.cpu(), 24000)
     print(f"\nSaved Python HiFT output to: {output_dir / 'python_hift_output.wav'}")
 
     # Load Rust native output if it exists
-    rust_output_path = "native_output.wav"
+    rust_output_path = "outputs/audio/native_hift_output.wav"
     if os.path.exists(rust_output_path):
-        print("\n=== Loading Rust native output ===")
+        print(f"\n=== Loading Rust native output: {rust_output_path} ===")
         rust_audio, rust_sr = torchaudio.load(rust_output_path)
         print(f"Rust audio shape: {rust_audio.shape}")
         print(
@@ -134,6 +143,13 @@ def main():
     print("\n=== Capturing Intermediate Values ===")
     with torch.inference_mode():
         # F0 prediction
+        with open("outputs/logs/test_hift_debug.log", "a") as log:
+            log.write(f"Before f0_predictor calling with mel device: {mel.device}\n")
+            # log.write(f"f0_predictor device check: {next(hift.f0_predictor.parameters()).device}\n") # Verify this
+
+        # Explicitly ensure f0_predictor is on device
+        hift.f0_predictor.to(device)
+
         f0 = hift.f0_predictor(mel)
         print(f"F0 predictor output: {tensor_stats(f0, 'f0')}")
 
@@ -173,9 +189,11 @@ def main():
         "conv_pre_out": x.cpu().contiguous(),
         "final_audio": audio.cpu().contiguous(),
     }
-    save_file(intermediates, str(output_dir / "python_intermediates.safetensors"))
+    debug_dir = Path("outputs/debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    save_file(intermediates, str(debug_dir / "python_intermediates.safetensors"))
     print(
-        f"\nSaved intermediate tensors to: {output_dir / 'python_intermediates.safetensors'}"
+        f"\nSaved intermediate tensors to: {debug_dir / 'python_intermediates.safetensors'}"
     )
 
     # Summary

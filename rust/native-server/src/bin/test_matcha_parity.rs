@@ -143,9 +143,9 @@ fn test_mel_spectrogram(device: &Device) -> Result<()> {
     let audio_vec: Vec<f32> = test_audio.flatten_all()?.to_vec1()?;
 
     // Compute mel spectrogram using native audio.rs
-    let config = cosyvoice_rust_backend::audio::MelConfig::inference();
+    let config = cosyvoice_native_server::audio::MelConfig::inference();
 
-    let rust_mel = cosyvoice_rust_backend::audio::mel_spectrogram(&audio_vec, &config, device)?;
+    let rust_mel = cosyvoice_native_server::audio::mel_spectrogram(&audio_vec, &config, device)?;
 
     println!("Rust mel shape: {:?}", rust_mel.shape());
 

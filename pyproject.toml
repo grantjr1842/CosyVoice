@@ -48,7 +48,7 @@ python = "3.12.*"
 numpy = "<2.0"
 pip = "*"
 pytorch = ">=2.3.0"
-pytorch-cuda = ">=12.1"
+pytorch-cuda = "12.4"
 torchaudio = ">=2.3.0"
 sox = "*"
 libsndfile = "*"
@@ -56,8 +56,12 @@ ffmpeg = ">=6.0"
 openh264 = "*"
 gxx_linux-64 = "12.*"
 gcc_linux-64 = "12.*"
-cuda-nvcc = "12.1.*"
-cuda-driver-dev = "12.1.*"
+cuda-nvcc = "12.4.*"
+cuda-driver-dev = "12.4.*"
+cuda-toolkit = "12.4.*"
+cuda-cccl = "12.4.*"
+openssl = "*"
+pkg-config = "*"
 
 [tool.pixi.pypi-dependencies]
 # Core ML dependencies
@@ -130,7 +134,7 @@ tensorrt-cu12-libs = "==10.13.3.9"
 
 [tool.pixi.pypi-options]
 extra-index-urls = [
-    "https://download.pytorch.org/whl/cu121",
+    "https://download.pytorch.org/whl/cu124",
     "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
 ]
 

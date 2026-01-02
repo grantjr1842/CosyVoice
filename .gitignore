@@ -41,12 +41,6 @@ tensorboard
 .cache
 compile_commands.json
 
-# audio files
-*.wav
-*.m4a
-*.aac
-*.mp3
-
 # output directory (keep structure, ignore generated files)
 output/*
 !output/.gitkeep

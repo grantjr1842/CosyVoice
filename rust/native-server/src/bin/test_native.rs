@@ -1,6 +1,6 @@
 //! Test binary for verifying native TTS component weight loading.
 
-use cosyvoice_rust_backend::native_tts::NativeTtsEngine;
+use cosyvoice_native_server::tts::NativeTtsEngine;
 use candle_core::{Device, Tensor, DType};
 use candle_nn::VarBuilder;
 use std::path::Path;
@@ -136,12 +136,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_format: hound::SampleFormat::Int,
     };
 
-    let mut writer = hound::WavWriter::create("native_output.wav", spec)?;
+    let _ = std::fs::create_dir_all("outputs/audio");
+    let mut writer = hound::WavWriter::create("outputs/audio/native_output.wav", spec)?;
     for sample in audio_samples {
         writer.write_sample(sample)?;
     }
     writer.finalize()?;
-    println!("Saved audio to native_output.wav");
+    println!("Saved audio to outputs/audio/native_output.wav");
 
     // 3. Test Direct HiFT (using artifact Mel)
     println!("\nSynthesizing (Direct HiFT from Artifact Mel)...");
@@ -149,12 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // inspect_artifacts showed [1, 80, 171]. This is correct.
     let audio_samples_hift = engine.synthesize_from_mel(&flow_feat_24k)?;
 
-    let mut wav_writer_hift = hound::WavWriter::create("native_hift_output.wav", spec)?;
+    let mut wav_writer_hift = hound::WavWriter::create("outputs/audio/native_hift_output.wav", spec)?;
     for sample in audio_samples_hift {
         wav_writer_hift.write_sample(sample)?;
     }
     wav_writer_hift.finalize()?;
-    println!("Saved direct output to native_hift_output.wav");
+    println!("Saved direct output to outputs/audio/native_hift_output.wav");
 
     Ok(())
 }

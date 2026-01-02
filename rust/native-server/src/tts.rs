@@ -46,6 +46,9 @@ pub struct NativeTtsEngine {
     pub sample_rate: u32,
 }
 
+const MIN_TOKEN_TEXT_RATIO: f32 = 2.0;
+const MAX_TOKEN_TEXT_RATIO: f32 = 20.0;
+
 impl NativeTtsEngine {
     /// Create a new native TTS engine from safetensors weights
     pub fn new(model_dir: &str, device: Option<Device>) -> Result<Self, NativeTtsError> {
@@ -61,8 +64,27 @@ impl NativeTtsEngine {
         // Load Qwen2 config
         let qwen_config: QwenConfig = serde_json::from_str(&config_str)?;
 
-        // Load LLM from safetensors
-        let llm_path = model_path.join("llm.safetensors");
+        // Load LLM from safetensors (prefer RL weights when available)
+        let use_rl = std::env::var("COSYVOICE_USE_RL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let llm_path = if use_rl {
+            let rl_path = model_path.join("llm.rl.safetensors");
+            if rl_path.exists() {
+                rl_path
+            } else {
+                let rl_pt = model_path.join("llm.rl.pt");
+                if rl_pt.exists() {
+                    eprintln!(
+                        "RL checkpoint found at {:?} but no safetensors. Run: pixi run python tools/convert_llm_pt_to_safetensors.py {:?}",
+                        rl_pt, rl_pt
+                    );
+                }
+                model_path.join("llm.safetensors")
+            }
+        } else {
+            model_path.join("llm.safetensors")
+        };
         eprintln!("Loading LLM from {:?}", llm_path);
         let llm_vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[&llm_path], DType::F32, &device)
@@ -282,6 +304,7 @@ impl NativeTtsEngine {
     ///
     /// # Arguments
     /// * `text_embeds` - Text embeddings from encoder [batch, text_len, hidden_dim]
+    /// * `prompt_text_len` - Prompt text token length included in `text_embeds`
     /// * `prompt_speech_tokens` - Prompt speech tokens [batch, prompt_len]
     /// * `prompt_mel` - Prompt mel features [batch, mel_len, mel_dim]
     /// * `speaker_embedding` - Speaker embedding [batch, spk_dim]
@@ -289,9 +312,10 @@ impl NativeTtsEngine {
     ///
     /// # Returns
     /// Audio samples as i16
-    pub fn synthesize_full(
+    pub fn synthesize_full_with_prompt_len(
         &mut self,
         text_embeds: &Tensor,
+        prompt_text_len: usize,
         prompt_speech_tokens: Option<&Tensor>,
         prompt_mel: &Tensor,
         speaker_embedding: &Tensor,
@@ -299,8 +323,9 @@ impl NativeTtsEngine {
     ) -> Result<Vec<i16>, NativeTtsError> {
         // Calculate generation length bounds
         let text_len = text_embeds.dim(1)?;
-        let min_len = (text_len as f32 * 2.0) as usize;
-        let max_len = (text_len as f32 * 20.0) as usize;
+        let effective_len = text_len.saturating_sub(prompt_text_len);
+        let min_len = (effective_len as f32 * MIN_TOKEN_TEXT_RATIO) as usize;
+        let max_len = (effective_len as f32 * MAX_TOKEN_TEXT_RATIO) as usize;
 
         // 1. Generate speech tokens via LLM
         eprintln!("Generating speech tokens... (min={}, max={})", min_len, max_len);
@@ -336,6 +361,25 @@ impl NativeTtsEngine {
         )
     }
 
+    /// Full synthesis with LLM generation (assumes no prompt text tokens are present)
+    pub fn synthesize_full(
+        &mut self,
+        text_embeds: &Tensor,
+        prompt_speech_tokens: Option<&Tensor>,
+        prompt_mel: &Tensor,
+        speaker_embedding: &Tensor,
+        sampling_k: usize,
+    ) -> Result<Vec<i16>, NativeTtsError> {
+        self.synthesize_full_with_prompt_len(
+            text_embeds,
+            0,
+            prompt_speech_tokens,
+            prompt_mel,
+            speaker_embedding,
+            sampling_k,
+        )
+    }
+
     /// Process prompt audio tensors to get speech tokens and speaker embedding
     pub fn process_prompt_tensors(
         &mut self,
@@ -363,6 +407,7 @@ impl NativeTtsEngine {
     ///
     /// # Arguments
     /// * `text_tokens` - Input text tokens [1, text_len] (including prompt text if any)
+    /// * `prompt_text_len` - Prompt text token length included in `text_tokens`
     /// * `prompt_speech_16k` - Prompt mel features for tokenizer [1, 128, mel_len]
     /// * `prompt_speech_24k` - Prompt mel features for Flow [1, 80, mel_len]
     /// * `prompt_fbank` - Prompt fbank features for embedding [1, fbank_len, 80]
@@ -370,9 +415,10 @@ impl NativeTtsEngine {
     ///
     /// # Returns
     /// Audio samples as i16
-    pub fn synthesize_instruct(
+    pub fn synthesize_instruct_with_prompt_len(
         &mut self,
         text_tokens: &Tensor,
+        prompt_text_len: usize,
         prompt_speech_16k: &Tensor,
         prompt_speech_24k: &Tensor,
         prompt_fbank: &Tensor,
@@ -385,12 +431,32 @@ impl NativeTtsEngine {
         let text_embeds = self.llm.embed_text_tokens(text_tokens)?;
 
         // 3. Full Synthesis pipeline
-        self.synthesize_full(
+        self.synthesize_full_with_prompt_len(
             &text_embeds,
+            prompt_text_len,
             Some(&prompt_speech_tokens),
             prompt_speech_24k, // Flow uses 24k mel (80 dim)
             &spk_emb,
             sampling_k
+        )
+    }
+
+    /// Synthesize speech in instruct/zero-shot mode (assumes no prompt text tokens)
+    pub fn synthesize_instruct(
+        &mut self,
+        text_tokens: &Tensor,
+        prompt_speech_16k: &Tensor,
+        prompt_speech_24k: &Tensor,
+        prompt_fbank: &Tensor,
+        sampling_k: usize,
+    ) -> Result<Vec<i16>, NativeTtsError> {
+        self.synthesize_instruct_with_prompt_len(
+            text_tokens,
+            0,
+            prompt_speech_16k,
+            prompt_speech_24k,
+            prompt_fbank,
+            sampling_k,
         )
     }
 }

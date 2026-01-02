@@ -132,7 +132,7 @@ impl OnnxFrontend {
 
         // Run inference
         let inputs = inputs![
-            "speech" => input_val
+            "input" => input_val
         ];
         let outputs = self.campplus.run(inputs)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
@@ -176,11 +176,21 @@ impl OnnxFrontend {
         let outputs = self.speech_tokenizer.run(inputs)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
 
-        let (shape, data) = outputs["indices"].try_extract_tensor::<i64>()
-            .map_err(|e| FrontendError::OrtError(e.to_string()))?;
-
-        let out_dims: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
-        let out_data: Vec<u32> = data.iter().map(|&x| x as u32).collect(); // Convert i64 to u32
+        let (out_dims, out_data): (Vec<usize>, Vec<u32>) = if let Ok((shape, data)) =
+            outputs["indices"].try_extract_tensor::<i64>()
+        {
+            let dims = shape.iter().map(|&x| x as usize).collect();
+            let values = data.iter().map(|&x| x as u32).collect();
+            (dims, values)
+        } else if let Ok((shape, data)) = outputs["indices"].try_extract_tensor::<i32>() {
+            let dims = shape.iter().map(|&x| x as usize).collect();
+            let values = data.iter().map(|&x| x as u32).collect();
+            (dims, values)
+        } else {
+            return Err(FrontendError::OrtError(
+                "Speech tokenizer output type is neither i64 nor i32".to_string(),
+            ));
+        };
 
         Tensor::from_vec(out_data, out_dims, &self.device)
             .map_err(FrontendError::CandleError)

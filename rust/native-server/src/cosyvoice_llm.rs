@@ -5,6 +5,7 @@
 use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use rand::Rng;
+use std::cmp::Ordering;
 
 use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 
@@ -13,9 +14,13 @@ use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 pub struct CosyVoiceLLMConfig {
     pub llm_input_size: usize,
     pub llm_output_size: usize,
-    pub speech_token_size: usize,  // Size in weights (6758)
-    pub sampling_vocab_size: usize, // Valid output range (6561)
+    pub speech_token_size: usize,    // Base speech token vocab size
+    pub speech_extra_tokens: usize,  // Special/stop tokens appended to speech vocab
+    pub sampling_vocab_size: usize,  // Valid output range (flow vocab size)
     pub spk_embed_dim: usize,
+    pub sampling_top_p: f32,
+    pub ras_window_size: usize,
+    pub ras_tau_r: f32,
 }
 
 impl Default for CosyVoiceLLMConfig {
@@ -23,9 +28,13 @@ impl Default for CosyVoiceLLMConfig {
         Self {
             llm_input_size: 896,
             llm_output_size: 896,
-            speech_token_size: 6758,  // Fun-CosyVoice3-0.5B default weights size
-            sampling_vocab_size: 6561, // Fun-CosyVoice3-0.5B Flow vocab size
+            speech_token_size: 6561,    // Fun-CosyVoice3-0.5B speech token size
+            speech_extra_tokens: 200,   // CosyVoice3 stop/special token range
+            sampling_vocab_size: 6561,  // Fun-CosyVoice3-0.5B Flow vocab size
             spk_embed_dim: 192,
+            sampling_top_p: 0.8,
+            ras_window_size: 10,
+            ras_tau_r: 0.1,
         }
     }
 }
@@ -35,19 +44,21 @@ pub struct CosyVoiceLLM {
     /// Core Qwen2 model
     llm: ModelForCausalLM,
     /// LLM embedding for SOS and task_id tokens
-    llm_embedding: Embedding,
+    llm_embedding: Option<Embedding>,
     /// Speech token embedding
     speech_embedding: Embedding,
     /// Decoder head for speech tokens
     llm_decoder: Linear,
-    /// Actual speech token vocabulary size (inferred from weights)
-    speech_token_size: usize,
+    /// Decoder vocabulary size (including special tokens)
+    speech_vocab_size: usize,
     /// Valid sampling range limit
     sampling_vocab_size: usize,
     /// Configuration
     config: CosyVoiceLLMConfig,
     /// Device
     device: Device,
+    /// Whether special tokens come from speech embedding
+    use_speech_special_tokens: bool,
     /// Special token IDs
     sos: usize,
     task_id: usize,
@@ -72,15 +83,9 @@ impl CosyVoiceLLM {
         let llm = ModelForCausalLM::new(qwen_config, vb.pp("llm.model"))?;
         eprintln!("Qwen2 model loaded successfully");
 
-        // Load LLM embedding (SOS=0, task_id=1)
-        // This is NOT in the safetensors file, so we create it randomly
-        eprintln!("Creating llm_embedding (2 tokens)...");
-        let llm_embedding = create_random_embedding(2, llm_config.llm_input_size, &device)?;
-
-        // Load speech embedding using the config's speech_token_size
-        // The actual size in Fun-CosyVoice3-0.5B is 6761 (6758 + 3 special tokens)
+        // Load speech embedding using the config's speech token sizes.
         eprintln!("Loading speech_embedding from top-level...");
-        let speech_vocab_size = llm_config.speech_token_size + 3;
+        let speech_vocab_size = llm_config.speech_token_size + llm_config.speech_extra_tokens;
         let speech_emb_weight = vb.pp("speech_embedding").get(
             (speech_vocab_size, llm_config.llm_input_size),
             "weight",
@@ -97,30 +102,65 @@ impl CosyVoiceLLM {
         let llm_decoder = Linear::new(decoder_weight, None);
         eprintln!("llm_decoder loaded successfully");
 
+        let use_speech_special_tokens = llm_config.speech_extra_tokens > 3;
+        let (llm_embedding, sos, task_id) = if use_speech_special_tokens {
+            let sos = llm_config.sampling_vocab_size;
+            let task_id = llm_config
+                .sampling_vocab_size
+                .saturating_add(2);
+            if task_id >= speech_vocab_size {
+                return Err(candle_core::Error::msg(
+                    "special token ids exceed speech vocab size; check llm config",
+                ));
+            }
+            (None, sos, task_id)
+        } else {
+            eprintln!("Creating llm_embedding (2 tokens)...");
+            let llm_embedding = create_random_embedding(2, llm_config.llm_input_size, &device)?;
+            (Some(llm_embedding), 0, 1)
+        };
+
         Ok(Self {
             llm,
             llm_embedding,
             speech_embedding,
             llm_decoder,
-            speech_token_size: llm_config.speech_token_size,
+            speech_vocab_size,
             sampling_vocab_size: llm_config.sampling_vocab_size,
             config: llm_config,
             device,
-            sos: 0,
-            task_id: 1,
+            use_speech_special_tokens,
+            sos,
+            task_id,
         })
     }
 
     /// Get SOS embedding
     fn get_sos_emb(&self) -> Result<Tensor> {
         let idx = Tensor::new(&[self.sos as u32], &self.device)?;
-        self.llm_embedding.forward(&idx)?.unsqueeze(0)
+        if self.use_speech_special_tokens {
+            self.speech_embedding.forward(&idx)?.unsqueeze(0)
+        } else {
+            self.llm_embedding
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("llm_embedding missing"))?
+                .forward(&idx)?
+                .unsqueeze(0)
+        }
     }
 
     /// Get task_id embedding
     fn get_task_id_emb(&self) -> Result<Tensor> {
         let idx = Tensor::new(&[self.task_id as u32], &self.device)?;
-        self.llm_embedding.forward(&idx)?.unsqueeze(0)
+        if self.use_speech_special_tokens {
+            self.speech_embedding.forward(&idx)?.unsqueeze(0)
+        } else {
+            self.llm_embedding
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("llm_embedding missing"))?
+                .forward(&idx)?
+                .unsqueeze(0)
+        }
     }
 
     /// Embed text tokens using the underlying LLM's embedding layer
@@ -133,59 +173,113 @@ impl CosyVoiceLLM {
         self.speech_embedding.forward(tokens)
     }
 
-    /// Top-k sampling
-    fn sample_top_k(&self, logits: &Tensor, k: usize, ignore_eos: bool) -> Result<u32> {
-        let logits = logits.squeeze(0)?; // [vocab_size]
-        let _vocab_size = logits.dim(0)?;
+    fn is_stop_token(&self, token_id: u32) -> bool {
+        let idx = token_id as usize;
+        idx >= self.sampling_vocab_size && idx < self.speech_vocab_size
+    }
 
-        // Get logits as vec
-        let logits_vec: Vec<f32> = logits.to_vec1()?;
-
-        // Find top-k indices and values
-        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // Filter out EOS (or invalid > sampling_vocab_size) if ignoring
-        // Also ensure we don't sample beyond sampling_vocab_size unless it's EOS
-        let candidates: Vec<(usize, f32)> = if ignore_eos {
-            indexed.into_iter()
-                .filter(|(idx, _)| *idx < self.sampling_vocab_size)
-                .take(k)
-                .collect()
-        } else {
-            // Filter candidates to be within loading size, but prefer within sampling size
-            // If we want to allow EOS (which might be >= sampling_size), we should check
-            // For now, restrict to sampling_vocab_size (6561) to define "valid tokens"
-            // If EOS is > 6561, then it will be filtered out?
-            // Wait, if EOS is 6561?
-            indexed.into_iter()
-                   .filter(|(idx, _)| *idx < self.sampling_vocab_size || *idx >= self.speech_token_size) // Allow < 6561 OR EOS?
-                   .take(k).collect()
-        };
-
-        if candidates.is_empty() {
-             // Fallback to EOS (speech_token_size)
-            return Ok(self.speech_token_size as u32);
+    fn sample_from_weighted(&self, weights: &[(usize, f32)]) -> Option<usize> {
+        let total: f32 = weights.iter().map(|(_, w)| *w).sum();
+        if total <= 0.0 {
+            return None;
         }
-
-        // Softmax over top-k
-        let max_logit = candidates.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = candidates.iter().map(|(_, v)| (v - max_logit).exp()).sum();
-        let probs: Vec<f32> = candidates.iter().map(|(_, v)| (v - max_logit).exp() / exp_sum).collect();
-
-        // Sample from categorical distribution
         let mut rng = rand::thread_rng();
-        let r: f32 = rng.gen();
-        let mut cumsum = 0.0;
-        for (i, p) in probs.iter().enumerate() {
-            cumsum += p;
-            if r <= cumsum {
-                return Ok(candidates[i].0 as u32);
+        let mut r = rng.gen::<f32>() * total;
+        for (idx, w) in weights {
+            r -= *w;
+            if r <= 0.0 {
+                return Some(*idx);
+            }
+        }
+        weights.last().map(|(idx, _)| *idx)
+    }
+
+    fn sample_from_probs(&self, probs: &[f32]) -> Option<usize> {
+        let total: f32 = probs.iter().sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut rng = rand::thread_rng();
+        let mut r = rng.gen::<f32>() * total;
+        for (idx, p) in probs.iter().enumerate() {
+            r -= *p;
+            if r <= 0.0 {
+                return Some(idx);
+            }
+        }
+        if probs.is_empty() { None } else { Some(probs.len() - 1) }
+    }
+
+    fn sample_nucleus(&self, probs: &[f32], top_p: f32, top_k: usize) -> Option<usize> {
+        let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        let mut cum_prob = 0.0;
+        let k = top_k.max(1);
+        for (idx, prob) in indexed {
+            if cum_prob < top_p && candidates.len() < k {
+                cum_prob += prob;
+                candidates.push((idx, prob));
+            } else {
+                break;
             }
         }
 
-        // Fallback to first candidate
-        Ok(candidates[0].0 as u32)
+        if candidates.is_empty() {
+            return None;
+        }
+
+        self.sample_from_weighted(&candidates)
+    }
+
+    fn sample_ras(&self, logp: &Tensor, decoded_tokens: &[u32], sampling_k: usize) -> Result<u32> {
+        let logp = logp.squeeze(0)?;
+        let logp_vec: Vec<f32> = logp.to_vec1()?;
+        let probs: Vec<f32> = logp_vec.iter().map(|v| v.exp()).collect();
+
+        let top_id = self
+            .sample_nucleus(&probs, self.config.sampling_top_p, sampling_k)
+            .unwrap_or(0);
+
+        if self.config.ras_window_size > 0 && !decoded_tokens.is_empty() {
+            let recent = decoded_tokens
+                .iter()
+                .rev()
+                .take(self.config.ras_window_size);
+            let rep_num = recent.filter(|&&t| t as usize == top_id).count() as f32;
+            let threshold = self.config.ras_window_size as f32 * self.config.ras_tau_r;
+            if rep_num >= threshold {
+                if let Some(random_id) = self.sample_from_probs(&probs) {
+                    return Ok(random_id as u32);
+                }
+            }
+        }
+
+        Ok(top_id as u32)
+    }
+
+    fn sample_ids(
+        &self,
+        logp: &Tensor,
+        decoded_tokens: &[u32],
+        sampling_k: usize,
+        ignore_stop: bool,
+    ) -> Result<u32> {
+        let max_trials = 100;
+        let mut trials = 0;
+        loop {
+            let top_id = self.sample_ras(logp, decoded_tokens, sampling_k)?;
+            if !ignore_stop || !self.is_stop_token(top_id) {
+                return Ok(top_id);
+            }
+            trials += 1;
+            if trials > max_trials {
+                return Err(candle_core::Error::msg(
+                    "sampling reaches max_trials and still gets stop tokens",
+                ));
+            }
+        }
     }
 
     /// Generate speech tokens autoregressively
@@ -242,13 +336,11 @@ impl CosyVoiceLLM {
             let logp = candle_nn::ops::log_softmax(&logits.squeeze(1)?, 1)?;
 
             // Sample next token
-            let ignore_eos = i < min_len;
-            let top_id = self.sample_top_k(&logp.i(0)?, sampling_k, ignore_eos)?;
+            let ignore_stop = i < min_len;
+            let top_id = self.sample_ids(&logp, &out_tokens, sampling_k, ignore_stop)?;
 
-            // Check for EOS
-            // top_id >= sampling_vocab_size (6561) is considered EOS or invalid
-            if top_id as usize >= self.sampling_vocab_size {
-                eprintln!("LLM: EOS reached at step {} (token id {})", i, top_id);
+            if self.is_stop_token(top_id) {
+                eprintln!("LLM: stop token reached at step {} (token id {})", i, top_id);
                 break;
             }
 

@@ -470,15 +470,47 @@ impl CausalConvPositionEmbedding {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [B, N, D]
-        let x = x.transpose(1, 2)?; // [B, D, N] for Conv1d
+        // Manual grouped convolution to check for backend issues
+        let apply_manual_grouped_conv = |x: &Tensor, conv: &candle_nn::Conv1d| -> Result<Tensor> {
+            let groups = 16;
+            let weight = conv.weight();
 
-        // Pad left by kernel_size - 1 = 30
-        let x = x.pad_with_zeros(2, 30, 0)?;
-        let x = x.apply(&self.conv1)?;
+
+            let bias = conv.bias();
+            let x_chunks = x.chunk(groups, 1)?;
+            let w_chunks = weight.chunk(groups, 0)?;
+            let b_chunks = match bias {
+                Some(b) => Some(b.chunk(groups, 0)?),
+                None => None,
+            };
+
+            let mut outs = Vec::new();
+            for i in 0..groups {
+                let x_i = &x_chunks[i];
+                let w_i = &w_chunks[i];
+                // conv1d(weight, padding, stride, dilation, groups)
+                // Here groups=1 because we split manually
+                let out_i = x_i.conv1d(w_i, 0, 1, 1, 1)?;
+
+                let out_i = match &b_chunks {
+                    Some(bs) => out_i.broadcast_add(&bs[i].unsqueeze(0)?.unsqueeze(2)?)?,
+                    None => out_i,
+                };
+                outs.push(out_i);
+            }
+            Tensor::cat(&outs, 1)
+        };
+
+        let x = x.transpose(1, 2)?; // [B, D, N]
+        let (b, d, _) = x.dims3()?;
+        let zeros = Tensor::zeros((b, d, 30), x.dtype(), x.device())?;
+
+        let x = Tensor::cat(&[&zeros, &x], 2)?;
+        let x = apply_manual_grouped_conv(&x, &self.conv1)?;
         let x = mish(&x)?;
 
-        let x = x.pad_with_zeros(2, 30, 0)?;
-        let x = x.apply(&self.conv2)?;
+        let x = Tensor::cat(&[&zeros, &x], 2)?;
+        let x = apply_manual_grouped_conv(&x, &self.conv2)?;
         let x = mish(&x)?;
 
         x.transpose(1, 2) // [B, N, D]
@@ -557,64 +589,21 @@ impl DiT {
         spks: &Tensor,
         cond: &Tensor,
     ) -> Result<Tensor> {
-        eprintln!(
-            "DIT START: x={:?}, mask={:?}, mu={:?}, t={:?}, spks={:?}, cond={:?}",
-            x.shape(),
-            mask.shape(),
-            mu.shape(),
-            t.shape(),
-            spks.shape(),
-            cond.shape()
-        );
         let x = self.input_embed.forward(x, cond, mu, spks)?;
-        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
-        // Calculate mean and std manually or just print first few
-        let sum: f32 = x_vec.iter().sum();
-        let mean = sum / x_vec.len() as f32;
-        eprintln!(
-            "Rust InputEmbed output: mean={}, first 5={:?}",
-            mean,
-            &x_vec[0..5]
-        );
-        eprintln!("DIT: after input_embed x={:?}", x.shape());
+
         // TimestepEmbedding handles sinusoidal embedding internally now
         let t_emb = self.time_embed.forward(t)?;
-        eprintln!("DIT: t_emb={:?}", t_emb.shape());
 
         let rope = Some((self.rotary_embed.cos.clone(), self.rotary_embed.sin.clone()));
 
         let mut x = x;
-        for (i, block) in self.transformer_blocks.iter().enumerate() {
-            eprintln!(
-                "DIT: entering block {} with x={:?}, t_emb={:?}",
-                i,
-                x.shape(),
-                t_emb.shape()
-            );
+        for block in self.transformer_blocks.iter() {
             x = block.forward(&x, &t_emb, mask, rope.as_ref())?;
-            eprintln!("DIT: exiting block {} with x={:?}", i, x.shape());
         }
 
-        eprintln!(
-            "DIT: before norm_out x={:?}, t_emb={:?}",
-            x.shape(),
-            t_emb.shape()
-        );
-        std::io::Write::flush(&mut std::io::stderr()).unwrap();
-        std::io::Write::flush(&mut std::io::stderr()).unwrap();
-        x = self.norm_out.forward(&x, &t_emb)?;
-
-        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
-        let sum: f32 = x_vec.iter().sum();
-        let mean = sum / x_vec.len() as f32;
-        eprintln!("DIT NORM_OUT mean={}, first 5={:?}", mean, &x_vec[0..5]);
+        let x = self.norm_out.forward(&x, &t_emb)?;
 
         let out = self.proj_out.forward(&x)?.transpose(1, 2)?;
-
-        let out_vec = out.flatten_all()?.to_vec1::<f32>()?;
-        let sum: f32 = out_vec.iter().sum();
-        let mean = sum / out_vec.len() as f32;
-        eprintln!("DIT FINAL mean={}, first 5={:?}", mean, &out_vec[0..5]);
 
         Ok(out)
     }
