@@ -38,6 +38,14 @@ def main() -> None:
     if not args.skip_rust:
         env = os.environ.copy()
         env.setdefault("SAVE_HIFT_DEBUG", "1")
+        env.setdefault(
+            "COSYVOICE_MODEL_DIR",
+            str(repo_root / "pretrained_models" / "Fun-CosyVoice3-0.5B"),
+        )
+        env.setdefault(
+            "ARTIFACT_PATH",
+            str(repo_root / "tests" / "test_artifacts.safetensors"),
+        )
         run(rust_cmd, env=env, cwd=repo_root / "rust")
 
     run([sys.executable, str(compare_script), "--tolerance", str(args.tolerance)])
