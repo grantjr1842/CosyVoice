@@ -120,7 +120,10 @@ impl NativeTtsEngine {
                 .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to load HiFT: {}", e)))?
         };
 
-        let hift_config = HiFTConfig::default();
+        let mut hift_config = HiFTConfig::default();
+        if model_dir.contains("Fun-CosyVoice3-0.5B") {
+            hift_config.voiced_threshold = 5.0;
+        }
         let hift = HiFTGenerator::new(hift_vb, &hift_config)
             .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize HiFT: {}", e)))?;
         eprintln!("HiFT initialized successfully");

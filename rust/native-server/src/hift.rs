@@ -483,7 +483,7 @@ impl SineGen {
                     let mut rad_values = vec![0f32; l];
                     for t in 0..l {
                         let current_f0 = f0_vec[offset_f0 + t];
-                        let rad = (current_f0 * mult / sampling_rate).rem_euclid(1.0);
+                        let rad = (current_f0 * mult / sampling_rate).fract();
                         rad_values[t] = rad;
                     }
 
@@ -648,7 +648,7 @@ impl SineGen {
                     let mut rad_values = vec![0f32; l];
                     for t in 0..l {
                         let current_f0 = f0_vec[offset_f0 + t];
-                        let rad = (current_f0 * mult / sampling_rate).rem_euclid(1.0);
+                        let rad = (current_f0 * mult / sampling_rate).fract();
                         rad_values[t] = rad;
                     }
 
