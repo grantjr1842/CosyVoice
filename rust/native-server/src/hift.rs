@@ -342,6 +342,8 @@ impl PaddedConv1d {
 pub struct SourceModuleHnNSF {
     sine_gen: SineGen,
     l_linear: candle_nn::Linear,
+    causal: bool,
+    noise_cache: Option<Vec<f32>>,
 }
 
 impl SourceModuleHnNSF {
@@ -370,9 +372,23 @@ impl SourceModuleHnNSF {
         // Check if weight_norm is on logic? generator.py: SourceModuleHnNSF uses regular Linear.
         let l_linear = candle_nn::linear(harmonic_num + 1, 1, vb.pp("l_linear"))?;
 
+        let noise_cache = if causal {
+            let mut rng = rand::thread_rng();
+            let len = sampling_rate.saturating_mul(300);
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(rng.gen::<f32>());
+            }
+            Some(values)
+        } else {
+            None
+        };
+
         Ok(Self {
             sine_gen,
             l_linear,
+            causal,
+            noise_cache,
         })
     }
 
@@ -402,6 +418,23 @@ impl SourceModuleHnNSF {
         // Noise branch - use injected noise or generate random noise
         let noise = match source_noise_inject {
             Some(n) => (n * (self.sine_gen.sine_amp / 3.0))?,
+            None if self.causal => {
+                let len = uv.dim(1)?;
+                let cache = self.noise_cache.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("Missing causal noise cache".into())
+                })?;
+                if len > cache.len() {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache too small: need {}, have {}",
+                        len,
+                        cache.len()
+                    )));
+                }
+                let noise_vec = cache[..len].to_vec();
+                let noise_tensor = Tensor::from_vec(noise_vec, (1, len, 1), uv.device())?;
+                let noise_tensor = noise_tensor.broadcast_as(uv.shape())?;
+                (noise_tensor * (self.sine_gen.sine_amp / 3.0))?
+            }
             None => (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?,
         };
 
