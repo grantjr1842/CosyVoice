@@ -300,6 +300,11 @@ pub struct SineGen {
     sine_noise_cache: Option<Tensor>,
 }
 
+struct SineGenDebug {
+    rad_down: Option<Tensor>,
+    phase_up: Option<Tensor>,
+}
+
 impl SineGen {
     pub fn new(
         harmonic_num: usize,
@@ -590,6 +595,192 @@ impl SineGen {
 
         Ok((output.transpose(1, 2)?, uv.transpose(1, 2)?, noise))
     }
+
+    pub fn forward_with_debug(
+        &self,
+        f0: &Tensor,
+        _phase_inject: Option<&Tensor>,
+        noise_inject: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor, SineGenDebug)> {
+        let f0_2d = if f0.dim(1)? == 1 {
+            f0.squeeze(1)?
+        } else if f0.dim(2)? == 1 {
+            f0.squeeze(2)?
+        } else {
+            return Err(candle_core::Error::Msg(
+                "SineGen expects f0 with a singleton channel dimension".into(),
+            ));
+        };
+        let (b, l) = f0_2d.dims2()?;
+        let f0_cpu = f0_2d.to_device(&Device::Cpu)?;
+        let f0_vec = f0_cpu.flatten_all()?.to_vec1::<f32>()?;
+
+        let num_harmonics = self.harmonic_num + 1;
+        let mut sine_waves_vec = vec![0f32; b * num_harmonics * l];
+
+        let mut rad_down_vec = None;
+        let mut phase_up_vec = None;
+        let mut down_len = None;
+
+        let sampling_rate = self.sampling_rate as f32;
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let sine_amp = self.sine_amp as f32;
+
+        if self.use_interpolated {
+            if l % self.upsample_scale != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "SineGen2 expects length {} divisible by upsample_scale {}",
+                    l, self.upsample_scale
+                )));
+            }
+            let local_down_len = l / self.upsample_scale;
+            down_len = Some(local_down_len);
+            rad_down_vec = Some(vec![0f32; b * num_harmonics * local_down_len]);
+            phase_up_vec = Some(vec![0f32; b * num_harmonics * l]);
+
+            let scale = l as f32 / local_down_len as f32;
+            let mut rng = rand::thread_rng();
+
+            for b_idx in 0..b {
+                let offset_f0 = b_idx * l;
+                for h in 0..num_harmonics {
+                    let mult = (h + 1) as f32;
+                    let mut rad_values = vec![0f32; l];
+                    for t in 0..l {
+                        let current_f0 = f0_vec[offset_f0 + t];
+                        let rad = (current_f0 * mult / sampling_rate).rem_euclid(1.0);
+                        rad_values[t] = rad;
+                    }
+
+                    let rand_ini = if self.causal {
+                        self.rand_ini
+                            .as_ref()
+                            .and_then(|vals| vals.get(h))
+                            .cloned()
+                            .unwrap_or(0.0)
+                    } else if h == 0 {
+                        0.0
+                    } else {
+                        rng.gen::<f32>()
+                    };
+                    if rand_ini != 0.0 {
+                        rad_values[0] += rand_ini;
+                    }
+
+                    let mut rad_down = vec![0f32; local_down_len];
+                    for out_idx in 0..local_down_len {
+                        let in_index = (out_idx as f32 + 0.5) * scale - 0.5;
+                        let i0 = in_index.floor();
+                        let i1 = i0 + 1.0;
+                        let w = in_index - i0;
+                        let idx0 = if i0 < 0.0 {
+                            0
+                        } else if i0 as usize >= l {
+                            l - 1
+                        } else {
+                            i0 as usize
+                        };
+                        let idx1 = if i1 < 0.0 {
+                            0
+                        } else if i1 as usize >= l {
+                            l - 1
+                        } else {
+                            i1 as usize
+                        };
+                        let v0 = rad_values[idx0];
+                        let v1 = rad_values[idx1];
+                        rad_down[out_idx] = v0 + (v1 - v0) * w;
+                        if let Some(rad_down_vec) = rad_down_vec.as_mut() {
+                            let dst = (b_idx * num_harmonics + h) * local_down_len + out_idx;
+                            rad_down_vec[dst] = rad_down[out_idx];
+                        }
+                    }
+
+                    let mut phase = 0f32;
+                    for down_idx in 0..local_down_len {
+                        phase += rad_down[down_idx];
+                        let phase_val = phase * two_pi * self.upsample_scale as f32;
+                        let start = down_idx * self.upsample_scale;
+                        for t in 0..self.upsample_scale {
+                            let idx = start + t;
+                            let dst = (b_idx * num_harmonics + h) * l + idx;
+                            sine_waves_vec[dst] = phase_val.sin() * sine_amp;
+                            if let Some(phase_up_vec) = phase_up_vec.as_mut() {
+                                phase_up_vec[dst] = phase_val;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for b_idx in 0..b {
+                let offset_f0 = b_idx * l;
+                for h in 0..num_harmonics {
+                    let mult = (h + 1) as f32;
+                    let mut running_phase = 0.0f32;
+                    for t in 0..l {
+                        let current_f0 = f0_vec[offset_f0 + t];
+                        let phase_step = current_f0 * mult / sampling_rate;
+                        running_phase += phase_step;
+                        running_phase %= 1.0;
+                        let val = (running_phase * two_pi).sin() * sine_amp;
+                        let idx = (b_idx * num_harmonics + h) * l + t;
+                        sine_waves_vec[idx] = val;
+                    }
+                }
+            }
+        }
+
+        let sine_waves = Tensor::from_vec(sine_waves_vec, (b, num_harmonics, l), f0.device())?;
+
+        let uv = f0.gt(self.voiced_threshold as f64)?.to_dtype(DType::F32)?;
+
+        let term1 = (&uv * self.noise_std)?;
+        let ones = Tensor::ones_like(&uv)?;
+        let term2 = ((&ones - &uv)? * (self.sine_amp / 3.0))?;
+        let noise_amp = (term1 + term2)?;
+
+        let noise = match noise_inject {
+            Some(n) => n.broadcast_mul(&noise_amp)?,
+            None => {
+                if self.causal {
+                    if let Some(cache) =
+                        self.cached_sine_noise(b, l, num_harmonics, f0.device())?
+                    {
+                        cache.broadcast_mul(&noise_amp)?
+                    } else {
+                        Tensor::randn_like(&sine_waves, 0.0, 1.0)?
+                            .broadcast_mul(&noise_amp)?
+                    }
+                } else {
+                    Tensor::randn_like(&sine_waves, 0.0, 1.0)?
+                        .broadcast_mul(&noise_amp)?
+                }
+            }
+        };
+
+        let output = ((sine_waves.broadcast_mul(&uv))? + noise.clone())?;
+
+        let rad_down = match (rad_down_vec, down_len) {
+            (Some(values), Some(local_down_len)) => Some(Tensor::from_vec(
+                values,
+                (b, num_harmonics, local_down_len),
+                f0.device(),
+            )?),
+            _ => None,
+        };
+        let phase_up = match phase_up_vec {
+            Some(values) => Some(Tensor::from_vec(values, (b, num_harmonics, l), f0.device())?),
+            None => None,
+        };
+
+        Ok((
+            output.transpose(1, 2)?,
+            uv.transpose(1, 2)?,
+            noise,
+            SineGenDebug { rad_down, phase_up },
+        ))
+    }
 }
 
 fn causal_padding(kernel_size: usize, dilation: usize) -> usize {
@@ -802,6 +993,69 @@ impl SourceModuleHnNSF {
         };
 
         Ok((sine_merge, noise, uv, sine_wavs))
+    }
+
+    fn forward_with_sine_debug(
+        &self,
+        f0: &Tensor,
+        phase_inject: Option<&Tensor>,
+        sine_noise_inject: Option<&Tensor>,
+        source_noise_inject: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, SineGenDebug)> {
+        let (sine_wavs, uv, _, sine_debug) =
+            self.sine_gen
+                .forward_with_debug(f0, phase_inject, sine_noise_inject)?;
+        let sine_merge = self.l_linear.forward(&sine_wavs)?;
+        let sine_merge = sine_merge.tanh()?;
+        let sine_merge = sine_merge.transpose(1, 2)?;
+
+        let noise = match source_noise_inject {
+            Some(n) => (n * (self.sine_gen.sine_amp / 3.0))?,
+            None if self.causal => {
+                let len = uv.dim(1)?;
+                let cache = self.noise_cache.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("Missing causal noise cache".into())
+                })?;
+                let mut noise_tensor = cache.to_device(uv.device())?;
+                if noise_tensor.rank() == 2 {
+                    noise_tensor = noise_tensor.unsqueeze(2)?;
+                }
+                if noise_tensor.rank() != 3 {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache must be 3D, got rank {}",
+                        noise_tensor.rank()
+                    )));
+                }
+                let (cb, cl, cc) = noise_tensor.dims3()?;
+                if cc != 1 {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache expected last dim 1, got {}",
+                        cc
+                    )));
+                }
+                if len > cl {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache too small: need {}, have {}",
+                        len, cl
+                    )));
+                }
+                noise_tensor = noise_tensor.narrow(1, 0, len)?;
+                if cb == 1 && uv.dim(0)? > 1 {
+                    noise_tensor = noise_tensor.repeat((uv.dim(0)?, 1, 1))?;
+                } else if cb != uv.dim(0)? {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Noise cache batch mismatch: cache {}, input {}",
+                        cb,
+                        uv.dim(0)?
+                    )));
+                }
+                let noise_tensor = noise_tensor.broadcast_as(uv.shape())?;
+                (noise_tensor * (self.sine_gen.sine_amp / 3.0))?
+            }
+            None => (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?,
+        };
+
+        Ok((sine_merge, noise, uv, sine_wavs, sine_debug))
     }
 
     /// Forward pass with optional noise injection for parity testing.
@@ -1435,12 +1689,18 @@ impl HiFTGenerator {
             .reshape((b, c, l * self.f0_upsamp_scale))?;
         debug.insert("source_s".to_string(), s.transpose(1, 2)?);
 
-        let (sine_merge, noise, uv, sine_waves) =
-            self.m_source.forward_with_sine(&s, None, None, None)?;
+        let (sine_merge, noise, uv, sine_waves, sine_debug) =
+            self.m_source.forward_with_sine_debug(&s, None, None, None)?;
         debug.insert("sine_merge".to_string(), sine_merge.transpose(1, 2)?);
         debug.insert("sine_waves".to_string(), sine_waves.clone());
         debug.insert("noise".to_string(), noise.clone());
         debug.insert("uv".to_string(), uv.clone());
+        if let Some(rad_down) = sine_debug.rad_down {
+            debug.insert("sine_rad_down".to_string(), rad_down);
+        }
+        if let Some(phase_up) = sine_debug.phase_up {
+            debug.insert("sine_phase_up".to_string(), phase_up);
+        }
         if let Some(rand_ini) = self.m_source.sine_gen.rand_ini.as_ref() {
             let rand_ini_tensor =
                 Tensor::from_vec(rand_ini.clone(), (1, rand_ini.len()), mel.device())?;

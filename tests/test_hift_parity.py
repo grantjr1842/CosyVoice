@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import torchaudio
 from safetensors.torch import load_file, save_file
 
@@ -33,12 +34,58 @@ def tensor_stats(t: torch.Tensor, name: str) -> dict:
     }
 
 
+def compute_sinegen2_debug(l_sin_gen, f0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    harmonic_num = l_sin_gen.harmonic_num
+    sampling_rate = l_sin_gen.sampling_rate
+    upsample_scale = l_sin_gen.upsample_scale
+    causal = getattr(l_sin_gen, "causal", False)
+
+    fn = f0 * torch.FloatTensor([[range(1, harmonic_num + 2)]]).to(f0.device)
+    rad_values = (fn / sampling_rate) % 1
+    rad_values = rad_values.clone()
+
+    if not l_sin_gen.training and causal:
+        rand_ini = l_sin_gen.rand_ini.to(rad_values.device)
+    else:
+        rand_ini = torch.rand(
+            rad_values.shape[0], rad_values.shape[2], device=rad_values.device
+        )
+        rand_ini[:, 0] = 0
+    rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+
+    rad_down = F.interpolate(
+        rad_values.transpose(1, 2),
+        scale_factor=1 / upsample_scale,
+        mode="linear",
+        align_corners=False,
+    ).transpose(1, 2)
+    phase = torch.cumsum(rad_down, dim=1) * 2 * torch.pi
+
+    phase_input = phase.transpose(1, 2) * upsample_scale
+    if causal:
+        phase_up = F.interpolate(
+            phase_input,
+            scale_factor=upsample_scale,
+            mode="nearest",
+        ).transpose(1, 2)
+    else:
+        phase_up = F.interpolate(
+            phase_input,
+            scale_factor=upsample_scale,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+
+    return rad_down, phase_up
+
+
 def main():
     model_dir = "pretrained_models/Fun-CosyVoice3-0.5B"
 
     # Load the same test artifacts used by Rust
     print("Loading test artifacts...")
-    artifacts = load_file("tests/test_artifacts.safetensors")
+    artifact_path = os.environ.get("ARTIFACT_PATH", "tests/test_artifacts.safetensors")
+    artifacts = load_file(artifact_path)
     flow_feat_24k = artifacts["flow_feat_24k"]  # [1, 80, 171]
 
     print(f"Input mel (flow_feat_24k) shape: {flow_feat_24k.shape}")
@@ -83,10 +130,131 @@ def main():
     with open(log_path, "a") as log:
         log.write(f"Mel device: {mel.device}\n")
 
-    # Run Python HiFT inference
-    print("\n=== Running Python HiFT ===")
+    # Run Python HiFT and capture detailed intermediates
+    print("\n=== Running Python HiFT (deterministic path) ===")
     with torch.inference_mode():
-        audio, cache_source = hift.inference(mel)
+        def run_f0_with_debug(predictor, mel_cpu, finalize=True):
+            condnet = predictor.condnet
+            x = mel_cpu
+            layer_outputs = {}
+            layer_idx = 0
+
+            if finalize:
+                x = condnet[0](x)
+            else:
+                pad = condnet[0].causal_padding
+                x = condnet[0](x[:, :, :-pad], x[:, :, -pad:])
+            x = condnet[1](x)
+            layer_outputs[f"f0_layer{layer_idx}"] = x.detach()
+            layer_idx += 1
+
+            for i in range(2, len(condnet), 2):
+                x = condnet[i](x)
+                x = condnet[i + 1](x)
+                layer_outputs[f"f0_layer{layer_idx}"] = x.detach()
+                layer_idx += 1
+
+            x = x.transpose(1, 2)
+            classifier_pre_abs = predictor.classifier(x)
+            f0 = torch.abs(classifier_pre_abs).squeeze(-1)
+            return f0, layer_outputs, classifier_pre_abs
+
+        # F0 prediction
+        with open("outputs/logs/test_hift_debug.log", "a") as log:
+            log.write(f"Before f0_predictor calling with mel device: {mel.device}\n")
+            # log.write(f"f0_predictor device check: {next(hift.f0_predictor.parameters()).device}\n") # Verify this
+
+        hift.f0_predictor.to("cpu")
+        f0_cpu, f0_layers, f0_classifier_pre_abs = run_f0_with_debug(
+            hift.f0_predictor, mel.cpu(), finalize=True
+        )
+        f0 = f0_cpu.to(mel)
+        print(f"F0 predictor output: {tensor_stats(f0, 'f0')}")
+
+        # Upsample F0
+        s = hift.f0_upsamp(f0[:, None]).transpose(1, 2)
+        print(f"Upsampled F0 (s): {tensor_stats(s, 's')}")
+
+        # Source module
+        sine_merge, noise, uv = hift.m_source(s)
+        print(f"Source sine_merge: {tensor_stats(sine_merge, 'sine_merge')}")
+        print(f"Source noise: {tensor_stats(noise, 'noise')}")
+        print(f"Source uv: {tensor_stats(uv, 'uv')}")
+
+        rand_ini = None
+        sine_noise_cache = None
+        source_noise_cache = None
+        sine_waves = None
+        sine_rad_down = None
+        sine_phase_up = None
+
+        if hasattr(hift.m_source, "l_sin_gen"):
+            l_sin_gen = hift.m_source.l_sin_gen
+            if hasattr(l_sin_gen, "rand_ini"):
+                rand_ini = l_sin_gen.rand_ini.detach().cpu()
+            if hasattr(l_sin_gen, "sine_waves"):
+                sine_noise_cache = l_sin_gen.sine_waves[:, : s.shape[1], :].detach().cpu()
+            with torch.no_grad():
+                sine_waves, _, _ = l_sin_gen(s)
+            if hasattr(l_sin_gen, "upsample_scale"):
+                sine_rad_down, sine_phase_up = compute_sinegen2_debug(l_sin_gen, s)
+        if hasattr(hift.m_source, "uv"):
+            source_noise_cache = hift.m_source.uv[:, : uv.shape[1], :].detach().cpu()
+
+        # Transpose for decode
+        s_source = sine_merge.transpose(1, 2)
+
+        # Decode (detailed)
+        # STFT of source
+        s_stft_real, s_stft_imag = hift._stft(s_source.squeeze(1))
+        print(f"Source STFT real: {tensor_stats(s_stft_real, 's_stft_real')}")
+        print(f"Source STFT imag: {tensor_stats(s_stft_imag, 's_stft_imag')}")
+        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+
+        # Pre-conv
+        x = hift.conv_pre(mel)
+        conv_pre_out = x.detach()
+        print(f"After conv_pre: {tensor_stats(conv_pre_out, 'conv_pre_out')}")
+
+        decode_intermediates = {}
+
+        for i in range(hift.num_upsamples):
+            x = F.leaky_relu(x, hift.lrelu_slope)
+            decode_intermediates[f"upsample_{i}_pre"] = x.detach()
+            x = hift.ups[i](x)
+            if i == hift.num_upsamples - 1:
+                x = hift.reflection_pad(x)
+            decode_intermediates[f"upsample_{i}_out"] = x.detach()
+
+            si = hift.source_downs[i](s_stft)
+            decode_intermediates[f"source_down_{i}_out"] = si.detach()
+            si = hift.source_resblocks[i](si)
+            decode_intermediates[f"source_resblock_{i}_out"] = si.detach()
+            x = x + si
+            decode_intermediates[f"fusion_{i}_out"] = x.detach()
+
+            xs = None
+            for j in range(hift.num_kernels):
+                out = hift.resblocks[i * hift.num_kernels + j](x)
+                decode_intermediates[f"resblock_{i}_{j}_out"] = out.detach()
+                if xs is None:
+                    xs = out
+                else:
+                    xs = xs + out
+            x = xs / hift.num_kernels
+            decode_intermediates[f"resblock_{i}_out"] = x.detach()
+
+        x = F.leaky_relu(x)
+        decode_intermediates["post_lrelu_out"] = x.detach()
+        conv_post_out = hift.conv_post(x)
+
+        n_fft = hift.istft_params["n_fft"]
+        cutoff = n_fft // 2 + 1
+        magnitude = torch.exp(conv_post_out[:, :cutoff, :])
+        magnitude = torch.clip(magnitude, max=1e2)
+        phase = torch.sin(conv_post_out[:, cutoff:, :])
+        istft_audio = hift._istft(magnitude, phase)
+        audio = torch.clamp(istft_audio, -hift.audio_limit, hift.audio_limit)
 
     print(f"Python audio shape: {audio.shape}")
     print(
@@ -139,43 +307,6 @@ def main():
                 f"\n❌ CRITICAL: Low correlation ({correlation:.4f}) - outputs are fundamentally different"
             )
 
-    # Also capture detailed intermediate values for debugging
-    print("\n=== Capturing Intermediate Values ===")
-    with torch.inference_mode():
-        # F0 prediction
-        with open("outputs/logs/test_hift_debug.log", "a") as log:
-            log.write(f"Before f0_predictor calling with mel device: {mel.device}\n")
-            # log.write(f"f0_predictor device check: {next(hift.f0_predictor.parameters()).device}\n") # Verify this
-
-        # Explicitly ensure f0_predictor is on device
-        hift.f0_predictor.to(device)
-
-        f0 = hift.f0_predictor(mel)
-        print(f"F0 predictor output: {tensor_stats(f0, 'f0')}")
-
-        # Upsample F0
-        s = hift.f0_upsamp(f0[:, None]).transpose(1, 2)
-        print(f"Upsampled F0 (s): {tensor_stats(s, 's')}")
-
-        # Source module
-        sine_merge, noise, uv = hift.m_source(s)
-        print(f"Source sine_merge: {tensor_stats(sine_merge, 'sine_merge')}")
-        print(f"Source noise: {tensor_stats(noise, 'noise')}")
-        print(f"Source uv: {tensor_stats(uv, 'uv')}")
-
-        # Transpose for decode
-        s_source = sine_merge.transpose(1, 2)
-
-        # Decode (detailed)
-        # STFT of source
-        s_stft_real, s_stft_imag = hift._stft(s_source.squeeze(1))
-        print(f"Source STFT real: {tensor_stats(s_stft_real, 's_stft_real')}")
-        print(f"Source STFT imag: {tensor_stats(s_stft_imag, 's_stft_imag')}")
-
-        # Pre-conv
-        x = hift.conv_pre(mel)
-        print(f"After conv_pre: {tensor_stats(x, 'conv_pre_out')}")
-
     # Save intermediate tensors
     intermediates = {
         "input_mel": mel.cpu().contiguous(),
@@ -186,9 +317,31 @@ def main():
         "uv": uv.cpu().contiguous(),
         "s_stft_real": s_stft_real.cpu().contiguous(),
         "s_stft_imag": s_stft_imag.cpu().contiguous(),
-        "conv_pre_out": x.cpu().contiguous(),
+        "conv_pre_out": conv_pre_out.cpu().contiguous(),
+        "conv_post_out": conv_post_out.cpu().contiguous(),
+        "magnitude": magnitude.cpu().contiguous(),
+        "phase": phase.cpu().contiguous(),
+        "istft_audio": istft_audio.cpu().contiguous(),
         "final_audio": audio.cpu().contiguous(),
     }
+    for name, tensor in decode_intermediates.items():
+        intermediates[name] = tensor.cpu().contiguous()
+    for name, tensor in f0_layers.items():
+        intermediates[name] = tensor.cpu().contiguous()
+    if f0_classifier_pre_abs is not None:
+        intermediates["f0_classifier_pre_abs"] = f0_classifier_pre_abs.cpu().contiguous()
+    if rand_ini is not None:
+        intermediates["rand_ini"] = rand_ini.contiguous()
+    if sine_noise_cache is not None:
+        intermediates["sine_noise_cache"] = sine_noise_cache.contiguous()
+    if source_noise_cache is not None:
+        intermediates["source_noise_cache"] = source_noise_cache.contiguous()
+    if sine_waves is not None:
+        intermediates["sine_waves"] = sine_waves.cpu().contiguous()
+    if sine_rad_down is not None:
+        intermediates["sine_rad_down"] = sine_rad_down.cpu().contiguous()
+    if sine_phase_up is not None:
+        intermediates["sine_phase_up"] = sine_phase_up.cpu().contiguous()
     debug_dir = Path("outputs/debug")
     debug_dir.mkdir(parents=True, exist_ok=True)
     save_file(intermediates, str(debug_dir / "python_intermediates.safetensors"))
