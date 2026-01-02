@@ -1,6 +1,7 @@
 // use crate::utils::StftModule; // Commented out until used
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
+use rand::Rng;
 use std::collections::HashMap;
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
@@ -46,6 +47,10 @@ pub struct SineGen {
     noise_std: f64,
     sampling_rate: f64,
     voiced_threshold: f32,
+    upsample_scale: usize,
+    use_interpolated: bool,
+    causal: bool,
+    rand_ini: Option<Vec<f32>>,
 }
 
 impl SineGen {
@@ -55,14 +60,36 @@ impl SineGen {
         noise_std: f64,
         sampling_rate: usize,
         voiced_threshold: f32,
+        upsample_scale: usize,
+        causal: bool,
         _vb: VarBuilder,
     ) -> Result<Self> {
+        let use_interpolated = sampling_rate != 22050;
+        let rand_ini = if causal {
+            let mut rng = rand::thread_rng();
+            let num = harmonic_num + 1;
+            let mut values = Vec::with_capacity(num);
+            for h in 0..num {
+                if h == 0 {
+                    values.push(0.0);
+                } else {
+                    values.push(rng.gen::<f32>());
+                }
+            }
+            Some(values)
+        } else {
+            None
+        };
         Ok(Self {
             harmonic_num,
             sine_amp,
             noise_std,
             sampling_rate: sampling_rate as f64,
             voiced_threshold,
+            upsample_scale: upsample_scale.max(1),
+            use_interpolated,
+            causal,
+            rand_ini,
         })
     }
 
@@ -96,42 +123,122 @@ impl SineGen {
         _phase_inject: Option<&Tensor>,
         noise_inject: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        // f0: [Batch, 1, Length]
-        let (b, _, l) = f0.dims3()?;
-
-        let f0_cpu = f0.to_device(&Device::Cpu)?;
+        // f0: [Batch, 1, Length] (or [Batch, Length, 1])
+        let f0_2d = if f0.dim(1)? == 1 {
+            f0.squeeze(1)?
+        } else if f0.dim(2)? == 1 {
+            f0.squeeze(2)?
+        } else {
+            return Err(candle_core::Error::Msg(
+                "SineGen expects f0 with a singleton channel dimension".into(),
+            ));
+        };
+        let (b, l) = f0_2d.dims2()?;
+        let f0_cpu = f0_2d.to_device(&Device::Cpu)?;
         let f0_vec = f0_cpu.flatten_all()?.to_vec1::<f32>()?;
 
-        // 2. Audio-rate Phase Integration (Cumsum)
         let num_harmonics = self.harmonic_num + 1;
-        let mut sine_waves_vec = Vec::with_capacity(b * num_harmonics * l);
+        let mut sine_waves_vec = vec![0f32; b * num_harmonics * l];
 
         let sampling_rate = self.sampling_rate as f32;
         let two_pi = 2.0 * std::f32::consts::PI;
         let sine_amp = self.sine_amp as f32;
 
-        for i in 0..b {
-            let offset_f0 = i * l;
-            for h in 0..num_harmonics {
-                let mult = (h + 1) as f32;
-                let mut running_phase = 0.0f32;
+        if self.use_interpolated {
+            if l % self.upsample_scale != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "SineGen2 expects length {} divisible by upsample_scale {}",
+                    l, self.upsample_scale
+                )));
+            }
+            let down_len = l / self.upsample_scale;
+            let scale = l as f32 / down_len as f32;
+            let mut rng = rand::thread_rng();
 
-                for t in 0..l {
-                    let current_f0 = f0_vec[offset_f0 + t];
-                    let phase_step = current_f0 * mult / sampling_rate;
-                    running_phase += phase_step;
-                    running_phase %= 1.0;
-                    let val = (running_phase * two_pi).sin() * sine_amp;
-                    sine_waves_vec.push(val);
+            for b_idx in 0..b {
+                let offset_f0 = b_idx * l;
+                for h in 0..num_harmonics {
+                    let mult = (h + 1) as f32;
+                    let mut rad_values = vec![0f32; l];
+                    for t in 0..l {
+                        let current_f0 = f0_vec[offset_f0 + t];
+                        let rad = (current_f0 * mult / sampling_rate).rem_euclid(1.0);
+                        rad_values[t] = rad;
+                    }
+
+                    let rand_ini = if self.causal {
+                        self.rand_ini
+                            .as_ref()
+                            .and_then(|vals| vals.get(h))
+                            .cloned()
+                            .unwrap_or(0.0)
+                    } else if h == 0 {
+                        0.0
+                    } else {
+                        rng.gen::<f32>()
+                    };
+                    if rand_ini != 0.0 {
+                        rad_values[0] += rand_ini;
+                    }
+
+                    let mut rad_down = vec![0f32; down_len];
+                    for out_idx in 0..down_len {
+                        let in_index = (out_idx as f32 + 0.5) * scale - 0.5;
+                        let i0 = in_index.floor();
+                        let i1 = i0 + 1.0;
+                        let w = in_index - i0;
+                        let idx0 = if i0 < 0.0 {
+                            0
+                        } else if i0 as usize >= l {
+                            l - 1
+                        } else {
+                            i0 as usize
+                        };
+                        let idx1 = if i1 < 0.0 {
+                            0
+                        } else if i1 as usize >= l {
+                            l - 1
+                        } else {
+                            i1 as usize
+                        };
+                        let v0 = rad_values[idx0];
+                        let v1 = rad_values[idx1];
+                        rad_down[out_idx] = v0 + (v1 - v0) * w;
+                    }
+
+                    let mut phase = 0f32;
+                    for down_idx in 0..down_len {
+                        phase += rad_down[down_idx];
+                        let phase_val = phase * two_pi * self.upsample_scale as f32;
+                        let start = down_idx * self.upsample_scale;
+                        for t in 0..self.upsample_scale {
+                            let idx = start + t;
+                            let dst = (b_idx * num_harmonics + h) * l + idx;
+                            sine_waves_vec[dst] = phase_val.sin() * sine_amp;
+                        }
+                    }
+                }
+            }
+        } else {
+            for b_idx in 0..b {
+                let offset_f0 = b_idx * l;
+                for h in 0..num_harmonics {
+                    let mult = (h + 1) as f32;
+                    let mut running_phase = 0.0f32;
+                    for t in 0..l {
+                        let current_f0 = f0_vec[offset_f0 + t];
+                        let phase_step = current_f0 * mult / sampling_rate;
+                        running_phase += phase_step;
+                        running_phase %= 1.0;
+                        let val = (running_phase * two_pi).sin() * sine_amp;
+                        let idx = (b_idx * num_harmonics + h) * l + t;
+                        sine_waves_vec[idx] = val;
+                    }
                 }
             }
         }
 
-        let sine_waves = Tensor::from_vec(
-            sine_waves_vec,
-            (b, num_harmonics, l),
-            f0.device()
-        )?;
+        let sine_waves = Tensor::from_vec(sine_waves_vec, (b, num_harmonics, l), f0.device())?;
 
         // 4. UV
         let uv = f0.gt(self.voiced_threshold as f64)?.to_dtype(DType::F32)?;
@@ -244,6 +351,8 @@ impl SourceModuleHnNSF {
         noise_std: f64,
         sampling_rate: usize,
         voiced_threshold: f32,
+        upsample_scale: usize,
+        causal: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
         let sine_gen = SineGen::new(
@@ -252,6 +361,8 @@ impl SourceModuleHnNSF {
             noise_std,
             sampling_rate,
             voiced_threshold,
+            upsample_scale,
+            causal,
             vb.clone(),
         )?;
         // l_linear: Linear(harmonic_num + 1, 1)
@@ -626,6 +737,8 @@ impl HiFTGenerator {
             vb.device(),
         )?;
 
+        let f0_upsamp_scale = ups_rates.iter().product::<usize>() * config.istft_params_hop_len;
+
         // Source
         let m_source = SourceModuleHnNSF::new(
             config.nb_harmonics,
@@ -633,6 +746,8 @@ impl HiFTGenerator {
             0.003,
             config.sampling_rate,
             config.voiced_threshold,
+            f0_upsamp_scale,
+            true,
             vb.pp("m_source"),
         )?;
 
@@ -651,7 +766,7 @@ impl HiFTGenerator {
             analysis_stft,
             m_source,
             f0_predictor,
-            f0_upsamp_scale: ups_rates.iter().product::<usize>() * config.istft_params_hop_len,
+            f0_upsamp_scale,
         })
     }
 
