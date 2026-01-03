@@ -18,6 +18,29 @@ cd "$PROJECT_ROOT"
 
 export COSYVOICE_MODEL_DIR="${COSYVOICE_MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B}"
 
+if [ "${COSYVOICE_ORT_USE_TRT:-0}" = "1" ]; then
+    TRT_LIB_DIR="${COSYVOICE_TRT_LIB_DIR:-}"
+    if [ -z "$TRT_LIB_DIR" ]; then
+        TRT_LIB_DIR="$(pixi run python - <<'PY' 2>/dev/null || true
+import os
+try:
+    import tensorrt_libs
+    print(os.path.dirname(tensorrt_libs.__file__))
+except Exception:
+    pass
+PY
+)"
+    fi
+    if [ -n "$TRT_LIB_DIR" ] && [ -d "$TRT_LIB_DIR" ]; then
+        case ":${LD_LIBRARY_PATH:-}:" in
+            *":$TRT_LIB_DIR:"*) ;;
+            *) export LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+        esac
+    else
+        echo "Warning: COSYVOICE_ORT_USE_TRT=1 but TensorRT libs not found."
+    fi
+fi
+
 if [ "$SERVER_TYPE" = "bridge" ]; then
     echo "Starting CosyVoice BRIDGE Server..."
     echo "  Model dir: $COSYVOICE_MODEL_DIR"
