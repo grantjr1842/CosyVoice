@@ -54,6 +54,8 @@ pixi run example
 pixi run webui
 ```
 
+> **Pixi is all you need**: this project expects every command to run through `pixi run`. Pixi installs Python, PyTorch, CUDA, and every dependency listed in `pyproject.toml`, so there is no need to install `pip` yourself or manage packages outside of Pixi’s environment. Stick to `pixi install`, `pixi run <script>`, and `pixi shell` for any tooling; that keeps the environment consistent and avoids conflicts.
+
 ### Alternative: Conda Installation
 
 If you prefer Conda, you can still use the traditional installation method:

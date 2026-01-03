@@ -18,40 +18,6 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 
-def patch_python_dit_rope(model):
-    """
-    Patch Python DiT to match Rust's 'only-rotate-head-0' behavior.
-    """
-    import x_transformers.x_transformers as x_t
-
-    _orig_apply_rotary_pos_emb = x_t.apply_rotary_pos_emb
-
-    def patched_apply_rotary_pos_emb(t, freqs, scale=1.0):
-        # t: [B, N, H*D]
-        # In CosyVoice DiT, query/key are [B, N, H*D] when passed here.
-        # Rust isolates head 0.
-        B, N, HD = t.shape
-        H = 16  # heads
-        D = 64  # dim_head
-
-        t_reshaped = t.view(B, N, H, D)
-        t_h0 = t_reshaped[:, :, 0:1, :]
-        t_h0_flat = t_h0.reshape(B, N, D)
-
-        if hasattr(freqs, "__iter__"):
-            freqs = freqs[0]  # Handle tuple if returned
-
-        t_h0_rot_flat = _orig_apply_rotary_pos_emb(t_h0_flat, freqs, scale)
-        t_h0_rot = t_h0_rot_flat.view(B, N, 1, D)
-
-        # Keep rest of heads unrotated
-        t_rest = t_reshaped[:, :, 1:, :]
-
-        return torch.cat([t_h0_rot, t_rest], dim=2).reshape(B, N, HD)
-
-    x_t.apply_rotary_pos_emb = patched_apply_rotary_pos_emb
-
-
 def verify():
     logging.basicConfig(level=logging.INFO)
     print("Initializing models...")
@@ -77,10 +43,6 @@ def verify():
         spk_dim=mel_dim,
     )
     dit_py.eval()
-
-    # Patch RoPE to match Rust's current implementation
-    print("Patching Python DiT RoPE behavior...")
-    patch_python_dit_rope(dit_py)
 
     # 2. Save weights and config for Rust
     model_dir = "pretrained_models/Fun-CosyVoice3-0.5B"

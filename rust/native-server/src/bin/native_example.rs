@@ -103,16 +103,30 @@ fn main() -> Result<()> {
         // Load to CPU first to avoid potential CUDA cast issues
         let tensors = candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
         if let Some(py_st) = tensors.get("python_speech_tokens") {
-            println!("Replacing prompt_speech_tokens: {:?} -> {:?}", prompt_speech_tokens.shape(), py_st.shape());
+            println!(
+                "Replacing prompt_speech_tokens: {:?} -> {:?}",
+                prompt_speech_tokens.shape(),
+                py_st.shape()
+            );
             // Cast on CPU then move to device
-            prompt_speech_tokens = py_st.to_dtype(candle_core::DType::U32)?.to_device(&device)?;
+            prompt_speech_tokens = py_st
+                .to_dtype(candle_core::DType::U32)?
+                .to_device(&device)?;
         }
         if let Some(py_se) = tensors.get("python_spk_emb") {
-            println!("Replacing speaker_embedding: {:?} -> {:?}", speaker_embedding.shape(), py_se.shape());
+            println!(
+                "Replacing speaker_embedding: {:?} -> {:?}",
+                speaker_embedding.shape(),
+                py_se.shape()
+            );
             speaker_embedding = py_se.to_device(&device)?;
         }
         if let Some(py_mel) = tensors.get("python_mel_24k") {
-            println!("Replacing prompt_speech_24k: {:?} -> {:?}", prompt_speech_24k.shape(), py_mel.shape());
+            println!(
+                "Replacing prompt_speech_24k: {:?} -> {:?}",
+                prompt_speech_24k.shape(),
+                py_mel.shape()
+            );
             prompt_speech_24k = py_mel.to_device(&device)?;
         }
     }

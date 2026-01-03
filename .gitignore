@@ -97,3 +97,21 @@ rust/server/check_*.py
 /python_hift_output.wav
 /tests/hift_parity/python_intermediates.safetensors
 /tests/python_hift_debug_audio.wav
+
+# Debug output files (agent-generated)
+output_*.txt
+rust/native-server/output_*.txt
+*.safetensors
+!pretrained_models/**/*.safetensors
+
+# Debug scripts (root level)
+/debug_scripts/capture_*.py
+/debug_scripts/trace_*.py
+/debug_scripts/inspect_*.py
+
+# Temporary markdown docs
+"Fixing Flow Mel Discrepancy.md"
+
+# Rust test binaries
+rust/native-server/src/bin/test_*_parity.rs
+rust/server/

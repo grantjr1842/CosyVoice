@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
@@ -24,10 +25,71 @@ def tensor_stats(t, name):
     )
 
 
+def compare_step_dumps(repo_root: Path):
+    py_path = repo_root / "py_flow_steps.safetensors"
+    rust_candidates = [
+        repo_root / "rust_flow_steps.safetensors",
+        repo_root / "rust" / "native-server" / "rust_flow_steps.safetensors",
+    ]
+    rust_path = next((path for path in rust_candidates if path.exists()), None)
+
+    if not py_path.exists():
+        print(f"Step dump comparison skipped: {py_path} not found.")
+        return
+    if rust_path is None:
+        print(
+            "Step dump comparison skipped: could not find "
+            f"{', '.join(str(p) for p in rust_candidates)}."
+        )
+        return
+
+    py_dump = load_file(py_path)
+    rust_dump = load_file(rust_path)
+
+    print("\n--- Step dump comparison (Python vs. Rust) ---")
+    diffs = []
+    for key in sorted(py_dump.keys()):
+        if key not in rust_dump:
+            print(f"    [missing] {key} missing in Rust dump.")
+            continue
+        py_tensor = py_dump[key].to(torch.float32).cpu()
+        rust_tensor = rust_dump[key].to(torch.float32).cpu()
+        if py_tensor.shape != rust_tensor.shape:
+            print(
+                f"    [shape mismatch] {key}: py={py_tensor.shape} vs rust={rust_tensor.shape}"
+            )
+            continue
+        diff = (py_tensor - rust_tensor).abs()
+        mae = diff.mean().item()
+        max_diff = diff.max().item()
+        diffs.append((key, mae, max_diff))
+        print(
+            f"    {key}: shape={py_tensor.shape}, MAE={mae:.6e}, max={max_diff:.6e}"
+        )
+
+    if not diffs:
+        print("    No matching tensors were compared across step dumps.")
+        return
+
+    avg_mae = sum(entry[1] for entry in diffs) / len(diffs)
+    worst_key = max(diffs, key=lambda entry: entry[2])
+    print(
+        f"    Step summary: avg MAE {avg_mae:.6e}, worst {worst_key[0]} max diff {worst_key[2]:.6e}"
+    )
+
+
 def main():
-    rust_dump_path = "rust/server/rust_flow_debug.safetensors"
-    if not os.path.exists(rust_dump_path):
-        print(f"Error: {rust_dump_path} not found.")
+    repo_root = Path(__file__).resolve().parents[1]
+    rust_candidates = [
+        repo_root / "rust" / "server" / "rust_flow_debug.safetensors",
+        repo_root / "rust" / "native-server" / "rust_flow_debug.safetensors",
+    ]
+    rust_dump_path = next((path for path in rust_candidates if path.exists()), None)
+    if rust_dump_path is None:
+        print(
+            "Error: could not find rust_flow_debug.safetensors at "
+            f"{', '.join(str(p) for p in rust_candidates)}"
+        )
         return
 
     print(f"Loading Rust dump from {rust_dump_path}...")
@@ -52,8 +114,8 @@ def main():
 
     # Load Python model
     print("\nLoading Python model...")
-    model_dir = "pretrained_models/Fun-CosyVoice3-0.5B"
-    with open(os.path.join(model_dir, "cosyvoice3.yaml")) as f:
+    model_dir = repo_root / "pretrained_models" / "Fun-CosyVoice3-0.5B"
+    with open(model_dir / "cosyvoice3.yaml") as f:
         configs = load_hyperpyyaml(f, overrides={"llm": None, "hift": None})
 
     decoder = configs["flow"].decoder
@@ -62,7 +124,7 @@ def main():
 
     # LOAD WEIGHTS!
     print("Loading weights from flow.safetensors...")
-    flow_weights = load_file(os.path.join(model_dir, "flow.safetensors"))
+    flow_weights = load_file(model_dir / "flow.safetensors")
     # The weights might be prefixed with "decoder." or similar if saved from higher level.
     # Check keys.
     # In CosyVoice implementation, `CosyVoiceFlow` has `decoder`.
@@ -152,6 +214,8 @@ def main():
     else:
         print("❌ Parity Failed!")
         # If failed, we might want to step debug.
+
+    compare_step_dumps(repo_root)
 
 
 if __name__ == "__main__":

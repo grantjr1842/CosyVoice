@@ -129,10 +129,15 @@ class ConditionalCFM(BASECFM):
             dphi_dt = self.forward_estimator(
                 x_in, mask_in, mu_in, t_in, spks_in, cond_in, streaming
             )
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
+            v1, v2 = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
+            print(
+                f"    [PY CFM DEBUG] v1 mean={v1.mean().item():.6f}, v2 mean={v2.mean().item():.6f}"
+            )
+
             dphi_dt = (
                 1.0 + self.inference_cfg_rate
-            ) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+            ) * v1 - self.inference_cfg_rate * v2
+            print(f"    [PY CFM DEBUG] v_cfg mean={dphi_dt.mean().item():.6f}")
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)
