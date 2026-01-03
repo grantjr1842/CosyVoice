@@ -14,6 +14,7 @@ use crate::flow::FlowConfig;
 use crate::hift::{HiFTConfig, HiFTGenerator};
 use crate::onnx_frontend::OnnxFrontend;
 use crate::qwen::Config as QwenConfig;
+use crate::audio::normalize_audio;
 
 #[derive(Error, Debug)]
 pub enum NativeTtsError {
@@ -270,10 +271,16 @@ impl NativeTtsEngine {
             );
         }
 
-        // DC Removal & Conversion
+        // DC Removal
+        let mut audio_vec: Vec<f32> = audio_vec.into_iter().map(|x| x - mean_val).collect();
+
+        // Normalization (Fix Gain Issue)
+        normalize_audio(&mut audio_vec, 0.95);
+
+        // Conversion
         let samples: Vec<i16> = audio_vec
             .iter()
-            .map(|&x: &f32| ((x - mean_val) * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .map(|&x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect();
 
         eprintln!("=== END SYNTHESIS DEBUG ===\n");
@@ -338,9 +345,15 @@ impl NativeTtsEngine {
             );
         }
 
+        // DC Removal
+        let mut audio_vec: Vec<f32> = audio_vec.into_iter().map(|x| x - mean_val).collect();
+
+        // Normalization (Fix Gain Issue)
+        normalize_audio(&mut audio_vec, 0.95);
+
         let samples: Vec<i16> = audio_vec
             .iter()
-            .map(|&x: &f32| ((x - mean_val) * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .map(|&x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect();
 
         eprintln!("=== END SYNTHESIS FROM MEL DEBUG ===\n");

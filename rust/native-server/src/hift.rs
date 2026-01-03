@@ -22,6 +22,12 @@ impl Snake {
         } else {
             vb.get((1, channels, 1), "alpha")?
         };
+        if let Ok(flat) = alpha.flatten_all() {
+            let mean = flat.mean(0)?.to_scalar::<f32>()?;
+            let min = flat.min(0)?.to_scalar::<f32>()?;
+            let max = flat.max(0)?.to_scalar::<f32>()?;
+            eprintln!("    [Snake] New alpha: mean={:.4e}, min={:.4e}, max={:.4e}", mean, min, max);
+        }
         Ok(Self { alpha })
     }
 }
@@ -31,7 +37,11 @@ impl Module for Snake {
         // xs: [Batch, Channels, Time]
         // alpha: [1, Channels, 1]
         let norm = &self.alpha;
-        let one_over_norm = (norm.recip())?;
+        // Add epsilon to avoid division by zero / explosion
+        let epsilon = 1e-9;
+        let norm_safe = (norm + epsilon)?;
+        let one_over_norm = (norm_safe.recip())?;
+
         let scaled_x = xs.broadcast_mul(norm)?;
         let sin_sq = scaled_x.sin()?.sqr()?;
 
@@ -167,20 +177,26 @@ fn load_conv1d(
         let g = vb.get((out_c, 1, 1), "weight_g")?;
         let v = vb.get((out_c, in_c, k), "weight_v")?;
         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-        let scale = (g / norm_v)?;
-        v.broadcast_mul(&scale)?
+        let scale = (g.clone() / norm_v)?;
+        let w = v.broadcast_mul(&scale)?;
+        if let Ok(flat) = g.flatten_all() {
+             let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+             eprintln!("    [Conv] weight_g max={:.4e} (shape [{},{},{}])", max, out_c, in_c, k);
+        }
+        w
     } else if vb.contains_tensor("weight.original0") {
         let g = vb.get((out_c, 1, 1), "weight.original0")?;
+        // ... (similar logging could go here but weight_g is main case)
         let v = vb.get((out_c, in_c, k), "weight.original1")?;
         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
         let scale = (g / norm_v)?;
         v.broadcast_mul(&scale)?
     } else if vb.contains_tensor("parametrizations.weight.original0") {
-        let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
-        let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
-        let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-        let scale = (g / norm_v)?;
-        v.broadcast_mul(&scale)?
+         let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
+         let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
+         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+         let scale = (g / norm_v)?;
+         v.broadcast_mul(&scale)?
     } else {
         vb.get((out_c, in_c, k), "weight")?
     };
@@ -188,6 +204,7 @@ fn load_conv1d(
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get(out_c, "bias")?)
     } else {
+        eprintln!("    [Conv] WARNING: Bias NOT found for path: {}", vb.prefix());
         None
     };
 
@@ -270,6 +287,10 @@ pub struct ResBlock {
     convs2: Vec<Conv1d>,
     acti1: Vec<Snake>,
     acti2: Vec<Snake>,
+    // Causal support
+    pads1: Vec<usize>,
+    pads2: Vec<usize>,
+    causal: bool,
 }
 
 impl ResBlock {
@@ -278,11 +299,14 @@ impl ResBlock {
         kernel_size: usize,
         dilations: &[usize],
         vb: VarBuilder,
+        causal: bool,
     ) -> Result<Self> {
         let mut convs1 = Vec::new();
         let mut convs2 = Vec::new();
         let mut acti1 = Vec::new();
         let mut acti2 = Vec::new();
+        let mut pads1 = Vec::new();
+        let mut pads2 = Vec::new();
 
         let vb_c1 = vb.pp("convs1");
         let vb_c2 = vb.pp("convs2");
@@ -290,13 +314,25 @@ impl ResBlock {
         let vb_a2 = vb.pp("activations2");
 
         for (i, &dil) in dilations.iter().enumerate() {
-            let pad1 = get_padding(kernel_size, dil);
-            // convs1[i]
+            // convs1
+            let (pad1, manual_pad1) = if causal {
+                (0, (kernel_size - 1) * dil) // Left pad manual
+            } else {
+                (get_padding(kernel_size, dil), 0) // Central pad automatic
+            };
+            pads1.push(manual_pad1);
+
             let c1 = load_conv1d(vb_c1.pp(i), channels, channels, kernel_size, 1, dil, pad1)?;
             convs1.push(c1);
 
-            let pad2 = get_padding(kernel_size, 1);
-            // convs2[i]
+            // convs2 (dil=1)
+             let (pad2, manual_pad2) = if causal {
+                (0, kernel_size - 1) // Left pad manual
+            } else {
+                (get_padding(kernel_size, 1), 0) // Central pad automatic
+            };
+            pads2.push(manual_pad2);
+
             let c2 = load_conv1d(vb_c2.pp(i), channels, channels, kernel_size, 1, 1, pad2)?;
             convs2.push(c2);
 
@@ -310,6 +346,9 @@ impl ResBlock {
             convs2,
             acti1,
             acti2,
+            pads1,
+            pads2,
+            causal,
         })
     }
 }
@@ -318,10 +357,17 @@ impl Module for ResBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut x = xs.clone();
         for i in 0..self.convs1.len() {
-            let xt = self.acti1[i].forward(&x)?;
-            let xt = self.convs1[i].forward(&xt)?;
-            let xt = self.acti2[i].forward(&xt)?;
-            let xt = self.convs2[i].forward(&xt)?;
+            let mut xt = self.acti1[i].forward(&x)?;
+            if self.causal {
+                xt = xt.pad_with_zeros(2, self.pads1[i], 0)?;
+            }
+            xt = self.convs1[i].forward(&xt)?;
+
+            xt = self.acti2[i].forward(&xt)?;
+            if self.causal {
+                xt = xt.pad_with_zeros(2, self.pads2[i], 0)?;
+            }
+            xt = self.convs2[i].forward(&xt)?;
             x = (x + xt)?;
         }
         Ok(x)
@@ -493,6 +539,7 @@ pub struct HiFTGenerator {
     ups: Vec<Conv1d>,
     ups_rates: Vec<usize>,
     source_downs: Vec<Conv1d>,
+    source_down_pads: Vec<usize>, // Manual padding for causal source_downs
     source_resblocks: Vec<ResBlock>,
     resblocks: Vec<ResBlock>,
     conv_post: Conv1d,
@@ -502,6 +549,7 @@ pub struct HiFTGenerator {
     f0_upsamp_scale: usize,
     num_kernels: usize,
     m_source: SourceModuleHnNSF,
+    is_causal: bool, // Flag to indicate if the model uses causal convolutions
 }
 
 impl HiFTGenerator {
@@ -510,17 +558,22 @@ impl HiFTGenerator {
         let ups_kernels = &config.upsample_kernel_sizes;
         let base_ch = config.base_channels;
 
-        // Conv Pre
-        // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
-        let conv_pre_k = if vb.pp("conv_pre").contains_tensor("weight.original1")
+        // Determine if causal
+        let is_causal = if vb.pp("conv_pre").contains_tensor("weight.original1")
             || vb
                 .pp("conv_pre")
                 .contains_tensor("parametrizations.weight.original1")
         {
-            5
+            true
         } else {
-            13
+            false
         };
+        eprintln!("    [HiFT] is_causal: {}", is_causal);
+
+        // Conv Pre
+        // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
+        let conv_pre_k = if is_causal { 5 } else { 13 };
+        let conv_pre_pad = if is_causal { 0 } else { conv_pre_k / 2 }; // If causal, padding is handled manually
         let conv_pre = load_conv1d(
             vb.pp("conv_pre"),
             config.in_channels,
@@ -528,7 +581,7 @@ impl HiFTGenerator {
             conv_pre_k,
             1,
             1,
-            conv_pre_k / 2,
+            conv_pre_pad,
         )?;
 
         // Ups
@@ -538,27 +591,20 @@ impl HiFTGenerator {
             let in_c = base_ch / (1 << i);
             let out_c = base_ch / (1 << (i + 1));
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
-            let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, 0)?;
+            // If causal, padding is 0, manual padding k-1
+            let conv_pad = if is_causal { 0 } else { 0 }; // Upsample convs typically have 0 padding, manual padding for causal
+            let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, conv_pad)?;
             ups.push(conv);
         }
 
         // Source Downs & ResBlocks
         let mut source_downs = Vec::new();
+        let mut source_down_pads = Vec::new();
         let mut source_resblocks = Vec::new();
         let vb_sd = vb.pp("source_downs");
         let vb_sr = vb.pp("source_resblocks");
 
         // Downsample rates construction
-        // downsample_rates = [1] + upsample_rates[::-1][:-1]
-        // downsample_cum_rates logic:
-        // i=0: 1. i=1: 8. i=2: 64...
-        // Iterating logic matches len(ups).
-        // Let's assume standard HiFT logic:
-        // For i in 0..len(ups):
-        //   u = cum_rates[len-1-i]
-        //   kernel/dilation from lists
-
-        // Replicating generator.py logic:
         // downsample_rates = [1] + upsample_rates[::-1][:-1]
         // cum = cumprod(downsample_rates)
         // iter over zip(cum[::-1], k_list, d_list)
@@ -587,15 +633,24 @@ impl HiFTGenerator {
             let in_ch = config.istft_params_n_fft + 2; // nfft+2 channels source
 
             // source_down
-            let sd = if u == 1 {
-                load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, 0)?
+            let (sd_pad, sd_manual_pad) = if is_causal {
+                // If u=1: K=1. Pad=0. Manual=0.
+                // If u>1: K=u*2. Stride=u. Causal Pad = Stride-1 = u-1.
+                if u == 1 { (0, 0) } else { (0, u - 1) }
             } else {
-                load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, u / 2)?
+                 if u == 1 { (0, 0) } else { (u/2, 0) } // Standard logic line 593: u/2
+            };
+            source_down_pads.push(sd_manual_pad);
+
+            let sd = if u == 1 {
+                load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, sd_pad)?
+            } else {
+                load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, sd_pad)?
             };
             source_downs.push(sd);
 
             // source_resblock
-            let sb = ResBlock::new(ch, k, d, vb_sr.pp(i))?;
+            let sb = ResBlock::new(ch, k, d, vb_sr.pp(i), is_causal)?;
             source_resblocks.push(sb);
         }
 
@@ -615,21 +670,23 @@ impl HiFTGenerator {
                 .enumerate()
             {
                 let idx = i * num_kernels + j;
-                let rb = ResBlock::new(ch, k, d, vb_rb.pp(idx))?;
+                let rb = ResBlock::new(ch, k, d, vb_rb.pp(idx), is_causal)?;
                 resblocks.push(rb);
             }
         }
 
         // Post
         let last_ch = base_ch / (1 << num_ups);
+        let conv_post_k = 7;
+        let conv_post_pad = if is_causal { 0 } else { 3 };
         let conv_post = load_conv1d(
             vb.pp("conv_post"),
             last_ch,
             config.istft_params_n_fft + 2,
-            7,
+            conv_post_k,
             1,
             1,
-            3,
+            conv_post_pad,
         )?;
 
         let stft = crate::utils::InverseStftModule::new(
@@ -663,6 +720,7 @@ impl HiFTGenerator {
             ups_rates: ups_rates.clone(),
             resblocks,
             source_downs,
+            source_down_pads,
             source_resblocks,
             num_kernels,
             conv_post,
@@ -671,6 +729,7 @@ impl HiFTGenerator {
             m_source,
             f0_predictor,
             f0_upsamp_scale: ups_rates.iter().product::<usize>() * config.istft_params_hop_len,
+            is_causal,
         })
     }
 
@@ -775,17 +834,29 @@ impl HiFTGenerator {
     }
 
     fn decode(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
-        // s STFT logic for fusion
-        // s: [Batch, 1, Time]
-        // We need STFT of s.
-        // Wait, self.stft is INVERSE. We need ANALYSIS STFT.
-        // I need to add `analysis_stft` to struct.
-        // For now, let's assume I added it.
-        let (s_real, s_imag) = self.analysis_stft.transform(s)?; // [Batch, Freq, Frames]
+        // s is `source` (excitation signal) [B, 1, T]
+        // Compute STFT [B, Freq, T_frame]
+        // analysis_stft outputs (real, imag)
+        let (s_real, s_imag) = self.analysis_stft.transform(s)?;
         let s_stft = Tensor::cat(&[&s_real, &s_imag], 1)?; // [Batch, 2*Freq, Frames]
 
-        // x (mel): [Batch, 80, Length]
-        let mut x = self.conv_pre.forward(x)?;
+        let mut x = x.clone();
+
+        // conv_pre
+        if self.is_causal {
+            // Right Pad (Lookahead)
+            // K is usually 5 for CV3.
+            let k = self.conv_pre.weight().dims()[2];
+            let pad = k - 1;
+            x = x.pad_with_zeros(2, 0, pad)?;
+        }
+        x = self.conv_pre.forward(&x)?;
+
+        // Debug conv_pre
+        if let Ok(flat) = x.flatten_all() {
+            let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+            eprintln!("    [decode] conv_pre output: abs_max={:.4}", max);
+        }
 
         let num_ups = self.ups.len();
 
@@ -800,22 +871,49 @@ impl HiFTGenerator {
                 .repeat((1, 1, 1, u))?
                 .reshape((b, c, l * u))?;
 
-            // Causal Padding k-1
-            let k = self.ups[i].weight().dim(2)?;
-            x = x.pad_with_zeros(2, k - 1, 0)?;
+            // Causal Up Conv: Pad Left K-1
+            if self.is_causal {
+                 let k = self.ups[i].weight().dims()[2];
+                 let pad = k - 1;
+                 x = x.pad_with_zeros(2, pad, 0)?;
+            }
             x = self.ups[i].forward(&x)?;
 
             // Reflection-like padding at the end?
             // CausalHiFTGenerator.py: self.reflection_pad = nn.ReflectionPad1d((1, 0))
-            if i == num_ups - 1 {
-                let left = x.i((.., .., 1..2))?;
-                x = Tensor::cat(&[&left, &x], 2)?;
+            if self.is_causal && i == num_ups - 1 {
+                 // Pad Left 1. Value = x[1].
+                 // Use narrow/slice.
+                 let left = x.i((.., .., 1..2))?;
+                 x = Tensor::cat(&[&left, &x], 2)?;
+            }
+
+            // Debug Ups output
+            if let Ok(flat) = x.flatten_all() {
+                let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+                eprintln!("    [decode] Loop {} Ups output: abs_max={:.4}", i, max);
             }
 
             // Fusion
-            // si = source_downs[i](s_stft)
-            let si = self.source_downs[i].forward(&s_stft)?;
-            let si = self.source_resblocks[i].forward(&si)?;
+            // Channels: ups[i] -> 256, 128, 64.
+            // source_downs[i] -> 256, 128, 64.
+            // So we must use idx = i.
+            let idx = i;
+
+            // source_downs
+            let mut si_in = s_stft.clone();
+            if self.is_causal {
+                 let pad = self.source_down_pads[idx];
+                 si_in = si_in.pad_with_zeros(2, pad, 0)?;
+            }
+            let si = self.source_downs[idx].forward(&si_in)?;
+            let si = self.source_resblocks[idx].forward(&si)?;
+
+            // Debug SI output
+            if let Ok(flat) = si.flatten_all() {
+                let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+                eprintln!("    [decode] Loop {} SI output: abs_max={:.4}", i, max);
+            }
 
             // Robust slice to handle boundary effects
             let x_len = x.dim(2)?;
@@ -823,7 +921,7 @@ impl HiFTGenerator {
             let common_len = x_len.min(si_len);
             let x_slice = x.i((.., .., ..common_len))?;
             let si_slice = si.i((.., .., ..common_len))?;
-            x = (x_slice + si_slice)?;
+            x = x_slice.add(&si_slice)?;
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
@@ -838,10 +936,27 @@ impl HiFTGenerator {
             if let Some(val) = xs {
                 x = (val / (self.num_kernels as f64))?;
             }
+
+            // Debug Loop Stats
+            if let Ok(flat) = x.flatten_all() {
+                 if let Ok(vec) = flat.mean(0) {
+                      let mean = vec.to_scalar::<f32>()?;
+                      let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+                      eprintln!("    [decode] Loop {} End: mean={:.4}, abs_max={:.4}", i, mean, max);
+                 }
+            }
         }
 
         x = candle_nn::ops::leaky_relu(&x, 0.1)?; // Default slope
-        x = self.conv_post.forward(&x)?;
+
+        if self.is_causal {
+             // Conv Post K=7. Pad Left 6.
+             // (K from weight)
+             let k = self.conv_post.weight().dims()[2];
+             let pad = k - 1;
+             x = x.pad_with_zeros(2, pad, 0)?;
+        }
+        let x = self.conv_post.forward(&x)?;
 
         // ISTFT Input: [B, n_fft+2, T]
         // Magnitude = exp(x[:, :mid])

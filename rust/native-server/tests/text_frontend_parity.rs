@@ -15,7 +15,8 @@ struct PyOutput {
 
 fn run_python(text: &str, tokenizer_path: &str, split: bool) -> Result<PyOutput> {
     let mut child = Command::new("pixi")
-        .args(["run", "python", "tools/text_normalize_parity.py"])
+        .args(["run", "python", "../../tools/text_normalize_parity.py"])
+        .env("PYTHONPATH", "../../")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

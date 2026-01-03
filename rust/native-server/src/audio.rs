@@ -721,6 +721,7 @@ pub fn normalize_audio(samples: &mut [f32], target_peak: f32) -> f32 {
 
     // Calculate and apply gain
     let gain = target_peak / current_peak;
+    println!("normalize_audio: current_peak={:.6}, target_peak={:.6}, gain={:.6}", current_peak, target_peak, gain);
     for sample in samples.iter_mut() {
         *sample *= gain;
     }

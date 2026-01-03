@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     let mut prompt_speech_24k =
         audio::mel_spectrogram(&prompt_24k, &MelConfig::cosyvoice3(), &device)?;
 
-    let (mut prompt_speech_tokens, speaker_embedding) =
+    let (mut prompt_speech_tokens, mut speaker_embedding) =
         engine.process_prompt_tensors(&prompt_speech_16k, &prompt_fbank)?;
 
     // Align prompt mel length with prompt token length (token_mel_ratio = 2)
@@ -97,6 +97,26 @@ fn main() -> Result<()> {
     prompt_speech_24k = prompt_speech_24k.narrow(2, 0, aligned_token_len * 2)?;
     prompt_speech_tokens = prompt_speech_tokens.narrow(1, 0, aligned_token_len)?;
 
+    // DEBUG: Load python artifacts if available to verify parity
+    if std::path::Path::new("debug_artifacts.safetensors").exists() {
+        println!("\n*** LOADING DEBUG ARTIFACTS FROM PYTHON ***");
+        // Load to CPU first to avoid potential CUDA cast issues
+        let tensors = candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
+        if let Some(py_st) = tensors.get("python_speech_tokens") {
+            println!("Replacing prompt_speech_tokens: {:?} -> {:?}", prompt_speech_tokens.shape(), py_st.shape());
+            // Cast on CPU then move to device
+            prompt_speech_tokens = py_st.to_dtype(candle_core::DType::U32)?.to_device(&device)?;
+        }
+        if let Some(py_se) = tensors.get("python_spk_emb") {
+            println!("Replacing speaker_embedding: {:?} -> {:?}", speaker_embedding.shape(), py_se.shape());
+            speaker_embedding = py_se.to_device(&device)?;
+        }
+        if let Some(py_mel) = tensors.get("python_mel_24k") {
+            println!("Replacing prompt_speech_24k: {:?} -> {:?}", prompt_speech_24k.shape(), py_mel.shape());
+            prompt_speech_24k = py_mel.to_device(&device)?;
+        }
+    }
+
     let texts = [
         "Hello! I am an AI voice assistant powered by Fun-CosyVoice3. How may I help you today?",
         "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet.",
@@ -104,6 +124,7 @@ fn main() -> Result<()> {
 
     let output_dir = repo_root.join("output");
     fs::create_dir_all(&output_dir)?;
+    println!("Output directory: {:?}", output_dir);
 
     let full_prompt_text = format!("{}{}", PROMPT_PREFIX, DEFAULT_PROMPT_TEXT);
     let prompt_texts = text_normalize_english(&full_prompt_text, &tokenizer, false, true)?;
