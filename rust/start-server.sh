@@ -16,6 +16,22 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$PROJECT_ROOT/.env"
+    set +a
+fi
+
+if [ -n "${LD_LIBRARY_PATH_EXTRA:-}" ]; then
+    # Ensure the server uses pixi's libpython and other env libs by default.
+    LD_LIBRARY_PATH_EXTRA_ABS="$PROJECT_ROOT/${LD_LIBRARY_PATH_EXTRA}"
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":$LD_LIBRARY_PATH_EXTRA_ABS:"*) ;;
+        *) export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_EXTRA_ABS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+fi
+
 export COSYVOICE_MODEL_DIR="${COSYVOICE_MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B}"
 
 if [ "${COSYVOICE_ORT_USE_TRT:-0}" = "1" ]; then
