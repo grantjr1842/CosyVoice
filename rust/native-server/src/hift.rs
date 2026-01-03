@@ -472,6 +472,24 @@ impl F0Predictor {
         // Classifier
         let classifier = candle_nn::linear(cond_channels, 1, vb.pp("classifier"))?;
 
+        // Debug classifier weights
+        let w = classifier.weight();
+        if let Ok(flat) = w.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                let std = (vec.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32).sqrt();
+                eprintln!("    [F0Predictor] Classifier weight: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+                    w.shape(), mean, std, min, max);
+            }
+        }
+        if let Some(bias) = classifier.bias() {
+            if let Ok(val) = bias.to_scalar::<f32>() {
+                eprintln!("    [F0Predictor] Classifier bias: {:.6}", val);
+            }
+        }
+
         Ok(Self {
             condnet,
             classifier,
@@ -484,6 +502,16 @@ impl F0Predictor {
 
         let mut h = x.clone();
         for (i, conv) in self.condnet.iter().enumerate() {
+            // Debug input to this layer
+            if let Ok(flat) = h.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                    eprintln!("    Layer {} INPUT: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                }
+            }
+
             if i == 0 {
                 // F0 predictor in CosyVoice3.0 uses kernel 4, causal type 'right'
                 // This means pad 3 on RIGHT.
@@ -493,7 +521,19 @@ impl F0Predictor {
                 // This means pad 2 on LEFT.
                 h = h.pad_with_zeros(2, 2, 0)?;
             }
+
             h = conv.forward(&h)?;
+
+            // Debug after conv, before ELU
+            if let Ok(flat) = h.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                    eprintln!("    Layer {} AFTER CONV: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                }
+            }
+
             h = h.elu(1.0)?; // ELU
 
             // Debug each layer
