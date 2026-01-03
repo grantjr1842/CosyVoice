@@ -216,6 +216,14 @@ cargo build --release
 
 The server will automatically configure its environment (including `LD_LIBRARY_PATH` and Python setup) on startup.
 
+#### TensorRT (Optional)
+
+TensorRT providers are only enabled when `COSYVOICE_ORT_USE_TRT=1` is set.
+If your TensorRT libs are not on the default linker path, set
+`COSYVOICE_TRT_LIB_DIR` to the directory containing `libnvinfer.so.*` or ensure
+`LD_LIBRARY_PATH` includes it. The `rust/start-server.sh` script will try to
+discover pixi-installed TensorRT libs automatically when the flag is enabled.
+
 ### Docker Deployment
 
 ```bash
