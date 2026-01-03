@@ -65,14 +65,34 @@ impl MelConfig {
     }
 }
 
-/// Convert frequency in Hz to mel scale.
+/// Convert frequency in Hz to mel scale (Slaney).
 fn hz_to_mel(freq: f64) -> f64 {
-    2595.0 * (1.0 + freq / 700.0).log10()
+    let min_log_hz = 1000.0;
+    let min_log_mel = 15.0;
+    let log_step = (6.4f64).ln() / 27.0; // ~0.06875
+
+    if freq < min_log_hz {
+        // Linear part: freq / (200.0 / 3.0)
+        freq / (200.0 / 3.0)
+    } else {
+        // Log part
+        min_log_mel + (freq / min_log_hz).ln() / log_step
+    }
 }
 
-/// Convert mel scale to frequency in Hz.
+/// Convert mel scale to frequency in Hz (Slaney).
 fn mel_to_hz(mel: f64) -> f64 {
-    700.0 * (10.0_f64.powf(mel / 2595.0) - 1.0)
+    let min_log_hz = 1000.0;
+    let min_log_mel = 15.0;
+    let log_step = (6.4f64).ln() / 27.0;
+
+    if mel < min_log_mel {
+        // Linear part
+        mel * (200.0 / 3.0)
+    } else {
+        // Log part
+        min_log_hz * (log_step * (mel - min_log_mel)).exp()
+    }
 }
 
 /// Create mel filterbank matrix.
@@ -114,6 +134,17 @@ pub fn create_mel_filterbank(config: &MelConfig) -> Array2<f32> {
             } else if k_f >= f_m && k_f <= f_m_plus {
                 filterbank[[m, k]] = ((f_m_plus - k_f) / (f_m_plus - f_m)) as f32;
             }
+        }
+
+        // Slaney-style area normalization: divide by width of the band in Hz
+        // Factor = 2.0 / (f_m_plus - f_m_minus)
+        let width = f_m_plus - f_m_minus;
+        let norm_factor = 2.0 / width;
+        if m == 0 {
+            eprintln!("[Audio] Mel band 0: width={:.4} Hz, norm_factor={:.6}", width, norm_factor);
+        }
+        for k in 0..n_fft_bins {
+            filterbank[[m, k]] *= norm_factor as f32;
         }
     }
 
@@ -721,7 +752,10 @@ pub fn normalize_audio(samples: &mut [f32], target_peak: f32) -> f32 {
 
     // Calculate and apply gain
     let gain = target_peak / current_peak;
-    println!("normalize_audio: current_peak={:.6}, target_peak={:.6}, gain={:.6}", current_peak, target_peak, gain);
+    println!(
+        "normalize_audio: current_peak={:.6}, target_peak={:.6}, gain={:.6}",
+        current_peak, target_peak, gain
+    );
     for sample in samples.iter_mut() {
         *sample *= gain;
     }

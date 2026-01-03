@@ -11,9 +11,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = repo_root.join("pretrained_models/Fun-CosyVoice3-0.5B");
 
     // Initialize Device
-    // Try CUDA if available, else CPU
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
-    println!("Using device: {:?}", device);
+    let device = Device::Cpu;
+    /*
+    let device = if candle_core::utils::cuda_is_available() {
+        Device::new_cuda(0)?
+    } else {
+        Device::Cpu
+    };
+    */println!("Using device: {:?}", device);
 
     // Load Engine
     println!("Loading NativeTtsEngine...");
@@ -21,17 +26,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Engine loaded.");
 
     // Load Debug Artifacts
-    let artifact_path = "debug_artifacts.safetensors";
-    if !Path::new(artifact_path).exists() {
-        return Err(format!("Artifact file not found: {}", artifact_path).into());
+    let artifact_path = repo_root.join("debug_artifacts.safetensors");
+    if !artifact_path.exists() {
+        return Err(format!("Artifact file not found: {:?}", artifact_path).into());
     }
 
-    println!("Loading artifacts from: {}", artifact_path);
+    println!("Loading artifacts from: {:?}", artifact_path);
     // Load to CPU first
     let tensors = candle_core::safetensors::load(artifact_path, &Device::Cpu)?;
+    println!("Loaded {} tensors. Keys: {:?}", tensors.len(), tensors.keys().collect::<Vec<_>>());
 
     // Get flow output (Mel)
-    let mel = tensors.get("python_flow_output")
+    let mel = tensors
+        .get("python_flow_output")
         .ok_or("python_flow_output not found in artifacts")?;
 
     println!("Loaded Mel shape: {:?}", mel.shape());
@@ -42,16 +49,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run Synthesis (HiFT only)
     // Load python_f0 if available
     if let Some(py_f0) = tensors.get("python_f0") {
-         eprintln!("Loaded python_f0 shape: {:?}", py_f0.shape());
-         if let Ok(flat) = py_f0.flatten_all() {
+        eprintln!("Loaded python_f0 shape: {:?}", py_f0.shape());
+        if let Ok(flat) = py_f0.flatten_all() {
             if let Ok(vec) = flat.to_vec1::<f32>() {
-                 let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                 let sum: f32 = vec.iter().sum();
-                 let mean = sum / vec.len() as f32;
-                 eprintln!("    python_f0 stats: min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz", min, max, mean);
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    python_f0 stats: min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz",
+                    min, max, mean
+                );
             }
-         }
+        }
+    }
+
+    if let Some(py_source) = tensors.get("python_hift_source") {
+        eprintln!("Loaded python_hift_source shape: {:?}, dtype: {:?}", py_source.shape(), py_source.dtype());
+        let py_source = py_source.to_dtype(candle_core::DType::F32).unwrap_or(py_source.clone());
+        if let Ok(flat) = py_source.flatten_all() {
+             if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    python_hift_source stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
+            }
+        }
+    }
+
+    if let Some(py_conv_pre) = tensors.get("python_conv_pre") {
+        eprintln!("Loaded python_conv_pre shape: {:?}, dtype: {:?}", py_conv_pre.shape(), py_conv_pre.dtype());
+        let py_conv_pre = py_conv_pre.to_dtype(candle_core::DType::F32).unwrap_or(py_conv_pre.clone());
+        if let Ok(flat) = py_conv_pre.flatten_all() {
+             if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    python_conv_pre stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
+            }
+        }
+    }
+
+    if let Some(py_ups0) = tensors.get("python_ups_0") {
+        eprintln!("Loaded python_ups_0 shape: {:?}, dtype: {:?}", py_ups0.shape(), py_ups0.dtype());
+        let py_ups0 = py_ups0.to_dtype(candle_core::DType::F32).unwrap_or(py_ups0.clone());
+        if let Ok(flat) = py_ups0.flatten_all() {
+             if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    python_ups_0 stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
+            }
+        }
+    }
+
+    if let Some(py_l0) = tensors.get("python_loop_0_output") {
+        eprintln!("Loaded python_loop_0_output shape: {:?}, dtype: {:?}", py_l0.shape(), py_l0.dtype());
+        let py_l0 = py_l0.to_dtype(candle_core::DType::F32).unwrap_or(py_l0.clone());
+        if let Ok(flat) = py_l0.flatten_all() {
+             if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    python_loop_0_output stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
+            }
+        }
+    }
+
+    if let Some(py_ups1) = tensors.get("python_ups_1") {
+        eprintln!("Loaded python_ups_1 shape: {:?}, dtype: {:?}", py_ups1.shape(), py_ups1.dtype());
+        let py_ups1 = py_ups1.to_dtype(candle_core::DType::F32).unwrap_or(py_ups1.clone());
+        if let Ok(flat) = py_ups1.flatten_all() {
+             if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    python_ups_1 stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
+            }
+        }
     }
 
     println!("\nRunning synthesize_from_mel...");

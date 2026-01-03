@@ -43,7 +43,7 @@ tokenizers = "0.20"
 rubato = "0.16"
 
 [features]
-default = []
+default = ["cuda"]
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",

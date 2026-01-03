@@ -8,13 +8,13 @@ use candle_nn::VarBuilder;
 use std::path::PathBuf;
 use thiserror::Error;
 
+use crate::audio::normalize_audio;
 use crate::cosyvoice_flow::{CosyVoiceFlow, CosyVoiceFlowConfig};
 use crate::cosyvoice_llm::{CosyVoiceLLM, CosyVoiceLLMConfig};
 use crate::flow::FlowConfig;
 use crate::hift::{HiFTConfig, HiFTGenerator};
 use crate::onnx_frontend::OnnxFrontend;
 use crate::qwen::Config as QwenConfig;
-use crate::audio::normalize_audio;
 
 #[derive(Error, Debug)]
 pub enum NativeTtsError {

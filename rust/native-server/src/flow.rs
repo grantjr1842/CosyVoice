@@ -6,6 +6,28 @@ const _FORCE_REBUILD: u32 = 1;
 
 use serde::Deserialize;
 
+fn log_v_stats(name: &str, t: &Tensor) -> Result<()> {
+    let t = if t.dtype() != DType::F32 {
+        t.to_dtype(DType::F32)?
+    } else {
+        t.clone()
+    };
+    let flat = t.flatten_all()?;
+    let vec = flat.to_vec1::<f32>()?;
+    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+    eprintln!(
+        "    [V DEBUG] {} stats: min={:.6}, max={:.6}, mean={:.6}, first 5={:?}",
+        name,
+        min,
+        max,
+        mean,
+        &vec[0..usize::min(vec.len(), 5)]
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlowConfig {
     pub dim: usize,
@@ -13,16 +35,24 @@ pub struct FlowConfig {
     pub heads: usize,
     pub dim_head: usize,
     pub mel_dim: usize,
+    pub mu_dim: usize,
+    pub spk_dim: usize,
+    pub static_chunk_size: usize,
+    pub num_decoding_left_chunks: isize,
 }
 
 impl Default for FlowConfig {
     fn default() -> Self {
         Self {
             dim: 1024,
-            depth: 2,
+            depth: 22,
             heads: 16,
             dim_head: 64,
             mel_dim: 80,
+            mu_dim: 80,
+            spk_dim: 80,
+            static_chunk_size: 50,
+            num_decoding_left_chunks: -1,
         }
     }
 }
@@ -170,7 +200,8 @@ impl DiTBlock {
         x: &Tensor,
         t_emb: &Tensor,
         mask: &Tensor,
-        rope: Option<&(Tensor, Tensor)>,
+        chunk_mask: Option<&Tensor>,
+        rope: Option<&Tensor>,
     ) -> Result<Tensor> {
         let emb = self
             .attn_norm
@@ -188,53 +219,22 @@ impl DiTBlock {
         // MSA
         let res_msa = x.clone();
         let x_norm = self.attn_norm.norm.forward(x)?;
-        eprintln!(
-            "DIT MSA: x_norm={:?}, scale_msa={:?}, shift_msa={:?}",
-            x_norm.shape(),
-            scale_msa.shape(),
-            shift_msa.shape()
-        );
         let x_norm = x_norm
             .broadcast_mul(&(scale_msa.affine(1.0, 1.0)?))?
             .broadcast_add(&shift_msa)?;
-        let x_attn = self.attn.forward(&x_norm, mask, rope)?;
-
-        eprintln!(
-            "DIT MSA ADD: res_msa={:?}, x_attn={:?}, gate_msa={:?}",
-            res_msa.shape(),
-            x_attn.shape(),
-            gate_msa.shape()
-        );
+        let x_attn = self.attn.forward(&x_norm, mask, chunk_mask, rope)?;
         let mul_msa = x_attn.broadcast_mul(&gate_msa)?;
         let x = res_msa.broadcast_add(&mul_msa)?;
 
         // MLP
         let res_mlp = x.clone();
         let x_norm = self.ff_norm.forward(&x)?;
-        eprintln!(
-            "DIT MLP: x_norm={:?}, scale_mlp={:?}, shift_mlp={:?}",
-            x_norm.shape(),
-            scale_mlp.shape(),
-            shift_mlp.shape()
-        );
         let x_norm = x_norm
             .broadcast_mul(&(scale_mlp.affine(1.0, 1.0)?))?
             .broadcast_add(&shift_mlp)?;
         let x_mlp = self.ff.forward(&x_norm)?;
-
-        eprintln!(
-            "DIT MLP ADD: res_mlp={:?}, x_mlp={:?}, gate_mlp={:?}",
-            res_mlp.shape(),
-            x_mlp.shape(),
-            gate_mlp.shape()
-        );
         let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
         let x = res_mlp.broadcast_add(&mul_mlp)?;
-
-        let x_vec = x.flatten_all()?.to_vec1::<f32>()?;
-        let sum: f32 = x_vec.iter().sum();
-        let mean = sum / x_vec.len() as f32;
-        eprintln!("DIT BLOCK mean={}, first 5={:?}", mean, &x_vec[0..5]);
 
         Ok(x)
     }
@@ -298,13 +298,26 @@ impl Attention {
         &self,
         x: &Tensor,
         mask: &Tensor,
-        rope: Option<&(Tensor, Tensor)>,
+        chunk_mask: Option<&Tensor>,
+        rope: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let q = self.to_q.forward(x)?;
         let k = self.to_k.forward(x)?;
         let v = self.to_v.forward(x)?;
 
+        let q = if let Some(rope_freqs) = rope {
+            apply_rotary_pos_emb(&q, rope_freqs)?
+        } else {
+            q
+        };
+        let k = if let Some(rope_freqs) = rope {
+            apply_rotary_pos_emb(&k, rope_freqs)?
+        } else {
+            k
+        };
+
+        eprintln!("    [Attn DEBUG] q after RoPE shape: {:?}", q.shape());
         let q = q
             .reshape((b, n, self.heads, self.dim_head))?
             .transpose(1, 2)?;
@@ -314,27 +327,39 @@ impl Attention {
         let v = v
             .reshape((b, n, self.heads, self.dim_head))?
             .transpose(1, 2)?;
-
-        let (q, k) = if let Some((cos, sin)) = rope {
-            (
-                apply_rotary_pos_emb(&q, cos, sin)?,
-                apply_rotary_pos_emb(&k, cos, sin)?,
-            )
-        } else {
-            (q, k)
-        };
+        eprintln!("    [Attn DEBUG] q after reshape/transpose: {:?}", q.shape());
+        eprintln!("    [Attn DEBUG] k shape: {:?}, v shape: {:?}", k.shape(), v.shape());
 
         // Ensure contiguous layout for matmul
         let q = q.contiguous()?;
         let k = k.contiguous()?;
+        let k_t = k.transpose(2, 3)?;
+        eprintln!("    [Attn DEBUG] k_t shape: {:?}", k_t.shape());
+        let attn = q.matmul(&k_t)?;
+        eprintln!("    [Attn DEBUG] attn after matmul: {:?}", attn.shape());
+        let mut attn = (attn * self.scale)?;
 
-        let mut attn = (q.matmul(&k.transpose(2, 3)?)? * self.scale)?;
+        if let Some(chunk_mask) = chunk_mask {
+            eprintln!("    [Attn DEBUG] chunk_mask shape: {:?}", chunk_mask.shape());
+            // chunk_mask is [B, 1, N, N] - no need to unsqueeze further
+            // We invert it: 0 -> large negative (masked), 1 -> 0 (not masked)
+            let chunk_inv = chunk_mask
+                .affine(-1.0, 1.0)?   // 1 -> 0, 0 -> 1
+                .affine(1e10, 0.0)?;  // multiply by large value
+            eprintln!("    [Attn DEBUG] chunk_inv shape: {:?}", chunk_inv.shape());
+            attn = candle_nn::ops::softmax(&attn.broadcast_sub(&chunk_inv)?, 3)?;
 
-        let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
-        let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?;
-        attn = candle_nn::ops::softmax(&attn.broadcast_sub(&m_inv)?, 3)?;
+        } else {
+            eprintln!("    [Attn DEBUG] mask shape: {:?}", mask.shape());
+            let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
+            eprintln!("    [Attn DEBUG] m shape: {:?}", m.shape());
+            let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?;
+            attn = candle_nn::ops::softmax(&attn.broadcast_sub(&m_inv)?, 3)?;
+        }
+        eprintln!("    [Attn DEBUG] attn after softmax: {:?}", attn.shape());
 
         let v = v.contiguous()?;
+        eprintln!("    [Attn DEBUG] v shape before final matmul: {:?}", v.shape());
         let out = attn.matmul(&v)?;
         self.to_out.forward(
             &out.transpose(1, 2)?
@@ -343,71 +368,163 @@ impl Attention {
     }
 }
 
-pub fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (b, h, n, d) = x.dims4()?;
-
-    // Split into Head 0 and others
-    let x_h0 = x.narrow(1, 0, 1)?; // [B, 1, N, D]
-    let x_rest = x.narrow(1, 1, h - 1)?; // [B, H-1, N, D]
-
-    // Rotate Head 0
-    // x_transformers matches frequencies to input shape by right-aligning
-    // and uses [cos, cos, sin, sin] but interleave in pairs.
-    // Actually x_transformers stack((freqs, freqs), -1).flatten(-2) -> [f1, f1, f2, f2]
-    // And rotate_half: [-x2, x1, -x4, x3]
-
-    // x_h0: [B, 1, N, D]
-    // freqs (cos/sin): [1, 1, N, D]
-
-    let cos = cos.narrow(0, 0, n)?.unsqueeze(0)?.unsqueeze(0)?;
-    let sin = sin.narrow(0, 0, n)?.unsqueeze(0)?.unsqueeze(0)?;
-
-    // GPT-J style rotation: adjacent pairs
-    // Reshape [B, 1, N, D/2, 2]
-    let x_reshaped = x_h0.reshape((b, 1, n, d / 2, 2))?;
-
-    // x1 = x[..., 0], x2 = x[..., 1]
-    let x1 = x_reshaped.narrow(4, 0, 1)?;
-    let x2 = x_reshaped.narrow(4, 1, 1)?;
-
-    // rotate_x = [-x2, x1]
-    let rotate_x = Tensor::cat(&[&x2.neg()?, &x1], 4)?.flatten_from(3)?; // Back to [B, 1, N, D]
-
-    let x_cos = x_h0.broadcast_mul(&cos)?;
-    let rot_sin = rotate_x.broadcast_mul(&sin)?;
-    let x_h0_rot = x_cos.broadcast_add(&rot_sin)?;
-
-    // Concatenate back
-    Tensor::cat(&[&x_h0_rot, &x_rest], 1)
-}
 
 pub struct RotaryEmbedding {
-    cos: Tensor,
-    sin: Tensor,
+    freqs: Tensor,
 }
 
 impl RotaryEmbedding {
     pub fn new(dim: usize, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let freqs: Vec<f32> = (0..dim)
+        // Python x_transformers uses interleaved layout: [f0, f0, f1, f1, f2, f2, ...]
+        // Each frequency appears twice consecutively
+        let inv_freqs: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1.0 / 10000.0f32.powf(i as f32 / dim as f32))
             .collect();
-        let freqs = Tensor::from_vec(freqs, (1, dim / 2), device)?;
-        let t = Tensor::arange(0.0f32, max_seq_len as f32, device)?.reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&freqs)?;
+        // inv_freqs has dim/2 values
 
-        // Interleave frequencies: [f1, f1, f2, f2, ...]
-        // freqs: [Seq, Dim/2]
-        // unsqueeze(-1) -> [Seq, Dim/2, 1]
-        // repeat -> [Seq, Dim/2, 2]
-        // flatten -> [Seq, Dim]
-        let freqs = freqs.unsqueeze(2)?.repeat((1, 1, 2))?.flatten_from(1)?;
+        // Build interleaved freqs: for each position, repeat each freq twice
+        let mut freqs_data = Vec::with_capacity(max_seq_len * dim);
+        for pos in 0..max_seq_len {
+            let t = pos as f32;
+            for &inv_f in &inv_freqs {
+                let freq_val = t * inv_f;
+                freqs_data.push(freq_val); // First copy
+                freqs_data.push(freq_val); // Second copy (interleaved)
+            }
+        }
 
-        Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
-        })
+        let freqs = Tensor::from_vec(freqs_data, (max_seq_len, dim), device)?;
+        Ok(Self { freqs })
     }
+}
+
+
+pub fn apply_rotary_pos_emb(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
+    match x.rank() {
+        3 => apply_rotary_pos_emb_flat(x, freqs),
+        4 => {
+            let (b, h, n, d) = x.dims4()?;
+            let inner = h * d;
+            let x_flat = x.transpose(1, 2)?.reshape((b, n, inner))?;
+            let rotated = apply_rotary_pos_emb_flat(&x_flat, freqs)?;
+            rotated.reshape((b, n, h, d))?.transpose(1, 2)
+        }
+        _ => Err(candle_core::Error::Msg(
+            "apply_rotary_pos_emb expects a rank-3 or rank-4 tensor".into(),
+        )),
+    }
+}
+
+fn apply_rotary_pos_emb_flat(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
+    let (_b, n, d) = x.dims3()?;
+    let device = x.device();
+    eprintln!(
+        "    [RoPE DEBUG] x shape: {:?}, freqs shape: {:?}",
+        x.shape(),
+        freqs.shape()
+    );
+    let freq = freqs
+        .narrow(0, 0, n)?
+        .to_dtype(x.dtype())?
+        .to_device(&device)?
+        .unsqueeze(0)?;
+    eprintln!("    [RoPE DEBUG] freq (after unsqueeze(0)) shape: {:?}", freq.shape());
+    let cos = freq.cos()?;
+    let sin = freq.sin()?;
+    let rot_dim = cos.dim(2)?;
+    eprintln!("    [RoPE DEBUG] rot_dim={}, d={}", rot_dim, d);
+
+    let x_rot = x.narrow(2, 0, rot_dim)?;
+    eprintln!("    [RoPE DEBUG] x_rot shape: {:?}", x_rot.shape());
+    let rotated = rotate_half(&x_rot)?;
+    eprintln!("    [RoPE DEBUG] rotated shape: {:?}", rotated.shape());
+    let rotated = rotated.broadcast_mul(&sin)?;
+    let mut x_rotated = x_rot.broadcast_mul(&cos)?;
+    x_rotated = x_rotated.broadcast_add(&rotated)?;
+    eprintln!("    [RoPE DEBUG] x_rotated shape: {:?}", x_rotated.shape());
+
+    if rot_dim < d {
+        let rest = x.narrow(2, rot_dim, d - rot_dim)?;
+        eprintln!("    [RoPE DEBUG] rest shape: {:?}", rest.shape());
+        let result = Tensor::cat(&[&x_rotated, &rest], 2)?;
+        eprintln!("    [RoPE DEBUG] result shape: {:?}", result.shape());
+        Ok(result)
+    } else {
+        Ok(x_rotated)
+    }
+}
+
+
+fn rotate_half(x: &Tensor) -> Result<Tensor> {
+    let dims = x.shape().dims().to_vec();
+    let last_dim = *dims.last().ok_or_else(|| {
+        candle_core::Error::Msg("rotate_half requires at least one dimension".into())
+    })?;
+    if last_dim % 2 != 0 {
+        return Err(candle_core::Error::Msg(
+            "rotate_half expects an even number of channels".into(),
+        ));
+    }
+    let half = last_dim / 2;
+    let mut pair_shape = dims.clone();
+    pair_shape.pop();
+    pair_shape.push(half);
+    pair_shape.push(2);
+    let x_pairs = x.reshape(pair_shape.as_slice())?;
+    let last_idx = pair_shape.len() - 1;
+    let x_even = x_pairs.narrow(last_idx, 0, 1)?;
+    let x_odd = x_pairs.narrow(last_idx, 1, 1)?;
+    let rotated = Tensor::cat(&[&x_odd.neg()?, &x_even], last_idx)?;
+    rotated.reshape(dims.as_slice())
+}
+
+fn collapse_mask(mask: &Tensor) -> Result<Tensor> {
+    match mask.rank() {
+        3 => {
+            if mask.dim(1)? == 1 {
+                let dims = (mask.dim(0)?, mask.dim(2)?);
+                mask.reshape(&[dims.0, dims.1])
+            } else {
+                let idx = mask.rank() - 1;
+                let dims = (mask.dim(0)?, mask.dim(idx)?);
+                mask.reshape(&[dims.0, dims.1])
+            }
+        }
+        2 => Ok(mask.clone()),
+        _ => {
+            let idx = mask.rank() - 1;
+            let dims = (mask.dim(0)?, mask.dim(idx)?);
+            mask.reshape(&[dims.0, dims.1])
+        }
+    }
+}
+
+fn subsequent_chunk_mask(
+    size: usize,
+    chunk_size: usize,
+    num_left_chunks: isize,
+    device: &Device,
+) -> Result<Tensor> {
+    if chunk_size == 0 {
+        return Tensor::ones((size, size), DType::F32, device);
+    }
+    let mut data = vec![0f32; size * size];
+    for i in 0..size {
+        let block_idx = i / chunk_size;
+        let start = if num_left_chunks < 0 {
+            0
+        } else {
+            let left_chunks = block_idx.saturating_sub(num_left_chunks as usize);
+            left_chunks * chunk_size
+        };
+        let start = start.min(size);
+        let end = ((block_idx + 1) * chunk_size).min(size);
+        for j in start..end {
+            data[i * size + j] = 1.0;
+        }
+    }
+    Tensor::from_vec(data, (size, size), device)
 }
 
 fn mish(x: &Tensor) -> Result<Tensor> {
@@ -419,31 +536,31 @@ fn mish(x: &Tensor) -> Result<Tensor> {
 }
 
 fn sinusoidal_embedding(x: &Tensor, dim: usize) -> Result<Tensor> {
-    // x: [B] (time steps)
+    // x: [B] (time steps in [0, 1])
     // Output: [B, dim]
     let half_dim = dim / 2;
-    let scale = 1000.0;
-    let emb_factor = (10000.0f64).ln() / (half_dim as f64 - 1.0);
+    let device = x.device();
 
-    // freqs = exp(arange(half_dim) * -emb_factor)
-    let arange = Tensor::arange(0u32, half_dim as u32, x.device())?.to_dtype(DType::F32)?;
-    let freqs = (arange * (-emb_factor))?.exp()?;
+    // freqs = exp(-ln(10000.0) * arange(half_dim) / half_dim)
+    let arange = Tensor::arange(0.0f32, half_dim as f32, device)?;
+    let denom = (half_dim as f32 - 1.0).max(1.0);
+    let inv_freq = arange
+        .affine((-(10000.0f32.ln()) / denom) as f64, 0.0)?
+        .exp()?;
 
-    // args = scale * x.unsqueeze(1) * freqs.unsqueeze(0)
+    // args = x.unsqueeze(1) * inv_freq.unsqueeze(0)
     let x_uns = x.unsqueeze(1)?.to_dtype(DType::F32)?;
-    let freqs_uns = freqs.unsqueeze(0)?;
-    eprintln!(
-        "SINUSOIDAL: x={:?}, x_uns={:?}, freqs_uns={:?}",
-        x.shape(),
-        x_uns.shape(),
-        freqs_uns.shape()
-    );
-    let args = (x_uns * scale)?.broadcast_mul(&freqs_uns)?;
+    let x_scaled = x_uns.affine(1000.0, 0.0)?;
+    let args = x_scaled.broadcast_mul(&inv_freq.unsqueeze(0)?)?;
 
     let emb_sin = args.sin()?;
     let emb_cos = args.cos()?;
 
-    Tensor::cat(&[emb_sin, emb_cos], 1)
+    let mut emb = Tensor::cat(&[emb_sin, emb_cos], 1)?;
+    if dim % 2 == 1 {
+        emb = Tensor::cat(&[&emb, &emb.narrow(1, 0, 1)?.zeros_like()?], 1)?;
+    }
+    Ok(emb)
 }
 
 pub struct CausalConvPositionEmbedding {
@@ -522,8 +639,15 @@ pub struct InputEmbedding {
 }
 
 impl InputEmbedding {
-    pub fn new(vb: VarBuilder, mel_dim: usize, out_dim: usize) -> Result<Self> {
-        let proj = linear(mel_dim * 4, out_dim, vb.pp("proj"))?;
+    pub fn new(
+        vb: VarBuilder,
+        mel_dim: usize,
+        text_dim: usize,
+        spk_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self> {
+        let in_dim = mel_dim * 2 + text_dim + spk_dim;
+        let proj = linear(in_dim, out_dim, vb.pp("proj"))?;
         let conv_pos_embed = CausalConvPositionEmbedding::new(vb.pp("conv_pos_embed"), out_dim)?;
         Ok(Self {
             proj,
@@ -549,11 +673,19 @@ pub struct DiT {
     pub norm_out: AdaLayerNormZeroFinal,
     proj_out: Linear,
     rotary_embed: RotaryEmbedding,
+    static_chunk_size: usize,
+    num_decoding_left_chunks: isize,
 }
 
 impl DiT {
     pub fn new(vb: VarBuilder, cfg: &FlowConfig) -> Result<Self> {
-        let input_embed = InputEmbedding::new(vb.pp("input_embed"), cfg.mel_dim, cfg.dim)?;
+        let input_embed = InputEmbedding::new(
+            vb.pp("input_embed"),
+            cfg.mel_dim,
+            cfg.mu_dim,
+            cfg.spk_dim,
+            cfg.dim,
+        )?;
         let time_embed = TimestepEmbedding::new(vb.pp("time_embed"), 256, cfg.dim)?;
         let mut transformer_blocks = Vec::new();
         let vb_blocks = vb.pp("transformer_blocks");
@@ -576,7 +708,41 @@ impl DiT {
             norm_out,
             proj_out,
             rotary_embed,
+            static_chunk_size: cfg.static_chunk_size,
+            num_decoding_left_chunks: cfg.num_decoding_left_chunks,
         })
+    }
+
+    fn build_chunk_mask(&self, mask: &Tensor) -> Result<Option<Tensor>> {
+        if self.static_chunk_size == 0 {
+            return Ok(None);
+        }
+        let rank = mask.rank();
+        let seq_len = match rank {
+            2 => mask.dim(1)?,
+            3 => mask.dim(2)?,
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "Chunk mask expects mask of rank 2 or 3".into(),
+                ))
+            }
+        };
+        let chunk = subsequent_chunk_mask(
+            seq_len,
+            self.static_chunk_size,
+            self.num_decoding_left_chunks,
+            mask.device(),
+        )?
+        .unsqueeze(0)?
+        .unsqueeze(1)?;
+        let mask_float = mask.to_dtype(DType::F32)?;
+        let mask_expand = if rank == 2 {
+            mask_float.unsqueeze(1)?.unsqueeze(1)?
+        } else {
+            mask_float.unsqueeze(2)?
+        };
+        let combined = mask_expand.broadcast_mul(&chunk)?;
+        Ok(Some(combined))
     }
 
     pub fn forward(
@@ -588,16 +754,38 @@ impl DiT {
         spks: &Tensor,
         cond: &Tensor,
     ) -> Result<Tensor> {
-        let x = self.input_embed.forward(x, cond, mu, spks)?;
+        // Default to non-streaming mode (no chunk masking) to match Python inference
+        self.forward_with_streaming(x, mask, mu, t, spks, cond, false)
+    }
+
+    pub fn forward_with_streaming(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        mu: &Tensor,
+        t: &Tensor,
+        spks: &Tensor,
+        cond: &Tensor,
+        streaming: bool,
+    ) -> Result<Tensor> {
+        let mut x = self.input_embed.forward(x, cond, mu, spks)?;
 
         // TimestepEmbedding handles sinusoidal embedding internally now
         let t_emb = self.time_embed.forward(t)?;
+        log_v_stats("t_emb", &t_emb)?;
 
-        let rope = Some((self.rotary_embed.cos.clone(), self.rotary_embed.sin.clone()));
+        let rope = Some(&self.rotary_embed.freqs);
 
-        let mut x = x;
+        // Only use chunk masking in streaming mode
+        // In non-streaming mode (default), chunk_mask is None - matching Python streaming=False
+        let chunk_mask = if streaming {
+            self.build_chunk_mask(mask)?
+        } else {
+            None
+        };
+
         for block in self.transformer_blocks.iter() {
-            x = block.forward(&x, &t_emb, mask, rope.as_ref())?;
+            x = block.forward(&x, &t_emb, mask, chunk_mask.as_ref(), rope)?;
         }
 
         let x = self.norm_out.forward(&x, &t_emb)?;
@@ -607,6 +795,7 @@ impl DiT {
         Ok(out)
     }
 }
+
 
 fn _t_to_sinusoidal(t: &Tensor, dim: usize) -> Result<Tensor> {
     let device = t.device();
@@ -667,7 +856,7 @@ impl ConditionalCFM {
         // Use injected noise for parity testing, or generate random noise
         // Clone inputs to owned handles to allow slicing/realignment
         let mut mu = mu.clone();
-        let mut mask = mask.clone();
+        let mut mask_flat = collapse_mask(mask)?;
         let mut cond = cond.cloned(); // Option<Tensor> -> Option<Tensor>
 
         let mut x = match noise {
@@ -687,11 +876,8 @@ impl ConditionalCFM {
             if mu_len > min_len {
                 mu = mu.narrow(2, 0, min_len)?;
             }
-            // mask is [1, 1, T] or [1, T]?
-            if mask.rank() >= 3 && mask.dim(2)? > min_len {
-                mask = mask.narrow(2, 0, min_len)?;
-            } else if mask.rank() == 2 && mask.dim(1)? > min_len {
-                mask = mask.narrow(1, 0, min_len)?;
+            if mask_flat.dim(1)? > min_len {
+                mask_flat = mask_flat.narrow(1, 0, min_len)?;
             }
 
             if let Some(c) = cond.take() {
@@ -712,6 +898,17 @@ impl ConditionalCFM {
             *t = 1.0 - (*t * 0.5 * std::f32::consts::PI).cos();
         }
 
+        let max_steps = std::env::var("FLOW_DEBUG_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let log_v = std::env::var("FLOW_DEBUG_LOG_V").is_ok();
+        let save_steps = std::env::var("SAVE_FLOW_STEP_TENSORS").is_ok();
+        let mut step_debug_map = if save_steps {
+            Some(std::collections::HashMap::new())
+        } else {
+            None
+        };
+
         // 2. ODE Solver Loop (Euler)
         for i in 1..t_span.len() {
             let t_prev = t_span[i - 1];
@@ -725,8 +922,19 @@ impl ConditionalCFM {
             // spks is Option<&Tensor> (arg) -> need to handle
             // cond is Option<Tensor> (shadowed) -> need to handle
 
+            if let Some(max) = max_steps {
+                if i > max {
+                    eprintln!(
+                        "    [Flow parity] reached debug max steps ({}) -> stopping early",
+                        max
+                    );
+                    break;
+                }
+            }
+            eprintln!("    [Flow parity] solver step {}/{}", i, t_span.len() - 1);
+
             let x_in = Tensor::cat(&[&x, &x], 0)?;
-            let mask_in = Tensor::cat(&[&mask, &mask], 0)?;
+            let mask_in = Tensor::cat(&[&mask_flat, &mask_flat], 0)?;
             let mu_in = Tensor::cat(&[&mu, &mu.zeros_like()?], 0)?;
 
             // Handle spks (Option<&Tensor> arg -> Tensor)
@@ -756,17 +964,39 @@ impl ConditionalCFM {
             let chunks = v.chunk(2, 0)?;
             let (v1, v2) = (&chunks[0], &chunks[1]);
 
-            let cfg_rate = 0.7; // Hardcoded default or use config
-                                // v1 * (1.7) - v2 * (0.7)
-                                // Use broadcast_mul to be safe with Result vs Tensor return
+            let cfg_rate = 0.7;
+            // v1 * (1.7) - v2 * (0.7)
+            // Use broadcast_mul to be safe with Result vs Tensor return
             let v1_scaled =
                 v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?))?;
             let v2_scaled =
                 v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?))?;
             let v_cfg = (v1_scaled - v2_scaled)?;
 
+            if log_v {
+                log_v_stats("rust_v1", v1)?;
+                log_v_stats("rust_v2", v2)?;
+                log_v_stats("rust_v_cfg", &v_cfg)?;
+            }
+
+            if let Some(map) = step_debug_map.as_mut() {
+                map.insert(format!("step{}_v1", i), v1.clone());
+                map.insert(format!("step{}_v2", i), v2.clone());
+                map.insert(format!("step{}_v_cfg", i), v_cfg.clone());
+                if let Ok(dt_tensor) = Tensor::from_vec(vec![dt], (1,), device) {
+                    map.insert(format!("step{}_dt", i), dt_tensor);
+                }
+            }
+
             let d = v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], (1,), device)?))?;
             x = (x + d)?;
+            if let Some(map) = step_debug_map.as_mut() {
+                map.insert(format!("step{}_x", i), x.clone());
+            }
+        }
+
+        if let Some(map) = step_debug_map {
+            candle_core::safetensors::save(&map, "rust_flow_steps.safetensors")?;
         }
 
         // Debug

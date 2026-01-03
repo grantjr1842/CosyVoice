@@ -3,10 +3,19 @@
 use anyhow::{anyhow, Result};
 use tokenizers::Tokenizer;
 
+pub const PROMPT_PREFIX: &str = "You are a helpful assistant.<|endofprompt|>";
 const EN_PREFIX: &str = "<|en|>";
 const EN_TOKEN_MAX: usize = 80;
 const EN_TOKEN_MIN: usize = 60;
 const EN_MERGE_LEN: usize = 20;
+
+pub fn ensure_prompt_prefix(text: &str) -> String {
+    if text.contains("<|endofprompt|>") {
+        text.to_string()
+    } else {
+        format!("{PROMPT_PREFIX}{text}")
+    }
+}
 
 pub fn text_normalize_english(
     text: &str,

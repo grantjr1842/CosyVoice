@@ -23,6 +23,8 @@ pub struct CosyVoiceFlowConfig {
     pub token_mel_ratio: usize, // Upsampling ratio (2)
     pub pre_lookahead_len: usize, // Lookahead context (3)
     pub pre_lookahead_channels: usize, // Intermediate channels in pre-lookahead (1024)
+    pub chunk_size: usize,      // Base chunk size (25)
+    pub num_decoding_left_chunks: isize, // -1 means unlimited
 }
 
 impl Default for CosyVoiceFlowConfig {
@@ -35,6 +37,8 @@ impl Default for CosyVoiceFlowConfig {
             token_mel_ratio: 2,
             pre_lookahead_len: 3,
             pre_lookahead_channels: 1024,
+            chunk_size: 25,
+            num_decoding_left_chunks: -1,
         }
     }
 }
@@ -182,7 +186,11 @@ impl CosyVoiceFlow {
         )?;
 
         // DiT decoder
-        let dit = DiT::new(vb.pp("decoder.estimator"), dit_config)?;
+        let mut dit_cfg = dit_config.clone();
+        dit_cfg.spk_dim = flow_config.output_size;
+        dit_cfg.static_chunk_size = flow_config.chunk_size * flow_config.token_mel_ratio;
+        dit_cfg.num_decoding_left_chunks = flow_config.num_decoding_left_chunks;
+        let dit = DiT::new(vb.pp("decoder.estimator"), &dit_cfg)?;
         let decoder = ConditionalCFM::new(vb.clone(), dit, "cosine".to_string(), 0.0, 0.7)?;
 
         Ok(Self {

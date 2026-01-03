@@ -21,6 +21,7 @@ pub struct CosyVoiceLLMConfig {
     pub sampling_top_p: f32,
     pub ras_window_size: usize,
     pub ras_tau_r: f32,
+    pub stop_token_count: usize,
 }
 
 impl Default for CosyVoiceLLMConfig {
@@ -35,6 +36,7 @@ impl Default for CosyVoiceLLMConfig {
             sampling_top_p: 0.8,
             ras_window_size: 10,
             ras_tau_r: 0.1,
+            stop_token_count: 200,
         }
     }
 }
@@ -55,6 +57,8 @@ pub struct CosyVoiceLLM {
     sampling_vocab_size: usize,
     /// Configuration
     config: CosyVoiceLLMConfig,
+    /// Stop token IDs used to truncate generation
+    stop_token_ids: Vec<usize>,
     /// Device
     device: Device,
     /// Whether special tokens come from speech embedding
@@ -123,6 +127,13 @@ impl CosyVoiceLLM {
 
         let extra_tokens = speech_vocab_size - llm_config.sampling_vocab_size;
         let use_speech_special_tokens = extra_tokens >= 3;
+        let mut stop_token_ids = Vec::new();
+        for idx in llm_config.sampling_vocab_size..speech_vocab_size {
+            if stop_token_ids.len() >= llm_config.stop_token_count {
+                break;
+            }
+            stop_token_ids.push(idx);
+        }
         let (llm_embedding, sos, task_id) = if use_speech_special_tokens {
             let sos = llm_config.sampling_vocab_size;
             let task_id = llm_config.sampling_vocab_size.saturating_add(2);
@@ -167,6 +178,7 @@ impl CosyVoiceLLM {
             use_speech_special_tokens,
             sos,
             task_id,
+            stop_token_ids,
         })
     }
 
@@ -210,7 +222,11 @@ impl CosyVoiceLLM {
 
     fn is_stop_token(&self, token_id: u32) -> bool {
         let idx = token_id as usize;
-        idx >= self.sampling_vocab_size && idx < self.speech_vocab_size
+        self.stop_token_ids.iter().any(|&stop| stop == idx)
+    }
+
+    pub fn stop_token_ids(&self) -> &[usize] {
+        &self.stop_token_ids
     }
 
     fn sample_from_weighted(&self, weights: &[(usize, f32)]) -> Option<usize> {
