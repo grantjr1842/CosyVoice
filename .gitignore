@@ -65,6 +65,9 @@ pretrained_models/*
 verify_output*.txt
 rust/server/*.log
 
+# Codex agent state
+/.agent/
+
 # Local task/plan artifacts (if any leaked to root)
 task.md
 implementation_plan.md
@@ -89,3 +92,8 @@ third_party/ug/
 
 # Rust internal debug scripts
 rust/server/check_*.py
+
+# Local debug artifacts
+/python_hift_output.wav
+/tests/hift_parity/python_intermediates.safetensors
+/tests/python_hift_debug_audio.wav
