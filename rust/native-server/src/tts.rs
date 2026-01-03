@@ -134,9 +134,12 @@ impl NativeTtsEngine {
             Ok(fe) => {
                 eprintln!("ONNX Frontend initialized successfully");
                 Some(fe)
-            },
+            }
             Err(e) => {
-                eprintln!("WARNING: Failed to initialize ONNX frontend: {}. Continuing without frontend.", e);
+                eprintln!(
+                    "WARNING: Failed to initialize ONNX frontend: {}. Continuing without frontend.",
+                    e
+                );
                 None
             }
         };
@@ -180,7 +183,10 @@ impl NativeTtsEngine {
             eprintln!("Input speech_tokens shape: {:?}", speech_tokens.shape());
             eprintln!("Input prompt_tokens shape: {:?}", prompt_tokens.shape());
             eprintln!("Input prompt_mel shape: {:?}", prompt_mel.shape());
-            eprintln!("Input speaker_embedding shape: {:?}", speaker_embedding.shape());
+            eprintln!(
+                "Input speaker_embedding shape: {:?}",
+                speaker_embedding.shape()
+            );
         }
 
         // Print tensor statistics helper
@@ -191,13 +197,21 @@ impl NativeTtsEngine {
                     let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let sum: f32 = vec.iter().sum();
                     let mean = sum / vec.len() as f32;
-                    let variance: f32 = vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
+                    let variance: f32 =
+                        vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
                     let std = variance.sqrt();
-                    eprintln!("  {} stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}, len={}",
-                             name, min, max, mean, std, vec.len());
+                    eprintln!(
+                        "  {} stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}, len={}",
+                        name,
+                        min,
+                        max,
+                        mean,
+                        std,
+                        vec.len()
+                    );
                     if vec.len() >= 10 {
                         eprintln!("    first_5: {:?}", &vec[..5]);
-                        eprintln!("    last_5:  {:?}", &vec[vec.len()-5..]);
+                        eprintln!("    last_5:  {:?}", &vec[vec.len() - 5..]);
                     }
                 }
             }
@@ -244,10 +258,16 @@ impl NativeTtsEngine {
         let mean_val: f32 = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
 
         if min_val < -1.0 || max_val > 1.0 {
-            eprintln!("⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}", min_val, max_val);
+            eprintln!(
+                "⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}",
+                min_val, max_val
+            );
         }
         if mean_val.abs() > 0.1 {
-            eprintln!("⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.", mean_val);
+            eprintln!(
+                "⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.",
+                mean_val
+            );
         }
 
         // DC Removal & Conversion
@@ -262,10 +282,7 @@ impl NativeTtsEngine {
     }
 
     /// Synthesize audio directly from a mel spectrogram (bypassing LLM and Flow)
-    pub fn synthesize_from_mel(
-        &self,
-        mel: &Tensor,
-    ) -> Result<Vec<i16>, NativeTtsError> {
+    pub fn synthesize_from_mel(&self, mel: &Tensor) -> Result<Vec<i16>, NativeTtsError> {
         eprintln!("\n=== SYNTHESIS FROM MEL DEBUG ===");
         eprintln!("Input mel shape: {:?}", mel.shape());
 
@@ -277,10 +294,18 @@ impl NativeTtsEngine {
                     let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let sum: f32 = vec.iter().sum();
                     let mean = sum / vec.len() as f32;
-                    let variance: f32 = vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
+                    let variance: f32 =
+                        vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
                     let std = variance.sqrt();
-                    eprintln!("  {} stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}, len={}",
-                             name, min, max, mean, std, vec.len());
+                    eprintln!(
+                        "  {} stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}, len={}",
+                        name,
+                        min,
+                        max,
+                        mean,
+                        std,
+                        vec.len()
+                    );
                 }
             }
         }
@@ -301,10 +326,16 @@ impl NativeTtsEngine {
         let mean_val: f32 = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
 
         if min_val < -1.0 || max_val > 1.0 {
-            eprintln!("⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}", min_val, max_val);
+            eprintln!(
+                "⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}",
+                min_val, max_val
+            );
         }
         if mean_val.abs() > 0.1 {
-            eprintln!("⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.", mean_val);
+            eprintln!(
+                "⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.",
+                mean_val
+            );
         }
 
         let samples: Vec<i16> = audio_vec
@@ -344,7 +375,10 @@ impl NativeTtsEngine {
         let max_len = (effective_len as f32 * MAX_TOKEN_TEXT_RATIO) as usize;
 
         // 1. Generate speech tokens via LLM
-        eprintln!("Generating speech tokens... (min={}, max={})", min_len, max_len);
+        eprintln!(
+            "Generating speech tokens... (min={}, max={})",
+            min_len, max_len
+        );
         let speech_tokens = self.llm.generate(
             text_embeds,
             prompt_speech_tokens,
@@ -357,11 +391,7 @@ impl NativeTtsEngine {
 
         // Convert to tensor
         let token_len = speech_tokens.len();
-        let speech_token_tensor = Tensor::from_vec(
-            speech_tokens,
-            (1, token_len),
-            &self.device,
-        )?;
+        let speech_token_tensor = Tensor::from_vec(speech_tokens, (1, token_len), &self.device)?;
 
         // Get prompt tokens or empty
         let empty_prompt = Tensor::zeros((1, 0), DType::U32, &self.device)?;
@@ -399,22 +429,30 @@ impl NativeTtsEngine {
     /// Process prompt audio tensors to get speech tokens and speaker embedding
     pub fn process_prompt_tensors(
         &mut self,
-        prompt_speech_16k: &Tensor,   // [1, 128, T] for Tokenizer
-        prompt_fbank: &Tensor, // [1, T, 80] for Speaker Embedding
+        prompt_speech_16k: &Tensor, // [1, 128, T] for Tokenizer
+        prompt_fbank: &Tensor,      // [1, T, 80] for Speaker Embedding
     ) -> Result<(Tensor, Tensor), NativeTtsError> {
         // 1. Check frontend availability
         let frontend = self.frontend.as_mut().ok_or_else(|| {
-            NativeTtsError::InferenceError("Frontend not initialized (ONNX error previously logged)".to_string())
+            NativeTtsError::InferenceError(
+                "Frontend not initialized (ONNX error previously logged)".to_string(),
+            )
         })?;
 
         // 2. Speech tokens
         let mel_len = prompt_speech_16k.dim(2)? as i32;
-        let speech_tokens = frontend.tokenize_speech(prompt_speech_16k, mel_len)
-            .map_err(|e| NativeTtsError::InferenceError(format!("Frontend error (tokenize): {}", e)))?;
+        let speech_tokens = frontend
+            .tokenize_speech(prompt_speech_16k, mel_len)
+            .map_err(|e| {
+                NativeTtsError::InferenceError(format!("Frontend error (tokenize): {}", e))
+            })?;
 
         // 3. Speaker embedding
-        let spk_emb = frontend.extract_speaker_embedding(prompt_fbank)
-            .map_err(|e| NativeTtsError::InferenceError(format!("Frontend error (embedding): {}", e)))?;
+        let spk_emb = frontend
+            .extract_speaker_embedding(prompt_fbank)
+            .map_err(|e| {
+                NativeTtsError::InferenceError(format!("Frontend error (embedding): {}", e))
+            })?;
 
         Ok((speech_tokens, spk_emb))
     }
@@ -441,7 +479,8 @@ impl NativeTtsEngine {
         sampling_k: usize,
     ) -> Result<Vec<i16>, NativeTtsError> {
         // 1. Process prompt audio
-        let (prompt_speech_tokens, spk_emb) = self.process_prompt_tensors(prompt_speech_16k, prompt_fbank)?;
+        let (prompt_speech_tokens, spk_emb) =
+            self.process_prompt_tensors(prompt_speech_16k, prompt_fbank)?;
 
         // 2. Embed text tokens
         let text_embeds = self.llm.embed_text_tokens(text_tokens)?;
@@ -453,7 +492,7 @@ impl NativeTtsEngine {
             Some(&prompt_speech_tokens),
             prompt_speech_24k, // Flow uses 24k mel (80 dim)
             &spk_emb,
-            sampling_k
+            sampling_k,
         )
     }
 

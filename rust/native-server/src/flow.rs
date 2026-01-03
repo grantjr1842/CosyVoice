@@ -35,24 +35,24 @@ pub struct TimestepEmbedding {
 
 impl TimestepEmbedding {
     pub fn new(vb: VarBuilder, dim: usize, inner_dim: usize) -> Result<Self> {
-    // PyTorch uses time_mlp.0 and time_mlp.2 (Sequential indices) instead of linear_1/linear_2
-    // Try both naming conventions for compatibility
-    let time_mlp = vb.pp("time_mlp");
-    let linear_1 = if time_mlp.contains_tensor("0.weight") {
-        linear(dim, inner_dim, time_mlp.pp("0"))?
-    } else {
-        linear(dim, inner_dim, vb.pp("linear_1"))?
-    };
-    let linear_2 = if time_mlp.contains_tensor("2.weight") {
-        linear(inner_dim, inner_dim, time_mlp.pp("2"))?
-    } else {
-        linear(inner_dim, inner_dim, vb.pp("linear_2"))?
-    };
-    Ok(Self {
-        linear_1,
-        linear_2,
-        silu: candle_nn::Activation::Silu,
-    })
+        // PyTorch uses time_mlp.0 and time_mlp.2 (Sequential indices) instead of linear_1/linear_2
+        // Try both naming conventions for compatibility
+        let time_mlp = vb.pp("time_mlp");
+        let linear_1 = if time_mlp.contains_tensor("0.weight") {
+            linear(dim, inner_dim, time_mlp.pp("0"))?
+        } else {
+            linear(dim, inner_dim, vb.pp("linear_1"))?
+        };
+        let linear_2 = if time_mlp.contains_tensor("2.weight") {
+            linear(inner_dim, inner_dim, time_mlp.pp("2"))?
+        } else {
+            linear(inner_dim, inner_dim, vb.pp("linear_2"))?
+        };
+        Ok(Self {
+            linear_1,
+            linear_2,
+            silu: candle_nn::Activation::Silu,
+        })
     }
 
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
@@ -475,7 +475,6 @@ impl CausalConvPositionEmbedding {
             let groups = 16;
             let weight = conv.weight();
 
-
             let bias = conv.bias();
             let x_chunks = x.chunk(groups, 1)?;
             let w_chunks = weight.chunk(groups, 0)?;
@@ -690,9 +689,9 @@ impl ConditionalCFM {
             }
             // mask is [1, 1, T] or [1, T]?
             if mask.rank() >= 3 && mask.dim(2)? > min_len {
-                 mask = mask.narrow(2, 0, min_len)?;
+                mask = mask.narrow(2, 0, min_len)?;
             } else if mask.rank() == 2 && mask.dim(1)? > min_len {
-                 mask = mask.narrow(1, 0, min_len)?;
+                mask = mask.narrow(1, 0, min_len)?;
             }
 
             if let Some(c) = cond.take() {
@@ -738,26 +737,32 @@ impl ConditionalCFM {
             // Ensure concatenated zeros match spks rank (2) not mu rank (3)
             let spks_in = Tensor::cat(&[&spks_tensor, &spks_tensor.zeros_like()?], 0)?;
 
-
             // Handle cond (Option<Tensor>)
             let cond_in_tensor = if let Some(c) = &cond {
-                 Tensor::cat(&[c, &c.zeros_like()?], 0)?
+                Tensor::cat(&[c, &c.zeros_like()?], 0)?
             } else {
-                 mu.zeros_like()? // Placeholder if cond is None
+                mu.zeros_like()? // Placeholder if cond is None
             };
             // forward expects &Tensor for cond.
             // cond_in_tensor is always initialized (zeros if None)
-            let v = self
-                .estimator
-                .forward(&x_in, &mask_in, &mu_in, &t_tensor, &spks_in, &cond_in_tensor)?;
+            let v = self.estimator.forward(
+                &x_in,
+                &mask_in,
+                &mu_in,
+                &t_tensor,
+                &spks_in,
+                &cond_in_tensor,
+            )?;
             let chunks = v.chunk(2, 0)?;
             let (v1, v2) = (&chunks[0], &chunks[1]);
 
             let cfg_rate = 0.7; // Hardcoded default or use config
-            // v1 * (1.7) - v2 * (0.7)
-            // Use broadcast_mul to be safe with Result vs Tensor return
-            let v1_scaled = v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?))?;
-            let v2_scaled = v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?))?;
+                                // v1 * (1.7) - v2 * (0.7)
+                                // Use broadcast_mul to be safe with Result vs Tensor return
+            let v1_scaled =
+                v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?))?;
+            let v2_scaled =
+                v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?))?;
             let v_cfg = (v1_scaled - v2_scaled)?;
 
             let d = v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], (1,), device)?))?;
@@ -776,7 +781,7 @@ impl ConditionalCFM {
             }
             // handle option cond
             if let Some(c) = cond {
-                 debug_map.insert("cond".to_string(), c);
+                debug_map.insert("cond".to_string(), c);
             }
             debug_map.insert("x_init".to_string(), x_init);
             debug_map.insert("flow_output".to_string(), x.clone());

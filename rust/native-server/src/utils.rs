@@ -93,9 +93,9 @@ impl StftModule {
 
         // x: [Batch, Time] -> need [Batch, 1, Time] for conv1d
         let x_unsqueezed = if x_in.rank() == 2 {
-             x_in.unsqueeze(1)?
+            x_in.unsqueeze(1)?
         } else {
-             x_in
+            x_in
         };
 
         let real = x_unsqueezed.conv1d(
@@ -127,7 +127,7 @@ pub struct InverseStftModule {
 
 impl InverseStftModule {
     pub fn new(n_fft: usize, hop_length: usize, center: bool, device: &Device) -> Result<Self> {
-        let window = hann_window(n_fft, device)?; // [n_fft]
+        let _window = hann_window(n_fft, device)?; // [n_fft]
         let window_cpu = hann_window(n_fft, &Device::Cpu)?;
         let window_vec = window_cpu.to_vec1::<f32>()?;
 
@@ -260,11 +260,15 @@ fn reflect_pad_1d(x: &Tensor, pad: usize) -> Result<Tensor> {
         let (b, c, t) = x.dims3()?;
         (b, c, t, 3usize)
     } else {
-        return Err(candle_core::Error::msg("reflect_pad_1d expects rank-2 or rank-3 input"));
+        return Err(candle_core::Error::msg(
+            "reflect_pad_1d expects rank-2 or rank-3 input",
+        ));
     };
 
     if t <= pad {
-        return Err(candle_core::Error::msg("reflect_pad_1d pad >= signal length"));
+        return Err(candle_core::Error::msg(
+            "reflect_pad_1d pad >= signal length",
+        ));
     }
 
     let x_cpu = x.to_device(&Device::Cpu)?;

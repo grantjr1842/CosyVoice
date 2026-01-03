@@ -7,7 +7,7 @@ use reqwest::Client;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
-use tracing::{info, error};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use shared::SynthesizeRequest;
@@ -108,11 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let start = Instant::now();
     let url = format!("{}/synthesize", args.server);
 
-    let response = client
-        .post(&url)
-        .json(&request)
-        .send()
-        .await?;
+    let response = client.post(&url).json(&request).send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -147,7 +143,11 @@ async fn main() -> anyhow::Result<()> {
         std::fs::write(output_path, &audio_data)?;
         info!(path = %output_path.display(), "Saved audio file");
 
-        println!("✓ Synthesized {} chars in {:.2}s", args.text.len(), elapsed.as_secs_f32());
+        println!(
+            "✓ Synthesized {} chars in {:.2}s",
+            args.text.len(),
+            elapsed.as_secs_f32()
+        );
         println!("  Audio duration: {:.2}s", audio_duration);
         println!("  RTF: {:.2}x", audio_duration / elapsed.as_secs_f32());
         println!("  Output: {}", output_path.display());

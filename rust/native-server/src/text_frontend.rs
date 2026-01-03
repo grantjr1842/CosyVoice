@@ -168,7 +168,11 @@ fn words_under_1000(value: u16) -> String {
     if remainder == 0 {
         format!("{} hundred", unit_word(hundreds))
     } else {
-        format!("{} hundred and {}", unit_word(hundreds), words_under_100(remainder))
+        format!(
+            "{} hundred and {}",
+            unit_word(hundreds),
+            words_under_100(remainder)
+        )
     }
 }
 

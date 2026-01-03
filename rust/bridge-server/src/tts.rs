@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum TtsError {
     #[error("TTS initialization failed: {0}")]
     InitError(String),

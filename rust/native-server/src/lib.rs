@@ -1,4 +1,3 @@
-pub mod tts;
 pub mod audio;
 pub mod cosyvoice_flow;
 pub mod cosyvoice_llm;
@@ -7,4 +6,5 @@ pub mod hift;
 pub mod onnx_frontend;
 pub mod qwen;
 pub mod text_frontend;
+pub mod tts;
 pub mod utils;

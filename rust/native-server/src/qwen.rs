@@ -1,6 +1,6 @@
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use candle_nn::ops::sdpa;
+use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
 
@@ -312,7 +312,10 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            eprintln!("Qwen2: Loading layer {}/{}...", layer_idx, cfg.num_hidden_layers);
+            eprintln!(
+                "Qwen2: Loading layer {}/{}...",
+                layer_idx, cfg.num_hidden_layers
+            );
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }

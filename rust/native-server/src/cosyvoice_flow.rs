@@ -7,29 +7,31 @@
 //! 4. DiT decoder with ODE solver
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{conv1d, embedding, linear, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
+use candle_nn::{
+    conv1d, embedding, linear, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder,
+};
 
 use crate::flow::{ConditionalCFM, DiT, FlowConfig};
 
 /// Configuration for the complete Flow model
 #[derive(Debug, Clone)]
 pub struct CosyVoiceFlowConfig {
-    pub input_size: usize,         // Token embedding dim (80 for Fun-CosyVoice3-0.5B)
-    pub output_size: usize,        // Mel dim (80)
-    pub spk_embed_dim: usize,      // Speaker embedding dim (192)
-    pub vocab_size: usize,         // Speech token vocab (6561 for Fun-CosyVoice3-0.5B)
-    pub token_mel_ratio: usize,    // Upsampling ratio (2)
-    pub pre_lookahead_len: usize,  // Lookahead context (3)
+    pub input_size: usize,      // Token embedding dim (80 for Fun-CosyVoice3-0.5B)
+    pub output_size: usize,     // Mel dim (80)
+    pub spk_embed_dim: usize,   // Speaker embedding dim (192)
+    pub vocab_size: usize,      // Speech token vocab (6561 for Fun-CosyVoice3-0.5B)
+    pub token_mel_ratio: usize, // Upsampling ratio (2)
+    pub pre_lookahead_len: usize, // Lookahead context (3)
     pub pre_lookahead_channels: usize, // Intermediate channels in pre-lookahead (1024)
 }
 
 impl Default for CosyVoiceFlowConfig {
     fn default() -> Self {
         Self {
-            input_size: 80,           // Fun-CosyVoice3-0.5B uses 80
+            input_size: 80, // Fun-CosyVoice3-0.5B uses 80
             output_size: 80,
             spk_embed_dim: 192,
-            vocab_size: 6561,          // Fun-CosyVoice3-0.5B uses 6561
+            vocab_size: 6561, // Fun-CosyVoice3-0.5B uses 6561
             token_mel_ratio: 2,
             pre_lookahead_len: 3,
             pre_lookahead_channels: 1024,
@@ -45,7 +47,12 @@ pub struct PreLookaheadLayer {
 }
 
 impl PreLookaheadLayer {
-    pub fn new(vb: VarBuilder, in_channels: usize, channels: usize, pre_lookahead_len: usize) -> Result<Self> {
+    pub fn new(
+        vb: VarBuilder,
+        in_channels: usize,
+        channels: usize,
+        pre_lookahead_len: usize,
+    ) -> Result<Self> {
         let conv1_cfg = Conv1dConfig {
             padding: 0,
             stride: 1,
@@ -58,7 +65,13 @@ impl PreLookaheadLayer {
         };
 
         // kernel_size = pre_lookahead_len + 1 for conv1
-        let conv1 = conv1d(in_channels, channels, pre_lookahead_len + 1, conv1_cfg, vb.pp("conv1"))?;
+        let conv1 = conv1d(
+            in_channels,
+            channels,
+            pre_lookahead_len + 1,
+            conv1_cfg,
+            vb.pp("conv1"),
+        )?;
         // kernel_size = 3 for conv2
         let conv2 = conv1d(channels, in_channels, 3, conv2_cfg, vb.pp("conv2"))?;
 
@@ -233,8 +246,10 @@ impl CosyVoiceFlow {
         let prompt_mel_len = prompt_feat.dim(2)?; // [B, D, T], use dim 2
         let total_mel_len = h.dim(1)?;
         let target_mel_len = total_mel_len - prompt_mel_len;
-        eprintln!("    prompt_mel_len={}, total_mel_len={}, target_mel_len={}",
-                 prompt_mel_len, total_mel_len, target_mel_len);
+        eprintln!(
+            "    prompt_mel_len={}, total_mel_len={}, target_mel_len={}",
+            prompt_mel_len, total_mel_len, target_mel_len
+        );
 
         // Build conditioning tensor: [1, 80, total_len]
         let mut conds = Tensor::zeros(
@@ -269,7 +284,10 @@ impl CosyVoiceFlow {
                 let max = mu_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = mu_vec.iter().sum();
                 let mean = sum / mu_vec.len() as f32;
-                eprintln!("    mu stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    mu stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 
@@ -293,7 +311,10 @@ impl CosyVoiceFlow {
                 let max = feat_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = feat_vec.iter().sum();
                 let mean = sum / feat_vec.len() as f32;
-                eprintln!("    decoder output stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    decoder output stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 
@@ -303,7 +324,10 @@ impl CosyVoiceFlow {
         let available_len = actual_dim.saturating_sub(prompt_mel_len);
         let final_len = usize::min(target_mel_len, available_len);
         if final_len != target_mel_len {
-            eprintln!("    [Flow.inference] Warning: Output truncated from {} to {}", target_mel_len, final_len);
+            eprintln!(
+                "    [Flow.inference] Warning: Output truncated from {} to {}",
+                target_mel_len, final_len
+            );
         }
         let feat = feat.narrow(2, prompt_mel_len, final_len)?;
         eprintln!("    final feat shape: {:?}", feat.shape());
@@ -315,7 +339,10 @@ impl CosyVoiceFlow {
                 let max = feat_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = feat_vec.iter().sum();
                 let mean = sum / feat_vec.len() as f32;
-                eprintln!("    [Flow.inference] Final mel stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    [Flow.inference] Final mel stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 
@@ -348,6 +375,9 @@ fn repeat_interleave(x: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
         x.reshape((b, n_dim * repeats, d))
     } else {
         // Generic fallback
-        Err(candle_core::Error::Msg(format!("repeat_interleave not implemented for dim={}", dim)))
+        Err(candle_core::Error::Msg(format!(
+            "repeat_interleave not implemented for dim={}",
+            dim
+        )))
     }
 }

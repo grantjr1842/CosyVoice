@@ -11,15 +11,10 @@ use axum::{
 };
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use std::{
-    env,
-    net::SocketAddr,
-    sync::Arc,
-    time::Instant,
-};
+use std::{env, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::signal;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use shared::{config, ErrorResponse, HealthResponse, SynthesizeRequest};
@@ -64,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Prometheus metrics recorder installed");
 
     // Get model directory from env or use default
-    let model_dir = env::var("COSYVOICE_MODEL_DIR")
-        .unwrap_or_else(|_| config::DEFAULT_MODEL_DIR.to_string());
+    let model_dir =
+        env::var("COSYVOICE_MODEL_DIR").unwrap_or_else(|_| config::DEFAULT_MODEL_DIR.to_string());
 
     // Initialize TTS engine
     info!(model_dir = %model_dir, "Initializing CosyVoice TTS engine...");
@@ -149,9 +144,7 @@ async fn synthesize_handler(
                 .synthesize_zero_shot(&text, &prompt_audio, prompt_text, speed)
         } else {
             // Instruct mode with default instruction
-            let instruct = speaker
-                .as_deref()
-                .unwrap_or("Speak naturally in English.");
+            let instruct = speaker.as_deref().unwrap_or("Speak naturally in English.");
             state
                 .tts
                 .synthesize_instruct(&text, instruct, &prompt_audio, speed)
@@ -319,8 +312,8 @@ fn ensure_library_path() -> anyhow::Result<()> {
     let _ = dotenvy::from_filename(".env");
 
     // Get the extra library path from .env (default to pixi env)
-    let lib_path_extra = env::var("LD_LIBRARY_PATH_EXTRA")
-        .unwrap_or_else(|_| ".pixi/envs/default/lib".to_string());
+    let lib_path_extra =
+        env::var("LD_LIBRARY_PATH_EXTRA").unwrap_or_else(|_| ".pixi/envs/default/lib".to_string());
 
     // Resolve to absolute path
     let lib_path_abs = cwd.join(&lib_path_extra);

@@ -106,14 +106,24 @@ fn llm_length_parity() -> Result<()> {
         .unwrap_or_else(|_| "pretrained_models/Fun-CosyVoice3-0.5B".to_string());
     let model_path = PathBuf::from(&model_dir);
     if !model_path.exists() {
-        eprintln!("Skipping parity test (model_dir not found at {}).", model_dir);
+        eprintln!(
+            "Skipping parity test (model_dir not found at {}).",
+            model_dir
+        );
         return Ok(());
     }
 
-    let tokenizer_path = std::env::var("COSYVOICE_TOKENIZER_PATH")
-        .unwrap_or_else(|_| model_path.join("tokenizer.json").to_string_lossy().to_string());
+    let tokenizer_path = std::env::var("COSYVOICE_TOKENIZER_PATH").unwrap_or_else(|_| {
+        model_path
+            .join("tokenizer.json")
+            .to_string_lossy()
+            .to_string()
+    });
     if !Path::new(&tokenizer_path).exists() {
-        eprintln!("Skipping parity test (tokenizer not found at {}).", tokenizer_path);
+        eprintln!(
+            "Skipping parity test (tokenizer not found at {}).",
+            tokenizer_path
+        );
         return Ok(());
     }
 
