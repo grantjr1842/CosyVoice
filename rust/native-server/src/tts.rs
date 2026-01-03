@@ -56,7 +56,11 @@ impl NativeTtsEngine {
         let model_path = PathBuf::from(model_dir);
 
         // Initialize device
-        let device = device.unwrap_or_else(|| Device::cuda_if_available(0).unwrap_or(Device::Cpu));
+        let device = match device {
+            Some(d) => d,
+            None => Device::new_cuda(0)
+                .map_err(|e| NativeTtsError::ModelLoad(format!("CUDA device required but not available: {}", e)))?,
+        };
         eprintln!("Native TTS Engine using device: {:?}", device);
 
         // Load configurations

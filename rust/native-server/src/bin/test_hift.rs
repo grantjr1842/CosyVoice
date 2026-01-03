@@ -1,4 +1,4 @@
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Device
     // Try CUDA if available, else CPU
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
+    let device = Device::new_cuda(0)?;
     println!("Using device: {:?}", device);
 
     // Load Engine

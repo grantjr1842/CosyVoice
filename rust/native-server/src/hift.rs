@@ -472,6 +472,24 @@ impl F0Predictor {
         // Classifier
         let classifier = candle_nn::linear(cond_channels, 1, vb.pp("classifier"))?;
 
+        // Debug classifier weights
+        let w = classifier.weight();
+        if let Ok(flat) = w.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                let std = (vec.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32).sqrt();
+                eprintln!("    [F0Predictor] Classifier weight: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+                    w.shape(), mean, std, min, max);
+            }
+        }
+        if let Some(bias) = classifier.bias() {
+            if let Ok(val) = bias.to_scalar::<f32>() {
+                eprintln!("    [F0Predictor] Classifier bias: {:.6}", val);
+            }
+        }
+
         Ok(Self {
             condnet,
             classifier,
@@ -484,6 +502,16 @@ impl F0Predictor {
 
         let mut h = x.clone();
         for (i, conv) in self.condnet.iter().enumerate() {
+            // Debug input to this layer
+            if let Ok(flat) = h.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                    eprintln!("    Layer {} INPUT: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                }
+            }
+
             if i == 0 {
                 // F0 predictor in CosyVoice3.0 uses kernel 4, causal type 'right'
                 // This means pad 3 on RIGHT.
@@ -493,7 +521,19 @@ impl F0Predictor {
                 // This means pad 2 on LEFT.
                 h = h.pad_with_zeros(2, 2, 0)?;
             }
+
             h = conv.forward(&h)?;
+
+            // Debug after conv, before ELU
+            if let Ok(flat) = h.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                    eprintln!("    Layer {} AFTER CONV: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                }
+            }
+
             h = h.elu(1.0)?; // ELU
 
             // Debug each layer
@@ -529,8 +569,28 @@ impl F0Predictor {
         }
 
         // out: [Batch, Time, 1]
-        let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
-        Ok(f0)
+        let f0 = out.transpose(1, 2)?.abs()?; //  [Batch, 1, Time]
+
+        // CRITICAL FIX: Clamp F0 to reasonable speech range to prevent cascading errors
+        // Speech F0 typically ranges from 80-400 Hz, but we'll allow 0-1000 Hz for safety
+        // The classifier sometimes produces extreme values due to weight/precision issues
+        let max_f0 = Tensor::new(&[1000.0f32], f0.device())?;
+        let f0_clamped = f0.minimum(&max_f0.broadcast_as(f0.shape())?)?;
+
+        if let Ok(flat) = f0_clamped.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    F0 stats (after clamp): min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz",
+                    min, max, mean
+                );
+            }
+        }
+
+        Ok(f0_clamped)
     }
 }
 
@@ -559,15 +619,10 @@ impl HiFTGenerator {
         let base_ch = config.base_channels;
 
         // Determine if causal
-        let is_causal = if vb.pp("conv_pre").contains_tensor("weight.original1")
+        let is_causal = vb.pp("conv_pre").contains_tensor("weight.original1")
             || vb
                 .pp("conv_pre")
-                .contains_tensor("parametrizations.weight.original1")
-        {
-            true
-        } else {
-            false
-        };
+                .contains_tensor("parametrizations.weight.original1");
         eprintln!("    [HiFT] is_causal: {}", is_causal);
 
         // Conv Pre
@@ -592,7 +647,7 @@ impl HiFTGenerator {
             let out_c = base_ch / (1 << (i + 1));
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
             // If causal, padding is 0, manual padding k-1
-            let conv_pad = if is_causal { 0 } else { 0 }; // Upsample convs typically have 0 padding, manual padding for causal
+            let conv_pad = 0; // Upsample convs typically have 0 padding, manual padding for causal
             let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, conv_pad)?;
             ups.push(conv);
         }
@@ -637,9 +692,7 @@ impl HiFTGenerator {
                 // If u=1: K=1. Pad=0. Manual=0.
                 // If u>1: K=u*2. Stride=u. Causal Pad = Stride-1 = u-1.
                 if u == 1 { (0, 0) } else { (0, u - 1) }
-            } else {
-                 if u == 1 { (0, 0) } else { (u/2, 0) } // Standard logic line 593: u/2
-            };
+            } else if u == 1 { (0, 0) } else { (u/2, 0) }; // Standard logic line 593: u/2
             source_down_pads.push(sd_manual_pad);
 
             let sd = if u == 1 {
@@ -986,7 +1039,13 @@ impl HiFTGenerator {
             }
         }
 
-        let magnitude = mag_log.exp()?;
+        // CRITICAL FIX: Clamp mag_log before exp() to prevent overflow
+        // Python clips magnitude AFTER exp, but we need to prevent exp overflow first
+        // exp(50) ≈ 5e21 which is way too large; exp(11.5) ≈ 100 (our target max)
+        let max_log = Tensor::new(&[11.5f32], mag_log.device())?;
+        let mag_log_clamped = mag_log.minimum(&max_log.broadcast_as(mag_log.shape())?)?;
+
+        let magnitude = mag_log_clamped.exp()?;
 
         // Clip magnitude to prevent overflow - Python does: magnitude = torch.clip(magnitude, max=1e2)
         let max_mag = Tensor::new(&[100.0f32], magnitude.device())?;
