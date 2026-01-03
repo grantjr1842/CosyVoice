@@ -56,7 +56,8 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    let device = Device::new_cuda(0)
+        .context("CUDA device required but not available")?;
     println!("Using device: {:?}", device);
 
     let mut engine =

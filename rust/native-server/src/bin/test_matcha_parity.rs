@@ -191,7 +191,8 @@ fn main() -> Result<()> {
     println!("MATCHA-TTS COMPONENT PARITY TESTS (RUST)");
     println!("============================================================");
 
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    let device = Device::new_cuda(0)
+        .context("CUDA device required but not available")?;
     println!("Using device: {:?}", device);
 
     // Run all tests

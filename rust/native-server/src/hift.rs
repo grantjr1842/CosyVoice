@@ -559,15 +559,10 @@ impl HiFTGenerator {
         let base_ch = config.base_channels;
 
         // Determine if causal
-        let is_causal = if vb.pp("conv_pre").contains_tensor("weight.original1")
+        let is_causal = vb.pp("conv_pre").contains_tensor("weight.original1")
             || vb
                 .pp("conv_pre")
-                .contains_tensor("parametrizations.weight.original1")
-        {
-            true
-        } else {
-            false
-        };
+                .contains_tensor("parametrizations.weight.original1");
         eprintln!("    [HiFT] is_causal: {}", is_causal);
 
         // Conv Pre
@@ -592,7 +587,7 @@ impl HiFTGenerator {
             let out_c = base_ch / (1 << (i + 1));
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
             // If causal, padding is 0, manual padding k-1
-            let conv_pad = if is_causal { 0 } else { 0 }; // Upsample convs typically have 0 padding, manual padding for causal
+            let conv_pad = 0; // Upsample convs typically have 0 padding, manual padding for causal
             let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, conv_pad)?;
             ups.push(conv);
         }
@@ -637,9 +632,7 @@ impl HiFTGenerator {
                 // If u=1: K=1. Pad=0. Manual=0.
                 // If u>1: K=u*2. Stride=u. Causal Pad = Stride-1 = u-1.
                 if u == 1 { (0, 0) } else { (0, u - 1) }
-            } else {
-                 if u == 1 { (0, 0) } else { (u/2, 0) } // Standard logic line 593: u/2
-            };
+            } else if u == 1 { (0, 0) } else { (u/2, 0) }; // Standard logic line 593: u/2
             source_down_pads.push(sd_manual_pad);
 
             let sd = if u == 1 {
