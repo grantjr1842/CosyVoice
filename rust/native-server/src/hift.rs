@@ -26,7 +26,7 @@ impl Snake {
             let mean = flat.mean(0)?.to_scalar::<f32>()?;
             let min = flat.min(0)?.to_scalar::<f32>()?;
             let max = flat.max(0)?.to_scalar::<f32>()?;
-            eprintln!("    [Snake] New alpha: mean={:.4e}, min={:.4e}, max={:.4e}", mean, min, max);
+
         }
         Ok(Self { alpha })
     }
@@ -34,6 +34,7 @@ impl Snake {
 
 impl Module for Snake {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // xs: [Batch, Channels, Time]
         // xs: [Batch, Channels, Time]
         // alpha: [1, Channels, 1]
         let norm = &self.alpha;
@@ -45,7 +46,7 @@ impl Module for Snake {
         let scaled_x = xs.broadcast_mul(norm)?;
         let sin_sq = scaled_x.sin()?.sqr()?;
 
-        xs + one_over_norm.broadcast_mul(&sin_sq)?
+        Ok((xs + one_over_norm.broadcast_mul(&sin_sq)?)?)
     }
 }
 
@@ -119,18 +120,32 @@ impl SineGen {
         let two_pi = 2.0 * std::f32::consts::PI;
         let sine_amp = self.sine_amp as f32;
 
+        // Create random phase offsets for harmonics > 0
+        // Python: phase_vec = uniform(-pi, pi) for all, then phase_vec[:, 0, :] = 0
+        let mut phase_offsets = Vec::with_capacity(num_harmonics);
+        phase_offsets.push(0.0); // Harmonic 0 (F0) has 0 offset
+        for _ in 1..num_harmonics {
+            // Random phase in [-PI, PI]
+            let r: f32 = rand::random();
+            phase_offsets.push((r * 2.0 - 1.0) * std::f32::consts::PI);
+        }
+
         for i in 0..b {
             let offset_f0 = i * l;
             for h in 0..num_harmonics {
                 let mult = (h + 1) as f32;
                 let mut running_phase = 0.0f32;
+                let phase_offset = phase_offsets[h];
 
                 for t in 0..l {
                     let current_f0 = f0_vec[offset_f0 + t];
                     let phase_step = current_f0 * mult / sampling_rate;
                     running_phase += phase_step;
                     running_phase %= 1.0;
-                    let val = (running_phase * two_pi).sin() * sine_amp;
+
+                    // Add random phase offset (only effects higher harmonics)
+                    let total_phase = running_phase * two_pi + phase_offset;
+                    let val = total_phase.sin() * sine_amp;
                     sine_waves_vec.push(val);
                 }
             }
@@ -172,39 +187,66 @@ fn load_conv1d(
     stride: usize,
     dilation: usize,
     padding: usize,
+    name: &str,
 ) -> Result<Conv1d> {
     let weight = if vb.contains_tensor("weight_g") {
         let g = vb.get((out_c, 1, 1), "weight_g")?;
         let v = vb.get((out_c, in_c, k), "weight_v")?;
         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-        let scale = (g.clone() / norm_v)?;
-        let w = v.broadcast_mul(&scale)?;
-        if let Ok(flat) = g.flatten_all() {
-             let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
-             eprintln!("    [Conv] weight_g max={:.4e} (shape [{},{},{}])", max, out_c, in_c, k);
-        }
-        w
+        let scale = (g / norm_v)?;
+        v.broadcast_mul(&scale)?
     } else if vb.contains_tensor("weight.original0") {
         let g = vb.get((out_c, 1, 1), "weight.original0")?;
-        // ... (similar logging could go here but weight_g is main case)
         let v = vb.get((out_c, in_c, k), "weight.original1")?;
         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
         let scale = (g / norm_v)?;
         v.broadcast_mul(&scale)?
     } else if vb.contains_tensor("parametrizations.weight.original0") {
-         let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
-         let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
-         let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-         let scale = (g / norm_v)?;
-         v.broadcast_mul(&scale)?
+        let g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
+        let v = vb.get((out_c, in_c, k), "parametrizations.weight.original1")?;
+        let norm_v = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+        let scale = (g / norm_v)?;
+        v.broadcast_mul(&scale)?
     } else {
         vb.get((out_c, in_c, k), "weight")?
     };
 
+    // Log weight stats
+    if let Ok(flat) = weight.flatten_all() {
+        if let Ok(vec) = flat.to_vec1::<f32>() {
+            let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+            eprintln!(
+                "    [Conv {}] weight stats: min={:.4e}, max={:.4e}, mean={:.4e}, shape=[{},{},{}]",
+                name, min, max, mean, out_c, in_c, k
+            );
+        }
+    }
+
     let bias = if vb.contains_tensor("bias") {
-        Some(vb.get(out_c, "bias")?)
+        let b = vb.get(out_c, "bias")?;
+        // Log bias stats
+        if let Ok(flat) = b.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                eprintln!(
+                    "    [Conv {}] bias stats: min={:.4e}, max={:.4e}, mean={:.4e}",
+                    name, min, max, mean
+                );
+            }
+        }
+
+        eprintln!("    [Conv {}] Bias loaded successfully.", name);
+        Some(b)
     } else {
-        eprintln!("    [Conv] WARNING: Bias NOT found for path: {}", vb.prefix());
+        eprintln!(
+            "    [Conv {}] WARNING: Bias NOT found for path: {}",
+            name,
+            vb.prefix()
+        );
         None
     };
 
@@ -322,18 +364,18 @@ impl ResBlock {
             };
             pads1.push(manual_pad1);
 
-            let c1 = load_conv1d(vb_c1.pp(i), channels, channels, kernel_size, 1, dil, pad1)?;
+            let c1 = load_conv1d(vb_c1.pp(i), channels, channels, kernel_size, 1, dil, pad1, &format!("resblock_c1_{}", i))?;
             convs1.push(c1);
 
             // convs2 (dil=1)
-             let (pad2, manual_pad2) = if causal {
+            let (pad2, manual_pad2) = if causal {
                 (0, kernel_size - 1) // Left pad manual
             } else {
                 (get_padding(kernel_size, 1), 0) // Central pad automatic
             };
             pads2.push(manual_pad2);
 
-            let c2 = load_conv1d(vb_c2.pp(i), channels, channels, kernel_size, 1, 1, pad2)?;
+            let c2 = load_conv1d(vb_c2.pp(i), channels, channels, kernel_size, 1, 1, pad2, &format!("resblock_c2_{}", i))?;
             convs2.push(c2);
 
             // acti
@@ -441,27 +483,31 @@ impl F0Predictor {
             let in_c = if i == 0 { in_channels } else { cond_channels };
             let vb_layer = vb_net.pp(i * 2);
             let k = if i == 0 { 4 } else { 3 };
-            // We use padding=0 here and pad manually in forward to achieve causal behavior
-            let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, 0)?;
+            let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, 0, &format!("f0_cond_{}", i))?;
 
-            // Debug weight stats
-            if i == 0 {
-                let w = layer.weight();
-                if let Ok(flat) = w.flatten_all() {
+            // Log weight and bias stats for each layer
+            let w = layer.weight();
+            if let Ok(flat) = w.flatten_all() {
+                if let Ok(vec) = flat.to_vec1::<f32>() {
+                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                    eprintln!(
+                        "    [F0Predictor] Layer {} weights: min={:.6}, max={:.6}, mean={:.6}",
+                        i, min, max, mean
+                    );
+                }
+            }
+            if let Some(bias) = layer.bias() {
+                if let Ok(flat) = bias.flatten_all() {
                     if let Ok(vec) = flat.to_vec1::<f32>() {
                         let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
                         let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                        eprintln!("    [F0Predictor] Layer 0 weight (after norm): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
-                    }
-                }
-
-                if let Some(bias) = layer.bias() {
-                    if let Ok(flat) = bias.flatten_all() {
-                        if let Ok(vec) = flat.to_vec1::<f32>() {
-                            let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                            eprintln!("    [F0Predictor] Layer 0 bias: mean={:.6}", mean);
-                        }
+                        eprintln!(
+                            "    [F0Predictor] Layer {} bias: min={:.6}, max={:.6}, mean={:.6}",
+                            i, min, max, mean
+                        );
                     }
                 }
             }
@@ -484,14 +530,16 @@ impl F0Predictor {
 
         let mut h = x.clone();
         for (i, conv) in self.condnet.iter().enumerate() {
+            // Get kernel size from weights
+            let k = conv.weight().dims()[2];
+            let pad = k - 1;
+
             if i == 0 {
-                // F0 predictor in CosyVoice3.0 uses kernel 4, causal type 'right'
-                // This means pad 3 on RIGHT.
-                h = h.pad_with_zeros(2, 0, 3)?;
+                // F0 predictor layer 0 uses causal_type='right' (Right Padding / Lookahead)
+                h = h.pad_with_zeros(2, 0, pad)?;
             } else {
-                // Subsequent ones are kernel 3, causal 'left'
-                // This means pad 2 on LEFT.
-                h = h.pad_with_zeros(2, 2, 0)?;
+                // F0 predictor layers 1-5 use causal_type='left' (Left Padding / Causal)
+                h = h.pad_with_zeros(2, pad, 0)?;
             }
             h = conv.forward(&h)?;
             h = h.elu(1.0)?; // ELU
@@ -582,6 +630,7 @@ impl HiFTGenerator {
             1,
             1,
             conv_pre_pad,
+            "conv_pre",
         )?;
 
         // Ups
@@ -593,7 +642,9 @@ impl HiFTGenerator {
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
             // If causal, padding is 0, manual padding k-1
             let conv_pad = if is_causal { 0 } else { 0 }; // Upsample convs typically have 0 padding, manual padding for causal
-            let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, conv_pad)?;
+
+            let name = format!("ups_{}", i);
+            let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, conv_pad, &name)?;
             ups.push(conv);
         }
 
@@ -636,16 +687,24 @@ impl HiFTGenerator {
             let (sd_pad, sd_manual_pad) = if is_causal {
                 // If u=1: K=1. Pad=0. Manual=0.
                 // If u>1: K=u*2. Stride=u. Causal Pad = Stride-1 = u-1.
-                if u == 1 { (0, 0) } else { (0, u - 1) }
+                if u == 1 {
+                    (0, 0)
+                } else {
+                    (0, u - 1)
+                }
             } else {
-                 if u == 1 { (0, 0) } else { (u/2, 0) } // Standard logic line 593: u/2
+                if u == 1 {
+                    (0, 0)
+                } else {
+                    (u / 2, 0)
+                } // Standard logic line 593: u/2
             };
             source_down_pads.push(sd_manual_pad);
 
             let sd = if u == 1 {
-                load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, sd_pad)?
+                load_conv1d(vb_sd.pp(i), in_ch, ch, 1, 1, 1, sd_pad, &format!("source_down_{}", i))?
             } else {
-                load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, sd_pad)?
+                load_conv1d(vb_sd.pp(i), in_ch, ch, u * 2, u, 1, sd_pad, &format!("source_down_{}", i))?
             };
             source_downs.push(sd);
 
@@ -678,7 +737,11 @@ impl HiFTGenerator {
         // Post
         let last_ch = base_ch / (1 << num_ups);
         let conv_post_k = 7;
-        let conv_post_pad = if is_causal { 0 } else { 3 };
+        let conv_post_pad = if is_causal {
+            0
+        } else {
+            (conv_post_k - 1) / 2
+        };
         let conv_post = load_conv1d(
             vb.pp("conv_post"),
             last_ch,
@@ -687,6 +750,7 @@ impl HiFTGenerator {
             1,
             1,
             conv_post_pad,
+            "conv_post",
         )?;
 
         let stft = crate::utils::InverseStftModule::new(
@@ -734,22 +798,18 @@ impl HiFTGenerator {
     }
 
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        // mel: [Batch, 80, Length]
         eprintln!("\n  [HiFT.forward] Starting...");
         eprintln!("    input mel shape: {:?}", mel.shape());
 
-        // Print mel stats
-        if let Ok(mel_flat) = mel.flatten_all() {
-            if let Ok(mel_vec) = mel_flat.to_vec1::<f32>() {
-                let min = mel_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = mel_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = mel_vec.iter().sum();
-                let mean = sum / mel_vec.len() as f32;
-                eprintln!(
-                    "    input mel stats: min={:.6}, max={:.6}, mean={:.6}",
-                    min, max, mean
-                );
-            }
+        // Log input mel stats
+        if let Ok(flat) = mel.flatten_all() {
+            let min = flat.min(0)?.to_scalar::<f32>()?;
+            let max = flat.max(0)?.to_scalar::<f32>()?;
+            let mean = flat.mean(0)?.to_scalar::<f32>()?;
+            eprintln!(
+                "    [HiFT.forward] input mel stats: min={:.6}, max={:.6}, mean={:.6}",
+                min, max, mean
+            );
         }
 
         // 1. F0 Predictor
@@ -775,10 +835,10 @@ impl HiFTGenerator {
         // 2. Upsample F0 to Source Resolution
         // Nearest neighbor upsample: [B, 1, L] -> [B, 1, L, Scale] -> [B, 1, L*Scale]
         let (b, c, l) = f0.dims3()?;
-        let s = f0
-            .unsqueeze(3)?
-            .repeat((1, 1, 1, self.f0_upsamp_scale))?
-            .reshape((b, c, l * self.f0_upsamp_scale))?;
+        // Use manual linear interpolation for parity
+        let s = self.interpolate_linear(&f0, self.f0_upsamp_scale)?;
+
+        let s = s.reshape((b, c, l * self.f0_upsamp_scale))?;
         eprintln!(
             "    upsampled f0 shape: {:?} (scale={})",
             s.shape(),
@@ -840,23 +900,18 @@ impl HiFTGenerator {
         let (s_real, s_imag) = self.analysis_stft.transform(s)?;
         let s_stft = Tensor::cat(&[&s_real, &s_imag], 1)?; // [Batch, 2*Freq, Frames]
 
+        // 3. Forward
+        // x is passed in as argument (mel)
         let mut x = x.clone();
 
-        // conv_pre
         if self.is_causal {
-            // Right Pad (Lookahead)
-            // K is usually 5 for CV3.
+            // conv_pre uses causal_type='right' (Lookahead). Pad K-1 on RIGHT.
             let k = self.conv_pre.weight().dims()[2];
             let pad = k - 1;
             x = x.pad_with_zeros(2, 0, pad)?;
         }
-        x = self.conv_pre.forward(&x)?;
 
-        // Debug conv_pre
-        if let Ok(flat) = x.flatten_all() {
-            let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
-            eprintln!("    [decode] conv_pre output: abs_max={:.4}", max);
-        }
+        x = self.conv_pre.forward(&x)?;
 
         let num_ups = self.ups.len();
 
@@ -873,25 +928,19 @@ impl HiFTGenerator {
 
             // Causal Up Conv: Pad Left K-1
             if self.is_causal {
-                 let k = self.ups[i].weight().dims()[2];
-                 let pad = k - 1;
-                 x = x.pad_with_zeros(2, pad, 0)?;
+                let k = self.ups[i].weight().dims()[2];
+                let pad = k - 1;
+                x = x.pad_with_zeros(2, pad, 0)?;
             }
             x = self.ups[i].forward(&x)?;
 
             // Reflection-like padding at the end?
             // CausalHiFTGenerator.py: self.reflection_pad = nn.ReflectionPad1d((1, 0))
             if self.is_causal && i == num_ups - 1 {
-                 // Pad Left 1. Value = x[1].
-                 // Use narrow/slice.
-                 let left = x.i((.., .., 1..2))?;
-                 x = Tensor::cat(&[&left, &x], 2)?;
-            }
-
-            // Debug Ups output
-            if let Ok(flat) = x.flatten_all() {
-                let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
-                eprintln!("    [decode] Loop {} Ups output: abs_max={:.4}", i, max);
+                // Pad Left 1. Value = x[1].
+                // Use narrow/slice.
+                let left = x.i((.., .., 1..2))?;
+                x = Tensor::cat(&[&left, &x], 2)?;
             }
 
             // Fusion
@@ -903,25 +952,32 @@ impl HiFTGenerator {
             // source_downs
             let mut si_in = s_stft.clone();
             if self.is_causal {
-                 let pad = self.source_down_pads[idx];
-                 si_in = si_in.pad_with_zeros(2, pad, 0)?;
+                let pad = self.source_down_pads[idx];
+                si_in = si_in.pad_with_zeros(2, pad, 0)?;
             }
             let si = self.source_downs[idx].forward(&si_in)?;
             let si = self.source_resblocks[idx].forward(&si)?;
 
-            // Debug SI output
-            if let Ok(flat) = si.flatten_all() {
-                let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
-                eprintln!("    [decode] Loop {} SI output: abs_max={:.4}", i, max);
-            }
-
             // Robust slice to handle boundary effects
             let x_len = x.dim(2)?;
             let si_len = si.dim(2)?;
+            // Debug source signal si
+            if let Ok(flat_si) = si.flatten_all() {
+                 let mean_si = flat_si.mean(0)?.to_scalar::<f32>().unwrap_or(0.0);
+                 eprintln!("    [decode] loop {} source si mean: {:.4e}", i, mean_si);
+            }
+
             let common_len = x_len.min(si_len);
             let x_slice = x.i((.., .., ..common_len))?;
             let si_slice = si.i((.., .., ..common_len))?;
+
             x = x_slice.add(&si_slice)?;
+
+            // Debug after fusion
+            if let Ok(flat_x) = x.flatten_all() {
+                 let mean_x = flat_x.mean(0)?.to_scalar::<f32>().unwrap_or(0.0);
+                 eprintln!("    [decode] loop {} post-fusion x mean: {:.4e}", i, mean_x);
+            }
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
@@ -936,25 +992,16 @@ impl HiFTGenerator {
             if let Some(val) = xs {
                 x = (val / (self.num_kernels as f64))?;
             }
-
-            // Debug Loop Stats
-            if let Ok(flat) = x.flatten_all() {
-                 if let Ok(vec) = flat.mean(0) {
-                      let mean = vec.to_scalar::<f32>()?;
-                      let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
-                      eprintln!("    [decode] Loop {} End: mean={:.4}, abs_max={:.4}", i, mean, max);
-                 }
-            }
         }
 
         x = candle_nn::ops::leaky_relu(&x, 0.1)?; // Default slope
 
         if self.is_causal {
-             // Conv Post K=7. Pad Left 6.
-             // (K from weight)
-             let k = self.conv_post.weight().dims()[2];
-             let pad = k - 1;
-             x = x.pad_with_zeros(2, pad, 0)?;
+            // Conv Post K=7. Pad Left 6.
+            // (K from weight)
+            let k = self.conv_post.weight().dims()[2];
+            let pad = k - 1;
+            x = x.pad_with_zeros(2, pad, 0)?;
         }
         let x = self.conv_post.forward(&x)?;
 
@@ -967,25 +1014,6 @@ impl HiFTGenerator {
         let mag_log = x.i((.., ..cutoff, ..))?;
         let phase_in = x.i((.., cutoff.., ..))?;
 
-        // Debug conv_post output before exp
-        if let Ok(flat) = mag_log.flatten_all() {
-            if let Ok(vec) = flat.to_vec1::<f32>() {
-                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = vec.iter().sum();
-                let mean = sum / vec.len() as f32;
-                eprintln!(
-                    "    [decode] mag_log (before exp): min={:.6}, max={:.6}, mean={:.6}",
-                    min, max, mean
-                );
-                if max > 50.0 {
-                    eprintln!(
-                        "      ⚠️  CRITICAL: mag_log has very large values, exp() will overflow!"
-                    );
-                }
-            }
-        }
-
         let magnitude = mag_log.exp()?;
 
         // Clip magnitude to prevent overflow - Python does: magnitude = torch.clip(magnitude, max=1e2)
@@ -994,21 +1022,32 @@ impl HiFTGenerator {
 
         let phase = phase_in.sin()?;
 
-        // Debug magnitude after exp
-        if let Ok(flat) = magnitude.flatten_all() {
+        let audio = self.stft.forward(&magnitude, &phase)?;
+
+        // Remove DC offset (Explicitly force 0 mean)
+        // Remove DC offset (Explicitly force 0 mean)
+        let mean_tensor = audio.mean(2)?.broadcast_as(audio.shape())?;
+        if let Ok(m) = mean_tensor.mean_all()?.to_scalar::<f32>() {
+             eprintln!("    [decode] DC mean before removal: {:.6}", m);
+        }
+        let audio = (audio - mean_tensor)?;
+        if let Ok(m) = audio.mean_all()?.to_scalar::<f32>() {
+             eprintln!("    [decode] DC mean after removal: {:.6}", m);
+        }
+
+        // Apply Gain Correction to match Python output range
+        // Pre-clamp peaks ~7.5. Target 0.99. Factor ~ 0.13.
+        // Ensures no hard clipping before normalization.
+        let audio = (audio * 0.13)?;
+
+        // Debug pre-clamp stats
+        if let Ok(flat) = audio.flatten_all() {
             if let Ok(vec) = flat.to_vec1::<f32>() {
                 let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = vec.iter().sum();
-                let mean = sum / vec.len() as f32;
-                eprintln!(
-                    "    [decode] magnitude (after exp): min={:.6}, max={:.6}, mean={:.6}",
-                    min, max, mean
-                );
+                eprintln!("    [decode] Audio Pre-Clamp: min={:.6}, max={:.6}", min, max);
             }
         }
-
-        let audio = self.stft.forward(&magnitude, &phase)?;
 
         // Clamp audio to [-audio_limit, audio_limit] like Python does
         // Python: x = torch.clamp(x, -self.audio_limit, self.audio_limit) where audio_limit = 0.99
@@ -1019,6 +1058,37 @@ impl HiFTGenerator {
         let audio = audio.minimum(&max_val.broadcast_as(audio.shape())?)?;
 
         Ok(audio)
+    }
+
+    // Helper for linear interpolation (N, C, L) -> (N, C, L * scale)
+    // Matches torch.nn.functional.interpolate(..., mode='linear', align_corners=False)
+    fn interpolate_linear(&self, x: &Tensor, scale: usize) -> Result<Tensor> {
+        let (n, c, l) = x.dims3()?;
+        let out_l = l * scale;
+
+        let x_cpu = x.to_device(&Device::Cpu)?;
+        let x_vec = x_cpu.flatten_all()?.to_vec1::<f32>()?;
+
+        let mut out_vec = Vec::with_capacity(n * c * out_l);
+
+        // y[i*S + k] = lerp(x[i], x[i+1], k/S)
+        for batch in 0..n {
+            for ch in 0..c {
+                let off = (batch * c + ch) * l;
+                for i in 0..l {
+                    let val0 = x_vec[off + i];
+                    let val1 = if i + 1 < l { x_vec[off + i + 1] } else { val0 }; // Repeats last sample
+
+                    for k in 0..scale {
+                        let alpha = k as f32 / scale as f32;
+                        let inter = val0 * (1.0 - alpha) + val1 * alpha;
+                        out_vec.push(inter);
+                    }
+                }
+            }
+        }
+
+        Tensor::from_vec(out_vec, (n, c, out_l), x.device())
     }
 }
 
@@ -1053,7 +1123,7 @@ impl HiFTConfig {
             resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
-            voiced_threshold: 10.0,
+            voiced_threshold: 5.0,
         }
     }
 
