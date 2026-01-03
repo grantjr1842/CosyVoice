@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use anyhow::Context;
 
 use shared::{config, ErrorResponse, HealthResponse, SynthesizeRequest};
 
@@ -65,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize Native TTS engine
     info!(model_dir = %model_dir, "Initializing Native TTS engine...");
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    let device = Device::new_cuda(0)
+        .context("CUDA device required but not available")?;
     info!("Using device: {:?}", device);
 
     let tts = NativeTtsEngine::new(&model_dir, Some(device))?;
