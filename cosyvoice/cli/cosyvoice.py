@@ -216,31 +216,32 @@ class CosyVoice3:
         ):
             if (not isinstance(i, Generator)) and len(i) < 0.5 * len(prompt_text):
                 logging.warning(
-                    "synthesis text {} too short than prompt text {}, this may lead to bad performance".format(
-                        i, prompt_text
-                    )
+                    "synthesis text %s too short than prompt text %s, this may lead to bad performance",
+                    i,
+                    prompt_text,
                 )
             model_input = self.frontend.frontend_zero_shot(
                 i, prompt_text, prompt_wav, self.sample_rate, zero_shot_spk_id
             )
-            start_time = time.time()
-            logging.info("synthesis text {}".format(i))
+            start_time = time.perf_counter()
+            logging.info("synthesis text %s", i)
             for model_output in self.model.tts(
                 **model_input, stream=stream, speed=speed
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
-                inference_time = time.time() - start_time
+                inference_time = time.perf_counter() - start_time
                 if speech_len > 0:
                     rtf = inference_time / speech_len
                     logging.info(
-                        "yield speech len {:.2f}s, inference time {:.3f}s, rtf {:.3f}".format(
-                            speech_len, inference_time, rtf
-                        )
+                        "yield speech len %.2fs, inference time %.3fs, rtf %.3f",
+                        speech_len,
+                        inference_time,
+                        rtf,
                     )
                 else:
                     logging.debug("yield speech len is 0, skipping rtf calculation")
                 yield model_output
-                start_time = time.time()
+                start_time = time.perf_counter()
 
     def inference_cross_lingual(
         self,
@@ -273,22 +274,22 @@ class CosyVoice3:
             model_input = self.frontend.frontend_cross_lingual(
                 i, prompt_wav, self.sample_rate, zero_shot_spk_id
             )
-            start_time = time.time()
-            logging.info("synthesis text {}".format(i))
+            start_time = time.perf_counter()
+            logging.info("synthesis text %s", i)
             for model_output in self.model.tts(
                 **model_input, stream=stream, speed=speed
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
                 if speech_len > 0:
                     logging.info(
-                        "yield speech len {}, rtf {}".format(
-                            speech_len, (time.time() - start_time) / speech_len
-                        )
+                        "yield speech len %s, rtf %s",
+                        speech_len,
+                        (time.perf_counter() - start_time) / speech_len,
                     )
                 else:
                     logging.debug("yield speech len is 0, skipping rtf calculation")
                 yield model_output
-                start_time = time.time()
+                start_time = time.perf_counter()
 
     def inference_instruct2(
         self,
@@ -323,22 +324,22 @@ class CosyVoice3:
             model_input = self.frontend.frontend_instruct2(
                 i, instruct_text, prompt_wav, self.sample_rate, zero_shot_spk_id
             )
-            start_time = time.time()
-            logging.info("synthesis text {}".format(i))
+            start_time = time.perf_counter()
+            logging.info("synthesis text %s", i)
             for model_output in self.model.tts(
                 **model_input, stream=stream, speed=speed
             ):
                 speech_len = model_output["tts_speech"].shape[1] / self.sample_rate
                 if speech_len > 0:
                     logging.info(
-                        "yield speech len {}, rtf {}".format(
-                            speech_len, (time.time() - start_time) / speech_len
-                        )
+                        "yield speech len %s, rtf %s",
+                        speech_len,
+                        (time.perf_counter() - start_time) / speech_len,
                     )
                 else:
                     logging.debug("yield speech len is 0, skipping rtf calculation")
                 yield model_output
-                start_time = time.time()
+                start_time = time.perf_counter()
 
 
 def AutoModel(**kwargs):

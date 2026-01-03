@@ -291,12 +291,11 @@ fn reflect_pad_1d(x: &Tensor, pad: usize) -> Result<Tensor> {
         }
     }
 
-    let shape = if rank == 2 {
-        (b, out_t)
+    if rank == 2 {
+        Tensor::from_vec(out, (b, out_t), device)
     } else {
-        (b, c, out_t)
-    };
-    Tensor::from_vec(out, shape, device)
+        Tensor::from_vec(out, (b, c, out_t), device)
+    }
 }
 
 /// Generates Hann Window of size N

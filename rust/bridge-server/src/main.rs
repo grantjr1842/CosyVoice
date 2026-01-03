@@ -117,38 +117,57 @@ async fn synthesize_handler(
         "Synthesizing speech"
     );
 
+    let SynthesizeRequest {
+        text,
+        prompt_audio,
+        prompt_text,
+        speaker,
+        speed,
+    } = request;
+
+    let prompt_audio = match prompt_audio {
+        Some(path) => path,
+        None => {
+            counter!("tts_requests_error").increment(1);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "prompt_audio is required for CosyVoice3 synthesis".to_string(),
+                    code: 400,
+                }),
+            )
+                .into_response();
+        }
+    };
+
     // Use spawn_blocking since Python inference is CPU-bound
     let result = tokio::task::spawn_blocking(move || {
-        // CosyVoice3 requires prompt audio for all synthesis modes
-        let prompt_audio = match &request.prompt_audio {
-            Some(path) => path.as_str(),
-            None => {
-                return Err(tts::TtsError::SynthesisError(
-                    "prompt_audio is required for CosyVoice3 synthesis".to_string()
-                ));
-            }
-        };
-
-        if let Some(prompt_text) = &request.prompt_text {
+        if let Some(prompt_text) = &prompt_text {
             // Zero-shot voice cloning
-            state.tts.synthesize_zero_shot(
-                &request.text,
-                prompt_audio,
-                prompt_text,
-                request.speed,
-            )
+            state
+                .tts
+                .synthesize_zero_shot(&text, &prompt_audio, prompt_text, speed)
         } else {
             // Instruct mode with default instruction
-            let instruct = request.speaker.as_deref().unwrap_or("Speak naturally in English.");
-            state.tts.synthesize_instruct(&request.text, instruct, prompt_audio, request.speed)
+            let instruct = speaker
+                .as_deref()
+                .unwrap_or("Speak naturally in English.");
+            state
+                .tts
+                .synthesize_instruct(&text, instruct, &prompt_audio, speed)
         }
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(Ok((samples, sample_rate))) => {
             let duration = start.elapsed();
             let audio_duration = samples.len() as f32 / sample_rate as f32;
-            let rtf = duration.as_secs_f32() / audio_duration;
+            let rtf = if audio_duration > 0.0 {
+                duration.as_secs_f32() / audio_duration
+            } else {
+                0.0
+            };
 
             histogram!("tts_synthesis_duration_seconds").record(duration.as_secs_f64());
             histogram!("tts_rtf").record(rtf as f64);

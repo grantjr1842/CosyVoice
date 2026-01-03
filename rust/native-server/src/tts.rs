@@ -170,12 +170,18 @@ impl NativeTtsEngine {
         speaker_embedding: &Tensor,
         flow_noise: Option<&Tensor>,
     ) -> Result<Vec<i16>, NativeTtsError> {
+        let debug = std::env::var("COSYVOICE_DEBUG")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+
         // Debug input tensors
-        eprintln!("\n=== SYNTHESIS DEBUG ===");
-        eprintln!("Input speech_tokens shape: {:?}", speech_tokens.shape());
-        eprintln!("Input prompt_tokens shape: {:?}", prompt_tokens.shape());
-        eprintln!("Input prompt_mel shape: {:?}", prompt_mel.shape());
-        eprintln!("Input speaker_embedding shape: {:?}", speaker_embedding.shape());
+        if debug {
+            eprintln!("\n=== SYNTHESIS DEBUG ===");
+            eprintln!("Input speech_tokens shape: {:?}", speech_tokens.shape());
+            eprintln!("Input prompt_tokens shape: {:?}", prompt_tokens.shape());
+            eprintln!("Input prompt_mel shape: {:?}", prompt_mel.shape());
+            eprintln!("Input speaker_embedding shape: {:?}", speaker_embedding.shape());
+        }
 
         // Print tensor statistics helper
         fn print_tensor_stats(name: &str, t: &Tensor) {
@@ -197,11 +203,15 @@ impl NativeTtsEngine {
             }
         }
 
-        print_tensor_stats("prompt_mel", prompt_mel);
-        print_tensor_stats("speaker_embedding", speaker_embedding);
+        if debug {
+            print_tensor_stats("prompt_mel", prompt_mel);
+            print_tensor_stats("speaker_embedding", speaker_embedding);
+        }
 
         // 1. Run Flow to get mel spectrogram
-        eprintln!("\n--- Running Flow inference... ---");
+        if debug {
+            eprintln!("\n--- Running Flow inference... ---");
+        }
         let mel = self.flow.inference(
             speech_tokens,
             prompt_tokens,
@@ -210,14 +220,20 @@ impl NativeTtsEngine {
             10, // n_timesteps
             flow_noise,
         )?;
-        eprintln!("Flow output shape: {:?}", mel.shape());
-        print_tensor_stats("flow_output_mel", &mel);
+        if debug {
+            eprintln!("Flow output shape: {:?}", mel.shape());
+            print_tensor_stats("flow_output_mel", &mel);
+        }
 
         // 2. Run HiFT to get audio
-        eprintln!("\n--- Running HiFT inference... ---");
+        if debug {
+            eprintln!("\n--- Running HiFT inference... ---");
+        }
         let audio = self.hift.forward(&mel)?;
-        eprintln!("HiFT output shape: {:?}", audio.shape());
-        print_tensor_stats("hift_output_audio", &audio);
+        if debug {
+            eprintln!("HiFT output shape: {:?}", audio.shape());
+            print_tensor_stats("hift_output_audio", &audio);
+        }
 
         // 3. Convert to i16 samples
         let audio_vec: Vec<f32> = audio.flatten_all()?.to_vec1()?;

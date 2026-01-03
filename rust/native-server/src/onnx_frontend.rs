@@ -9,10 +9,13 @@
 use candle_core::{Device, Tensor};
 // Import ExecutionProvider trait
 #[cfg(feature = "cuda")]
-use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
+use ort::execution_providers::{
+    CPUExecutionProvider, CUDAExecutionProvider, TensorRTExecutionProvider,
+};
 use ort::inputs;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
+use std::env;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -64,11 +67,22 @@ impl OnnxFrontend {
 
         // Initialize ORT sessions
         eprintln!("Creating speech_tokenizer session (builder init)...");
+        let intra_threads = env::var("COSYVOICE_ORT_INTRA_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let inter_threads = env::var("COSYVOICE_ORT_INTER_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+
         let builder = Session::builder()
             .map_err(|e| FrontendError::OrtError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads)
+            .map_err(|e| FrontendError::OrtError(e.to_string()))?
+            .with_inter_threads(inter_threads)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
 
         // Register Execution Providers (TensorRT -> CUDA -> CPU)
@@ -77,6 +91,7 @@ impl OnnxFrontend {
             .with_execution_providers(vec![
                 TensorRTExecutionProvider::default().build(),
                 CUDAExecutionProvider::default().build(),
+                CPUExecutionProvider::default().build(),
             ])
             .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?;
 
@@ -89,9 +104,11 @@ impl OnnxFrontend {
         eprintln!("Creating campplus session...");
         let builder = Session::builder()
             .map_err(|e| FrontendError::OrtError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads)
+            .map_err(|e| FrontendError::OrtError(e.to_string()))?
+            .with_inter_threads(inter_threads)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
 
         // Register Execution Providers for Campplus
@@ -100,6 +117,7 @@ impl OnnxFrontend {
             .with_execution_providers(vec![
                 TensorRTExecutionProvider::default().build(),
                 CUDAExecutionProvider::default().build(),
+                CPUExecutionProvider::default().build(),
             ])
             .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?;
 

@@ -2,8 +2,9 @@
 //!
 //! This module uses the CosyVoice3 Python model for TTS synthesis.
 
+use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyAny, PyList};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -89,23 +90,7 @@ impl TtsEngine {
             // Iterate over the generator
             for result in generator.try_iter()? {
                 let output = result?;
-                let speech_tensor = output.get_item("tts_speech")?;
-
-                // Convert tensor to samples: speech is [1, samples] shape
-                let samples_list = speech_tensor
-                    .call_method0("squeeze")?
-                    .call_method0("cpu")?
-                    .call_method0("numpy")?
-                    .call_method0("tolist")?;
-
-                let samples_f32: Vec<f32> = samples_list.extract()?;
-
-                // Convert f32 to i16
-                all_samples.extend(
-                    samples_f32
-                        .iter()
-                        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16),
-                );
+                append_samples_from_output(&output, &mut all_samples)?;
             }
 
             Ok((all_samples, self.sample_rate))
@@ -138,22 +123,7 @@ impl TtsEngine {
             // Iterate over the generator
             for result in generator.try_iter()? {
                 let output = result?;
-                let speech_tensor = output.get_item("tts_speech")?;
-
-                // Convert tensor to samples
-                let samples_list = speech_tensor
-                    .call_method0("squeeze")?
-                    .call_method0("cpu")?
-                    .call_method0("numpy")?
-                    .call_method0("tolist")?;
-
-                let samples_f32: Vec<f32> = samples_list.extract()?;
-
-                all_samples.extend(
-                    samples_f32
-                        .iter()
-                        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16),
-                );
+                append_samples_from_output(&output, &mut all_samples)?;
             }
 
             Ok((all_samples, self.sample_rate))
@@ -179,4 +149,30 @@ impl TtsEngine {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+}
+
+fn append_samples_from_output(
+    output: &Bound<'_, PyAny>,
+    all_samples: &mut Vec<i16>,
+) -> Result<(), TtsError> {
+    let speech_tensor = output.get_item("tts_speech")?;
+    let numpy_array = speech_tensor
+        .call_method0("squeeze")?
+        .call_method0("cpu")?
+        .call_method0("numpy")?
+        .call_method0("ravel")?;
+    let samples = numpy_array
+        .downcast::<PyArray1<f32>>()
+        .map_err(|e| TtsError::PythonError(e.to_string()))?;
+    let samples = samples.readonly();
+    let slice = samples
+        .as_slice()
+        .map_err(|e| TtsError::SynthesisError(e.to_string()))?;
+    all_samples.reserve(slice.len());
+    all_samples.extend(
+        slice
+            .iter()
+            .map(|&s| (s * 32767.0_f32).clamp(-32768.0_f32, 32767.0_f32) as i16),
+    );
+    Ok(())
 }

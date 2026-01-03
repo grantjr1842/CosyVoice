@@ -53,18 +53,33 @@ class CosyVoiceFrontEnd:
         option.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         )
-        option.intra_op_num_threads = 1
+        option.intra_op_num_threads = int(os.getenv("ORT_INTRA_OP_NUM_THREADS", "1"))
+        option.inter_op_num_threads = int(os.getenv("ORT_INTER_OP_NUM_THREADS", "1"))
+        option.enable_cpu_mem_arena = True
+        option.enable_mem_pattern = True
+        available_providers = set(onnxruntime.get_available_providers())
+        gpu_providers = []
+        if "TensorrtExecutionProvider" in available_providers:
+            gpu_providers.append("TensorrtExecutionProvider")
+        if "CUDAExecutionProvider" in available_providers:
+            gpu_providers.append("CUDAExecutionProvider")
+        gpu_providers.append("CPUExecutionProvider")
         self.campplus_session = onnxruntime.InferenceSession(
-            campplus_model, sess_options=option, providers=["CPUExecutionProvider"]
+            campplus_model,
+            sess_options=option,
+            providers=(
+                gpu_providers
+                if os.getenv("COSYVOICE_ORT_CAMPPLUS_GPU", "0") == "1"
+                else ["CPUExecutionProvider"]
+            ),
+        )
+        speech_providers = (
+            gpu_providers if torch.cuda.is_available() else ["CPUExecutionProvider"]
         )
         self.speech_tokenizer_session = onnxruntime.InferenceSession(
             speech_tokenizer_model,
             sess_options=option,
-            providers=[
-                "CUDAExecutionProvider"
-                if torch.cuda.is_available()
-                else "CPUExecutionProvider"
-            ],
+            providers=speech_providers,
         )
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device)
