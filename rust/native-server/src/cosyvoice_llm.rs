@@ -268,10 +268,22 @@ impl CosyVoiceLLM {
         self.sample_from_weighted(&candidates)
     }
 
-    fn sample_ras(&self, logp: &Tensor, decoded_tokens: &[u32], sampling_k: usize) -> Result<u32> {
+    fn sample_ras(
+        &self,
+        logp: &Tensor,
+        decoded_tokens: &[u32],
+        sampling_k: usize,
+        ignore_stop: bool,
+    ) -> Result<u32> {
         let logp = logp.squeeze(0)?;
         let logp_vec: Vec<f32> = logp.to_vec1()?;
-        let probs: Vec<f32> = logp_vec.iter().map(|v| v.exp()).collect();
+        let mut probs: Vec<f32> = logp_vec.iter().map(|v| v.exp()).collect();
+        if ignore_stop {
+            let stop_start = self.sampling_vocab_size.min(probs.len());
+            for p in probs.iter_mut().skip(stop_start) {
+                *p = 0.0;
+            }
+        }
 
         let top_id = self
             .sample_nucleus(&probs, self.config.sampling_top_p, sampling_k)
@@ -304,7 +316,7 @@ impl CosyVoiceLLM {
         let max_trials = 100;
         let mut trials = 0;
         loop {
-            let top_id = self.sample_ras(logp, decoded_tokens, sampling_k)?;
+            let top_id = self.sample_ras(logp, decoded_tokens, sampling_k, ignore_stop)?;
             if !ignore_stop || !self.is_stop_token(top_id) {
                 return Ok(top_id);
             }
