@@ -1,0 +1,938 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agent-keepalive: single entrypoint keepalive runner with prompt->issue creation,
+# wake-on-new-work polling, stall detection, blocked notification, and GitHub Projects integration.
+#
+# Exit codes:
+# 0 complete
+# 2 blocked (human required)
+# 3 env/auth/preflight failure
+# 4 lock held
+
+SELF="$(basename "$0")"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AGENT_BIN="${AGENT_BIN:-$ROOT_DIR/agent}"
+STATE_FILE="${STATE_FILE:-$ROOT_DIR/.agent/state.jsonl}"
+
+EXECUTE=0
+DRY=0
+ONCE=0
+SLEEP_SECS=15
+MAX_SLEEP_SECS=300
+POLL_INTERVAL=30
+JITTER_PCT=20
+
+STALL_MINUTES=20
+STALL_MAX=3
+
+PROMPT=""
+PROMPT_FILE=""
+PROMPT_STDIN=0
+PROMPT_SPLIT=0
+
+# Prompt splitting behavior:
+# - --prompt-split: force splitting
+# - auto-split (default on): split when the prompt appears multi-task even without bullets/flag
+PROMPT_AUTO_SPLIT=1
+PROMPT_MAX_ISSUES=10
+PROMPT_TITLE_PREFIX=""
+PROMPT_PARENT=0
+
+NO_NOTIFY_BLOCKED=0
+NO_CREATE_TRACKING=0
+
+PROJECT=""
+PROJECT_STATUS_FIELD="Status"
+PROJECT_QUEUED_OPTION=""
+PROJECT_STALLED_OPTION="Stalled"
+PROJECT_BLOCKED_OPTION="Blocked"
+
+# Cache project metadata to avoid repeated GraphQL lookups.
+PROJECT_CACHE_FILE="${PROJECT_CACHE_FILE:-$ROOT_DIR/.agent/project_cache.json}"
+
+# Cached project identifiers (populated lazily by ensure_project_cache)
+PROJECT_ID=""
+PROJECT_STATUS_FIELD_ID=""
+PROJECT_OPTION_QUEUED_ID=""
+PROJECT_OPTION_STALLED_ID=""
+PROJECT_OPTION_BLOCKED_ID=""
+
+LOCK_PATH="${LOCK_PATH:-$ROOT_DIR/.agent/keepalive.lock}"
+
+usage() {
+  cat <<EOF
+Usage: $SELF [--execute|--dry] [options]
+
+Core:
+  --execute               Run mutating operations (git/GitHub)
+  --dry                   Non-mutating loop (best-effort)
+  --once                  Run a single cycle then exit
+
+Polling/backoff:
+  --sleep SECS            Base sleep between cycles (default: $SLEEP_SECS)
+  --max-sleep SECS        Max backoff sleep (default: $MAX_SLEEP_SECS)
+  --poll-interval SECS    Min interval between GitHub queue polls (default: $POLL_INTERVAL)
+  --jitter PCT            Sleep jitter percentage (default: $JITTER_PCT)
+
+Stall detection:
+  --stall-minutes N       Minutes without progress => stalled (default: $STALL_MINUTES)
+  --stall-max N           After N stalls => blocked escalation (default: $STALL_MAX)
+
+Prompt -> Issue creation:
+  --prompt "TEXT"         Create a GitHub issue from this prompt (then continue loop)
+  --prompt-file PATH      Read prompt from file
+  --prompt-stdin          Read prompt from stdin
+  --prompt-split          Split prompt into multiple issues (bullets/numbered lines)
+  --no-prompt-auto-split  Disable auto-splitting when prompt appears multi-task
+  --prompt-max N          Max issues created from a single prompt (default: $PROMPT_MAX_ISSUES)
+  --prompt-title-prefix S Prefix applied to each created issue title
+  --prompt-parent         Create a parent tracking issue linking to the created issues
+
+Notifications:
+  --no-notify-blocked     Do not post comments/labels/project updates on blocked/stalled
+  --no-create-tracking    If blocked issue cannot be inferred, do not create tracking issue
+
+GitHub Project (v2):
+  --project OWNER/NUMBER          e.g. my-org/12
+  --project-status FIELD          e.g. Status (default: $PROJECT_STATUS_FIELD)
+  --project-queued OPTION         e.g. Todo (applied on issue creation)
+  --project-stalled OPTION        e.g. Stalled (default: $PROJECT_STALLED_OPTION)
+  --project-blocked OPTION        e.g. Blocked (default: $PROJECT_BLOCKED_OPTION)
+
+Other:
+  -h, --help              Show help
+
+EOF
+}
+
+die(){ echo "ERROR: $*" >&2; exit 3; }
+
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+
+num_re='^[0-9]+$'
+validate_int(){ [[ "$2" =~ $num_re ]] || die "Invalid $1: $2 (must be integer)"; }
+
+# Minimal robust sleep with jitter
+jitter_sleep() {
+  local base="$1"
+  local pct="$2"
+  if [[ "$pct" -le 0 ]]; then sleep "$base"; return; fi
+  # compute jitter range in bash without bc
+  local delta=$(( base * pct / 100 ))
+  local lo=$(( base - delta ))
+  local hi=$(( base + delta ))
+  [[ "$lo" -lt 0 ]] && lo=0
+  local span=$(( hi - lo + 1 ))
+  local r=$(( RANDOM % span ))
+  local s=$(( lo + r ))
+  sleep "$s"
+}
+
+# Locking: prefer flock if present.
+LOCK_FD=""
+acquire_lock() {
+  mkdir -p "$(dirname "$LOCK_PATH")"
+  if command -v flock >/dev/null 2>&1; then
+    # shellcheck disable=SC3003
+    exec {LOCK_FD}>"$LOCK_PATH"
+    if ! flock -n "$LOCK_FD"; then
+      echo "Lock held: $LOCK_PATH" >&2
+      exit 4
+    fi
+  else
+    if ! ( set -o noclobber; echo "$$" >"$LOCK_PATH" ) 2>/dev/null; then
+      echo "Lock held: $LOCK_PATH" >&2
+      exit 4
+    fi
+  fi
+}
+
+release_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    # lock auto-released on process exit; best-effort cleanup file
+    rm -f "$LOCK_PATH" 2>/dev/null || true
+  else
+    rm -f "$LOCK_PATH" 2>/dev/null || true
+  fi
+}
+
+cleanup() { release_lock; }
+trap cleanup EXIT INT TERM HUP
+
+# Parse prompt into title/body
+prompt_to_title_body() {
+  local prompt="$1"
+  local title=""
+  local body="$prompt"
+
+  # If starts with Title: ... then split
+  if [[ "$prompt" =~ ^[Tt]itle:[[:space:]]*(.+)$ ]]; then
+    title="${BASH_REMATCH[1]}"
+    body="$(echo "$prompt" | sed -n '2,$p')"
+    # trim leading blank lines
+    body="$(echo "$body" | sed '/./,$!d')"
+  fi
+
+  if [[ -z "$title" ]]; then
+    # title from first non-empty line (truncate)
+    title="$(echo "$prompt" | sed -n '/./{p;q;}')"
+  fi
+
+  # enforce max title length ~200
+  if [[ "${#title}" -gt 200 ]]; then
+    title="${title:0:197}..."
+  fi
+
+  printf '%s\n%s\n' "$title" "$body"
+}
+
+split_prompt_items() {
+  # Returns one item per line. Attempts to split on:
+  # - bullets (-, *, •)
+  # - numbered list (1., 1), 1:, 1-)
+  # - paragraphs (blank-line separated)
+  # - light heuristic sentence splitting when prompt looks like a compound request
+  local prompt="$1"
+
+  python3 - <<'PY' "$prompt"
+import re,sys
+text=sys.argv[1].strip()
+if not text:
+  sys.exit(0)
+
+def norm(s:str)->str:
+  s=re.sub(r"\s+"," ",s).strip()
+  return s
+
+# 1) Bullets / numbered lines
+lines=[l.rstrip() for l in text.splitlines()]
+items=[]
+for l in lines:
+  m=re.match(r"^\s*(?:[-*•]|\d+[\.)\]:-])\s+(.*)$", l)
+  if m:
+    items.append(norm(m.group(1)))
+
+if items:
+  for it in items:
+    if it:
+      print(it)
+  sys.exit(0)
+
+# 2) Numbered inline forms: "1) ... 2) ..." / "1. ... 2. ..."
+m=re.findall(r"(?:^|\s)(\d+[\.)])\s+([^\n]+)", text)
+if len(m) >= 2:
+  # Extract the segments in order of appearance; keep bodies
+  out=[]
+  for _,seg in m:
+    seg=norm(seg)
+    if seg:
+      out.append(seg)
+  if len(out) >= 2:
+    for it in out:
+      print(it)
+    sys.exit(0)
+
+# 3) Paragraph split
+paras=[norm(p) for p in re.split(r"\n\s*\n+", text) if norm(p)]
+if len(paras) >= 2:
+  for p in paras:
+    print(p)
+  sys.exit(0)
+
+# 4) Heuristic split on conjunction markers if it looks multi-task
+markers=[";", " also ", " additionally ", " then ", " next ", " and also ", " plus "]
+low=" "+text.lower()+" "
+if any(m in low for m in markers):
+  # Prefer semicolons; otherwise split on markers (limited)
+  if ";" in text:
+    parts=[norm(p) for p in text.split(";") if norm(p)]
+  else:
+    parts=[text]
+    for mk in [" and also "," also "," additionally "," then "," next "," plus "]:
+      new=[]
+      for part in parts:
+        sub=re.split(re.escape(mk), " "+part+" ", flags=re.IGNORECASE)
+        # re.split keeps empties; rebuild
+        built=[norm(s) for s in sub if norm(s)]
+        new.extend(built if built else [norm(part)])
+      parts=new
+    parts=[p for p in parts if p]
+
+  # Only accept if it genuinely produced multiple reasonable items.
+  parts=[p for p in parts if len(p) >= 12]
+  if 2 <= len(parts) <= 20:
+    for p in parts:
+      print(p)
+    sys.exit(0)
+
+# Default: single item
+print(norm(text))
+PY
+}
+
+should_auto_split() {
+  local prompt="$1"
+  mapfile -t _items < <(split_prompt_items "$prompt")
+  [[ "${#_items[@]}" -ge 2 ]]
+}
+
+split_prompt_auto() {
+  # Heuristic splitter for non-bulleted prompts.
+  # Order:
+  # 1) bullets/numbered (handled by split_prompt_items)
+  # 2) paragraphs separated by blank lines
+  # 3) inline numbered lists ("1) ... 2) ...")
+  # 4) "Also/Additionally/Then" sentence starters and semicolons
+  local prompt="$1"
+
+  python3 - <<'PY' "$prompt"
+import re,sys
+p=sys.argv[1].strip()
+
+def norm(s:str)->str:
+  s=re.sub(r"\s+"," ",s).strip()
+  return s
+
+items=[]
+
+# If bullets exist, let the bash splitter handle it by emitting nothing here.
+if re.search(r"(?m)^\s*([-*]|\d+\.)\s+", p):
+  # Emit nothing to allow upstream to use split_prompt_items
+  sys.exit(0)
+
+# Paragraph split
+paras=[norm(x) for x in re.split(r"\n\s*\n+", p) if norm(x)]
+if len(paras) >= 2:
+  items=paras
+else:
+  # Inline numbered list: 1) ... 2) ... or 1. ... 2.
+  m=re.split(r"\s*(?:^|\n)?\s*(?=\d+[\).]\s+)", p, flags=re.M)
+  cand=[norm(x) for x in m if norm(x)]
+  if len(cand) >= 2 and all(re.match(r"^\d+[\).]\s+", c) for c in cand):
+    items=[re.sub(r"^\d+[\).]\s+","",c).strip() for c in cand]
+  else:
+    # Discourse markers + semicolons
+    q=p
+    # Encourage splits before common add-on markers
+    q=re.sub(r"(?i)\b(also|additionally|then|next|separately|in addition)\b\s*[:,]", "\n\n\\1:", q)
+    parts=[norm(x) for x in re.split(r"(?:;\s+|\n\n+)", q) if norm(x)]
+    # Only accept if we got multiple non-trivial chunks
+    if len(parts) >= 2 and sum(1 for x in parts if len(x) >= 20) >= 2:
+      items=parts
+
+for it in items:
+  print(it)
+PY
+}
+
+infer_priority_label() {
+  local text="$1"
+  shopt -s nocasematch
+  if [[ "$text" =~ (urgent|asap|critical|blocker|sev0|sev1|p0|high) ]]; then
+    echo "priority:high"
+  elif [[ "$text" =~ (soon|important|p1|medium) ]]; then
+    echo "priority:medium"
+  else
+    echo "priority:low"
+  fi
+  shopt -u nocasematch
+}
+
+gh_authed() {
+  command -v gh >/dev/null 2>&1 || return 1
+  gh auth status >/dev/null 2>&1
+}
+
+gh_repo() {
+  gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true
+}
+
+create_issue() {
+  local prompt="$1"
+  local tb; tb="$(prompt_to_title_body "$prompt")"
+  local title body
+  title="$(echo "$tb" | sed -n '1p')"
+  body="$(echo "$tb" | sed -n '2,$p')"
+
+  if [[ -n "$PROMPT_TITLE_PREFIX" ]]; then
+    title="$PROMPT_TITLE_PREFIX$title"
+  fi
+
+  local prio; prio="$(infer_priority_label "$prompt")"
+
+  local args=(issue create --title "$title" --body "$body")
+  local url
+  url="$(gh "${args[@]}")"
+  # Apply labels after create to avoid failure if labels absent in create step.
+  gh issue edit "$url" --add-label "agent:queued" --add-label "$prio" >/dev/null
+
+  if [[ -n "$PROJECT" ]]; then
+    project_add_and_set_status "$url" "${PROJECT_QUEUED_OPTION:-}" || true
+  fi
+
+  echo "$url"
+}
+
+create_parent_issue() {
+  local title="$1"
+  local body="$2"
+  local url
+  url="$(gh issue create --title "$title" --body "$body")"
+  gh issue edit "$url" --add-label "agent:queued" >/dev/null 2>&1 || true
+  [[ -n "$PROJECT" ]] && project_add_and_set_status "$url" "${PROJECT_QUEUED_OPTION:-}" || true
+  echo "$url"
+}
+
+# Project helpers (GraphQL). Best-effort: if anything fails, continue.
+project_add_and_set_status() {
+  local issue_url="$1"
+  local status_option="$2"
+  [[ -z "$PROJECT" ]] && return 0
+  gh_authed || return 0
+
+  ensure_project_cache || return 0
+  [[ -z "$PROJECT_ID" ]] && return 0
+
+  # Add item by content id (need node_id of issue)
+  local issue_node
+  issue_node="$(gh api "$issue_url" --jq .node_id 2>/dev/null || true)"
+  [[ -z "$issue_node" ]] && return 0
+
+  local add_mut
+  add_mut=$(cat <<'GQL'
+mutation($projectId:ID!, $contentId:ID!) {
+  addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}) { item { id } }
+}
+GQL
+)
+  local add_resp
+  add_resp="$(gh api graphql -f query="$add_mut" -F projectId="$PROJECT_ID" -F contentId="$issue_node" 2>/dev/null || true)"
+  [[ -z "$add_resp" ]] && return 0
+  local item_id
+  item_id="$(python3 - <<'PY' "$add_resp"
+import json,sys
+d=json.loads(sys.argv[1])
+print(d.get("data",{}).get("addProjectV2ItemById",{}).get("item",{}).get("id",""))
+PY
+)"
+  [[ -z "$item_id" ]] && return 0
+
+  # Set status if option id present
+  local desired_opt_id=""
+  case "$status_option" in
+    "") desired_opt_id="";;
+    "${PROJECT_QUEUED_OPTION}") desired_opt_id="$PROJECT_OPTION_QUEUED_ID";;
+    "${PROJECT_STALLED_OPTION}") desired_opt_id="$PROJECT_OPTION_STALLED_ID";;
+    "${PROJECT_BLOCKED_OPTION}") desired_opt_id="$PROJECT_OPTION_BLOCKED_ID";;
+    *) desired_opt_id="$(python3 - <<'PY' "$PROJECT_CACHE_FILE" "$status_option"
+import json,sys
+path=sys.argv[1]
+name=sys.argv[2]
+try:
+  d=json.load(open(path))
+except Exception:
+  print("")
+  sys.exit(0)
+print(d.get('status_options',{}).get(name, ""))
+PY
+)";;
+  esac
+
+  if [[ -n "$PROJECT_STATUS_FIELD_ID" && -n "$desired_opt_id" ]]; then
+    local set_mut
+    set_mut=$(cat <<'GQL'
+mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+  updateProjectV2ItemFieldValue(input:{
+    projectId:$projectId, itemId:$itemId, fieldId:$fieldId,
+    value:{singleSelectOptionId:$optionId}
+  }) { projectV2Item { id } }
+}
+GQL
+)
+    gh api graphql -f query="$set_mut" -F projectId="$PROJECT_ID" -F itemId="$item_id" -F fieldId="$PROJECT_STATUS_FIELD_ID" -F optionId="$desired_opt_id" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_project_cache() {
+  [[ -z "$PROJECT" ]] && return 1
+  gh_authed || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  # If cache exists and matches current configuration, load it.
+  if [[ -f "$PROJECT_CACHE_FILE" ]]; then
+    local cached_project cached_field
+    read -r cached_project cached_field < <(python3 - <<'PY' "$PROJECT_CACHE_FILE" 2>/dev/null || true
+import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  print(d.get('project',''))
+  print(d.get('status_field',''))
+except Exception:
+  print('')
+  print('')
+PY
+)
+    if [[ "$cached_project" == "$PROJECT" && "$cached_field" == "$PROJECT_STATUS_FIELD" ]]; then
+      load_project_cache
+      return 0
+    fi
+  fi
+
+  refresh_project_cache
+  load_project_cache
+}
+
+load_project_cache() {
+  [[ -f "$PROJECT_CACHE_FILE" ]] || return 1
+  local out
+  out="$(python3 - <<'PY' "$PROJECT_CACHE_FILE"
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(d.get('project_id',''))
+print(d.get('status_field_id',''))
+print(d.get('status_options',{}).get(d.get('queued_option',''),''))
+print(d.get('status_options',{}).get(d.get('stalled_option',''),''))
+print(d.get('status_options',{}).get(d.get('blocked_option',''),''))
+PY
+)"
+  PROJECT_ID="$(echo "$out" | sed -n '1p')"
+  PROJECT_STATUS_FIELD_ID="$(echo "$out" | sed -n '2p')"
+  PROJECT_OPTION_QUEUED_ID="$(echo "$out" | sed -n '3p')"
+  PROJECT_OPTION_STALLED_ID="$(echo "$out" | sed -n '4p')"
+  PROJECT_OPTION_BLOCKED_ID="$(echo "$out" | sed -n '5p')"
+  return 0
+}
+
+refresh_project_cache() {
+  # PROJECT format: owner/number
+  local owner="${PROJECT%/*}"
+  local number="${PROJECT#*/}"
+
+  local q
+  q=$(cat <<'GQL'
+query($owner:String!, $number:Int!) {
+  organization(login:$owner) {
+    projectV2(number:$number) {
+      id
+      fields(first:50) {
+        nodes {
+          ... on ProjectV2SingleSelectField { id name options { id name } }
+        }
+      }
+    }
+  }
+  user(login:$owner) {
+    projectV2(number:$number) {
+      id
+      fields(first:50) {
+        nodes {
+          ... on ProjectV2SingleSelectField { id name options { id name } }
+        }
+      }
+    }
+  }
+}
+GQL
+)
+
+  local resp
+  resp="$(gh api graphql -f query="$q" -F owner="$owner" -F number="$number" 2>/dev/null || true)"
+  [[ -z "$resp" ]] && return 1
+
+  mkdir -p "$(dirname "$PROJECT_CACHE_FILE")" 2>/dev/null || true
+  python3 - <<'PY' "$resp" "$PROJECT" "$PROJECT_STATUS_FIELD" "$PROJECT_QUEUED_OPTION" "$PROJECT_STALLED_OPTION" "$PROJECT_BLOCKED_OPTION" "$PROJECT_CACHE_FILE"
+import json,sys,os
+resp=json.loads(sys.argv[1])
+project=sys.argv[2]
+field_name=sys.argv[3]
+queued=sys.argv[4]
+stalled=sys.argv[5]
+blocked=sys.argv[6]
+path=sys.argv[7]
+
+proj=None
+for root in ("organization","user"):
+  node=resp.get("data",{}).get(root)
+  if node and node.get("projectV2"):
+    proj=node.get("projectV2")
+    if proj: break
+
+if not proj:
+  raise SystemExit(0)
+
+project_id=proj.get("id","")
+status_field_id=""
+status_options={}
+for f in proj.get("fields",{}).get("nodes",[]):
+  if f.get("name")==field_name:
+    status_field_id=f.get("id","")
+    for o in f.get("options",[]) or []:
+      status_options[o.get("name","")] = o.get("id","")
+    break
+
+data={
+  "project": project,
+  "project_id": project_id,
+  "status_field": field_name,
+  "status_field_id": status_field_id,
+  "status_options": status_options,
+  "queued_option": queued,
+  "stalled_option": stalled,
+  "blocked_option": blocked,
+}
+
+tmp=path+".tmp"
+with open(tmp,"w",encoding="utf-8") as f:
+  json.dump(data,f,indent=2,sort_keys=True)
+os.replace(tmp,path)
+PY
+}
+
+queue_exists_remote() {
+  gh_authed || return 1
+  local repo; repo="$(gh_repo)"
+  [[ -z "$repo" ]] && return 1
+  # Throttle by POLL_INTERVAL using a timestamp file
+  local tsfile="$ROOT_DIR/.agent/.poll_ts"
+  local now; now="$(date +%s)"
+  local last=0
+  [[ -f "$tsfile" ]] && last="$(cat "$tsfile" 2>/dev/null || echo 0)"
+  if (( now - last < POLL_INTERVAL )); then
+    return 1
+  fi
+  echo "$now" >"$tsfile" 2>/dev/null || true
+
+  local n
+  n="$(gh issue list --label "agent:queued" --limit 1 --json number -q '.[0].number' 2>/dev/null || true)"
+  [[ -n "$n" && "$n" != "null" ]]
+}
+
+last_progress_epoch() {
+  # Parse last "progress" or "task_*" event timestamp from state.jsonl if present.
+  [[ -f "$STATE_FILE" ]] || { echo 0; return; }
+  python3 - <<'PY' "$STATE_FILE"
+import json,sys,os
+path=sys.argv[1]
+last=0
+try:
+  with open(path,'r',encoding='utf-8') as f:
+    for line in f:
+      line=line.strip()
+      if not line: continue
+      try: ev=json.loads(line)
+      except: continue
+      t=ev.get("ts") or ev.get("timestamp") or ev.get("time") or 0
+      # accept iso8601 or epoch
+      if isinstance(t,(int,float)):
+        ts=int(t)
+      elif isinstance(t,str):
+        try:
+          from datetime import datetime, timezone
+          ts=int(datetime.fromisoformat(t.replace("Z","+00:00")).timestamp())
+        except:
+          ts=0
+      else:
+        ts=0
+      et=ev.get("event") or ev.get("type") or ""
+      if et and ("progress" in et or "task_" in et or "plan_" in et or "pr_" in et):
+        if ts>last: last=ts
+except FileNotFoundError:
+  pass
+print(last)
+PY
+}
+
+infer_blocked_issue_url() {
+  # Best-effort: scan state.jsonl for last issue_url or issue number
+  [[ -f "$STATE_FILE" ]] || return 1
+  python3 - <<'PY' "$STATE_FILE"
+import json,sys,re
+path=sys.argv[1]
+last=None
+with open(path,'r',encoding='utf-8') as f:
+  for line in f:
+    line=line.strip()
+    if not line: continue
+    try: ev=json.loads(line)
+    except: continue
+    for k in ("issue_url","issue","url"):
+      v=ev.get(k)
+      if isinstance(v,str) and "github.com" in v and "/issues/" in v:
+        last=v
+    n=ev.get("issue_number") or ev.get("issue")
+    if isinstance(n,int):
+      # not enough to reconstruct without repo
+      pass
+print(last or "")
+PY
+}
+
+notify_issue_state() {
+  local issue_url="$1"
+  local kind="$2"   # blocked|stalled
+  local msg="$3"
+  [[ "$NO_NOTIFY_BLOCKED" -eq 1 ]] && return 0
+  gh_authed || return 0
+  [[ -z "$issue_url" ]] && return 0
+
+  if [[ "$kind" == "blocked" ]]; then
+    gh issue comment "$issue_url" --body "$msg" >/dev/null 2>&1 || true
+    gh issue edit "$issue_url" --add-label "agent:blocked" >/dev/null 2>&1 || true
+    gh issue edit "$issue_url" --remove-label "agent:queued" --remove-label "agent:pending" >/dev/null 2>&1 || true
+    [[ -n "$PROJECT" ]] && project_add_and_set_status "$issue_url" "$PROJECT_BLOCKED_OPTION" || true
+  else
+    gh issue comment "$issue_url" --body "$msg" >/dev/null 2>&1 || true
+    gh issue edit "$issue_url" --add-label "agent:stalled" >/dev/null 2>&1 || true
+    [[ -n "$PROJECT" ]] && project_add_and_set_status "$issue_url" "$PROJECT_STALLED_OPTION" || true
+  fi
+}
+
+create_tracking_issue() {
+  local title="$1"
+  local body="$2"
+  local url
+  url="$(gh issue create --title "$title" --body "$body")"
+  gh issue edit "$url" --add-label "agent:blocked" >/dev/null 2>&1 || true
+  [[ -n "$PROJECT" ]] && project_add_and_set_status "$url" "$PROJECT_BLOCKED_OPTION" || true
+  echo "$url"
+}
+
+run_agent_cycle() {
+  if [[ ! -x "$AGENT_BIN" ]]; then
+    die "Missing agent executable at $AGENT_BIN"
+  fi
+  "$AGENT_BIN" validate
+  "$AGENT_BIN" preflight --strict
+
+  if [[ "$DRY" -eq 1 ]]; then
+    "$AGENT_BIN" dry-run || true
+    return 0
+  fi
+
+  if [[ "$EXECUTE" -eq 1 ]]; then
+    if [[ -f "$STATE_FILE" ]]; then
+      "$AGENT_BIN" resume --execute || "$AGENT_BIN" run --execute
+    else
+      "$AGENT_BIN" run --execute
+    fi
+  else
+    # non-mutating best-effort
+    "$AGENT_BIN" run || true
+  fi
+}
+
+# Args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --execute) EXECUTE=1; DRY=0; shift ;;
+    --dry) DRY=1; EXECUTE=0; shift ;;
+    --once) ONCE=1; shift ;;
+    --sleep) validate_int "$1" "${2:-}"; SLEEP_SECS="$2"; shift 2 ;;
+    --max-sleep) validate_int "$1" "${2:-}"; MAX_SLEEP_SECS="$2"; shift 2 ;;
+    --poll-interval) validate_int "$1" "${2:-}"; POLL_INTERVAL="$2"; shift 2 ;;
+    --jitter) validate_int "$1" "${2:-}"; JITTER_PCT="$2"; shift 2 ;;
+    --stall-minutes) validate_int "$1" "${2:-}"; STALL_MINUTES="$2"; shift 2 ;;
+    --stall-max) validate_int "$1" "${2:-}"; STALL_MAX="$2"; shift 2 ;;
+    --prompt) PROMPT="${2:-}"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --prompt-stdin) PROMPT_STDIN=1; shift ;;
+    --prompt-split) PROMPT_SPLIT=1; shift ;;
+    --no-prompt-auto-split) PROMPT_AUTO_SPLIT=0; shift ;;
+    --prompt-max) validate_int "$1" "${2:-}"; PROMPT_MAX_ISSUES="$2"; shift 2 ;;
+    --prompt-title-prefix) PROMPT_TITLE_PREFIX="${2:-}"; shift 2 ;;
+    --prompt-parent) PROMPT_PARENT=1; shift ;;
+    --no-notify-blocked) NO_NOTIFY_BLOCKED=1; shift ;;
+    --no-create-tracking) NO_CREATE_TRACKING=1; shift ;;
+    --project) PROJECT="${2:-}"; shift 2 ;;
+    --project-status) PROJECT_STATUS_FIELD="${2:-}"; shift 2 ;;
+    --project-queued) PROJECT_QUEUED_OPTION="${2:-}"; shift 2 ;;
+    --project-stalled) PROJECT_STALLED_OPTION="${2:-}"; shift 2 ;;
+    --project-blocked) PROJECT_BLOCKED_OPTION="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 3 ;;
+  esac
+done
+
+acquire_lock
+
+# Prompt ingestion
+if [[ -n "$PROMPT_FILE" ]]; then
+  PROMPT="$(cat "$PROMPT_FILE")"
+fi
+if [[ "$PROMPT_STDIN" -eq 1 ]]; then
+  PROMPT="$(cat)"
+fi
+
+# If prompt provided, create issue(s) up front.
+if [[ -n "${PROMPT:-}" ]]; then
+  need_cmd gh
+  gh_authed || die "gh not authenticated. Run: gh auth login"
+  created_urls=()
+
+  # Split resolution:
+  # 1) forced --prompt-split
+  # 2) auto-split (default): split if prompt appears multi-task
+  split_mode=0
+  if [[ "$PROMPT_SPLIT" -eq 1 ]]; then
+    split_mode=1
+  elif [[ "$PROMPT_AUTO_SPLIT" -eq 1 ]]; then
+    # If bullets exist, split_prompt_items will handle; otherwise use split_prompt_auto.
+    if echo "$PROMPT" | grep -Eq '(^|\n)[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+'; then
+      split_mode=1
+    else
+      mapfile -t auto_items < <(split_prompt_auto "$PROMPT" || true)
+      if [[ "${#auto_items[@]}" -ge 2 ]]; then
+        items=("${auto_items[@]}")
+        split_mode=2
+      fi
+    fi
+  fi
+
+  if [[ "$split_mode" -eq 1 ]]; then
+    mapfile -t items < <(split_prompt_items "$PROMPT")
+  fi
+
+  if [[ "$split_mode" -ge 1 && "${#items[@]}" -ge 1 ]]; then
+    if [[ "${#items[@]}" -gt "$PROMPT_MAX_ISSUES" ]]; then
+      die "Prompt resolved to ${#items[@]} issues, exceeding --prompt-max $PROMPT_MAX_ISSUES"
+    fi
+    local_ctx="Context:\n\n$PROMPT\n"
+    for item in "${items[@]}"; do
+      issue_prompt="Title: $item\n\n$local_ctx"
+      url="$(create_issue "$(printf "%b" "$issue_prompt")")"
+      created_urls+=("$url")
+      echo "Created issue: $url"
+    done
+  else
+    url="$(create_issue "$PROMPT")"
+    created_urls+=("$url")
+    echo "Created issue: $url"
+  fi
+
+  if [[ "$PROMPT_PARENT" -eq 1 && "${#created_urls[@]}" -ge 2 ]]; then
+    parent_title="Autonomous batch: $(echo "$PROMPT" | sed -n '/./{p;q;}')"
+    if [[ "${#parent_title}" -gt 200 ]]; then parent_title="${parent_title:0:197}..."; fi
+    parent_body="Created by agent-keepalive from a single prompt.\n\nPrompt:\n\n$PROMPT\n\nIssues:\n"
+    for u in "${created_urls[@]}"; do
+      parent_body+="- $u\n"
+    done
+    purl="$(create_parent_issue "$parent_title" "$(printf "%b" "$parent_body")")"
+    echo "Created parent issue: $purl"
+  fi
+fi
+
+# Main keepalive loop
+sleep_now="$SLEEP_SECS"
+stall_count=0
+last_progress="$(last_progress_epoch)"
+
+while :; do
+  if ! run_agent_cycle; then
+    # Preflight/validate failures should be treated as env failures
+    exit 3
+  fi
+
+  # After cycle, refresh last progress
+  new_progress="$(last_progress_epoch)"
+  if [[ "$new_progress" -gt "$last_progress" ]]; then
+    last_progress="$new_progress"
+    sleep_now="$SLEEP_SECS"
+    stall_count=0
+  fi
+
+  # Check blocked signal from state.jsonl by looking for recent "task_blocked"
+  blocked_event=0
+  if [[ -f "$STATE_FILE" ]]; then
+    if python3 - <<'PY' "$STATE_FILE"
+import json,sys
+path=sys.argv[1]
+blocked=False
+with open(path,'r',encoding='utf-8') as f:
+  for line in f:
+    line=line.strip()
+    if not line: continue
+    try: ev=json.loads(line)
+    except: continue
+    et=(ev.get("event") or ev.get("type") or "")
+    if et=="task_blocked" or "blocked"==et:
+      blocked=True
+print("1" if blocked else "0")
+PY
+    then :; fi
+  fi
+
+  # We'll do a simpler shell check: search last few lines for task_blocked
+  if [[ -f "$STATE_FILE" ]] && tail -n 200 "$STATE_FILE" | grep -q '"task_blocked"\|"event":[[:space:]]*"task_blocked"'; then
+    blocked_event=1
+  fi
+
+  if [[ "$blocked_event" -eq 1 ]]; then
+    # Generate artifacts best-effort
+    "$AGENT_BIN" report || true
+    "$AGENT_BIN" dashboard || true
+
+    issue_url="$(infer_blocked_issue_url || true)"
+    msg="⛔ Agent blocked.\n\nArtifacts refreshed:\n- .agent/report.md\n- .agent/dashboard.md\n\nNext step: resolve blocker and relabel agent:queued."
+    notify_issue_state "$issue_url" "blocked" "$(printf "%b" "$msg")"
+
+    if [[ -z "$issue_url" && "$NO_CREATE_TRACKING" -eq 0 ]]; then
+      turl="$(create_tracking_issue "Agent blocked (no issue inferred)" "$(printf "%b" "$msg")")"
+      echo "Created tracking issue: $turl" >&2
+    fi
+
+    exit 2
+  fi
+
+  # Stall detection: if remote queue exists and no progress for STALL_MINUTES
+  now="$(date +%s)"
+  lp="$last_progress"
+  if [[ "$lp" -eq 0 ]]; then lp="$now"; fi
+  stalled=0
+  if queue_exists_remote; then
+    if (( now - lp >= STALL_MINUTES * 60 )); then
+      stalled=1
+    fi
+  fi
+
+  if [[ "$stalled" -eq 1 ]]; then
+    stall_count=$(( stall_count + 1 ))
+    "$AGENT_BIN" preflight --strict || {
+      # Escalate immediately
+      "$AGENT_BIN" report || true
+      "$AGENT_BIN" dashboard || true
+      issue_url="$(infer_blocked_issue_url || true)"
+      msg="⛔ Agent blocked during stall recovery (preflight failed).\n\nArtifacts refreshed:\n- .agent/report.md\n- .agent/dashboard.md"
+      notify_issue_state "$issue_url" "blocked" "$(printf "%b" "$msg")"
+      exit 2
+    }
+    "$AGENT_BIN" report || true
+    "$AGENT_BIN" dashboard || true
+    issue_url="$(infer_blocked_issue_url || true)"
+    msg="⚠️ Agent stalled.\n\nNo progress detected for ${STALL_MINUTES} minutes while queued work exists.\nRecovery executed (preflight + artifacts refresh).\nStall count: ${stall_count}/${STALL_MAX}"
+    notify_issue_state "$issue_url" "stalled" "$(printf "%b" "$msg")"
+
+    sleep_now="$SLEEP_SECS"
+
+    if (( stall_count >= STALL_MAX )); then
+      # Escalate to blocked
+      msg2="⛔ Agent blocked due to repeated stalls (${stall_count}/${STALL_MAX}).\n\nArtifacts refreshed:\n- .agent/report.md\n- .agent/dashboard.md\n\nNext step: investigate CI, hanging tests, or repo invariants."
+      notify_issue_state "$issue_url" "blocked" "$(printf "%b" "$msg2")"
+      exit 2
+    fi
+  fi
+
+  if [[ "$ONCE" -eq 1 ]]; then
+    exit 0
+  fi
+
+  # If idle and no remote queue, increase backoff
+  if ! queue_exists_remote; then
+    sleep_now=$(( sleep_now * 2 ))
+    if (( sleep_now > MAX_SLEEP_SECS )); then sleep_now="$MAX_SLEEP_SECS"; fi
+  else
+    sleep_now="$SLEEP_SECS"
+  fi
+
+  jitter_sleep "$sleep_now" "$JITTER_PCT"
+done
