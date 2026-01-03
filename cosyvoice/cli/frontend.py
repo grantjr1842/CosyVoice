@@ -49,6 +49,21 @@ class CosyVoiceFrontEnd:
         self.tokenizer = get_tokenizer()
         self.feat_extractor = feat_extractor
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_trt = os.getenv("COSYVOICE_ORT_USE_TRT", "0") == "1"
+        if use_trt:
+            try:
+                import tensorrt_libs
+
+                trt_lib_dir = os.path.dirname(tensorrt_libs.__file__)
+                ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+                if trt_lib_dir not in ld_path.split(":"):
+                    os.environ["LD_LIBRARY_PATH"] = (
+                        f"{trt_lib_dir}:{ld_path}" if ld_path else trt_lib_dir
+                    )
+            except ImportError:
+                logging.warning(
+                    "TensorRT libs not found; set COSYVOICE_ORT_USE_TRT=0 to silence this."
+                )
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -59,7 +74,7 @@ class CosyVoiceFrontEnd:
         option.enable_mem_pattern = True
         available_providers = set(onnxruntime.get_available_providers())
         gpu_providers = []
-        if "TensorrtExecutionProvider" in available_providers:
+        if use_trt and "TensorrtExecutionProvider" in available_providers:
             gpu_providers.append("TensorrtExecutionProvider")
         if "CUDAExecutionProvider" in available_providers:
             gpu_providers.append("CUDAExecutionProvider")

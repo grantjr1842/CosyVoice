@@ -83,15 +83,22 @@ impl OnnxFrontend {
             .with_inter_threads(inter_threads)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
 
-        // Register Execution Providers (TensorRT -> CUDA -> CPU)
+        // Register Execution Providers (CUDA -> CPU, optional TensorRT)
         #[cfg(feature = "cuda")]
-        let builder = builder
-            .with_execution_providers(vec![
-                TensorRTExecutionProvider::default().build(),
-                CUDAExecutionProvider::default().build(),
-                CPUExecutionProvider::default().build(),
-            ])
-            .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?;
+        let builder = {
+            let use_trt = env::var("COSYVOICE_ORT_USE_TRT")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let mut providers = Vec::new();
+            if use_trt {
+                providers.push(TensorRTExecutionProvider::default().build());
+            }
+            providers.push(CUDAExecutionProvider::default().build());
+            providers.push(CPUExecutionProvider::default().build());
+            builder
+                .with_execution_providers(providers)
+                .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?
+        };
 
         eprintln!("Speech Tokenizer bytes: {}", speech_tokenizer_bytes.len());
         eprintln!("Threads set. Committing from memory...");
@@ -112,13 +119,20 @@ impl OnnxFrontend {
 
         // Register Execution Providers for Campplus
         #[cfg(feature = "cuda")]
-        let builder = builder
-            .with_execution_providers(vec![
-                TensorRTExecutionProvider::default().build(),
-                CUDAExecutionProvider::default().build(),
-                CPUExecutionProvider::default().build(),
-            ])
-            .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?;
+        let builder = {
+            let use_trt = env::var("COSYVOICE_ORT_USE_TRT")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let mut providers = Vec::new();
+            if use_trt {
+                providers.push(TensorRTExecutionProvider::default().build());
+            }
+            providers.push(CUDAExecutionProvider::default().build());
+            providers.push(CPUExecutionProvider::default().build());
+            builder
+                .with_execution_providers(providers)
+                .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?
+        };
 
         eprintln!("Campplus bytes: {}", campplus_bytes.len());
         eprintln!("Committing campplus from memory...");
