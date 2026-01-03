@@ -529,8 +529,28 @@ impl F0Predictor {
         }
 
         // out: [Batch, Time, 1]
-        let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
-        Ok(f0)
+        let f0 = out.transpose(1, 2)?.abs()?; //  [Batch, 1, Time]
+
+        // CRITICAL FIX: Clamp F0 to reasonable speech range to prevent cascading errors
+        // Speech F0 typically ranges from 80-400 Hz, but we'll allow 0-1000 Hz for safety
+        // The classifier sometimes produces extreme values due to weight/precision issues
+        let max_f0 = Tensor::new(&[1000.0f32], f0.device())?;
+        let f0_clamped = f0.minimum(&max_f0.broadcast_as(f0.shape())?)?;
+
+        if let Ok(flat) = f0_clamped.flatten_all() {
+            if let Ok(vec) = flat.to_vec1::<f32>() {
+                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = vec.iter().sum();
+                let mean = sum / vec.len() as f32;
+                eprintln!(
+                    "    F0 stats (after clamp): min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz",
+                    min, max, mean
+                );
+            }
+        }
+
+        Ok(f0_clamped)
     }
 }
 
@@ -979,7 +999,13 @@ impl HiFTGenerator {
             }
         }
 
-        let magnitude = mag_log.exp()?;
+        // CRITICAL FIX: Clamp mag_log before exp() to prevent overflow
+        // Python clips magnitude AFTER exp, but we need to prevent exp overflow first
+        // exp(50) ≈ 5e21 which is way too large; exp(11.5) ≈ 100 (our target max)
+        let max_log = Tensor::new(&[11.5f32], mag_log.device())?;
+        let mag_log_clamped = mag_log.minimum(&max_log.broadcast_as(mag_log.shape())?)?;
+
+        let magnitude = mag_log_clamped.exp()?;
 
         // Clip magnitude to prevent overflow - Python does: magnitude = torch.clip(magnitude, max=1e2)
         let max_mag = Tensor::new(&[100.0f32], magnitude.device())?;
