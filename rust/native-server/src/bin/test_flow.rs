@@ -1,6 +1,6 @@
 // Minimal test to isolate AdaLayerNormZero and DiTBlock forward issues
-use candle_core::{Device, Result, Tensor, DType};
-use candle_nn::{layer_norm_no_bias, linear, VarBuilder, Module};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{layer_norm_no_bias, linear, Module, VarBuilder};
 use std::collections::HashMap;
 
 fn main() -> Result<()> {
@@ -12,12 +12,24 @@ fn main() -> Result<()> {
     let mut weights: HashMap<String, Tensor> = HashMap::new();
 
     // AdaLayerNormZero weights (attn_norm)
-    weights.insert("attn_norm.linear.weight".to_string(), Tensor::randn(0.0f32, 0.01, (6144, 1024), &device)?);
-    weights.insert("attn_norm.linear.bias".to_string(), Tensor::zeros((6144,), DType::F32, &device)?);
-    weights.insert("attn_norm.weight".to_string(), Tensor::ones((1024,), DType::F32, &device)?);
+    weights.insert(
+        "attn_norm.linear.weight".to_string(),
+        Tensor::randn(0.0f32, 0.01, (6144, 1024), &device)?,
+    );
+    weights.insert(
+        "attn_norm.linear.bias".to_string(),
+        Tensor::zeros((6144,), DType::F32, &device)?,
+    );
+    weights.insert(
+        "attn_norm.weight".to_string(),
+        Tensor::ones((1024,), DType::F32, &device)?,
+    );
 
     // ff_norm weights
-    weights.insert("ff_norm.weight".to_string(), Tensor::ones((1024,), DType::F32, &device)?);
+    weights.insert(
+        "ff_norm.weight".to_string(),
+        Tensor::ones((1024,), DType::F32, &device)?,
+    );
 
     let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
 
@@ -46,7 +58,10 @@ fn main() -> Result<()> {
 
     eprintln!("\n2. Chunking emb into 6 parts");
     let chunks = emb.chunk(6, 1)?;
-    eprintln!("   chunk shapes: {:?}", chunks.iter().map(|c| c.dims()).collect::<Vec<_>>());
+    eprintln!(
+        "   chunk shapes: {:?}",
+        chunks.iter().map(|c| c.dims()).collect::<Vec<_>>()
+    );
 
     let shift_msa = chunks[0].unsqueeze(1)?;
     let scale_msa = chunks[1].unsqueeze(1)?;

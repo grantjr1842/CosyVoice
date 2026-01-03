@@ -119,18 +119,14 @@ impl SineGen {
                     let current_f0 = f0_vec[offset_f0 + t];
                     let phase_step = current_f0 * mult / sampling_rate;
                     running_phase += phase_step;
-                    running_phase = running_phase % 1.0;
+                    running_phase %= 1.0;
                     let val = (running_phase * two_pi).sin() * sine_amp;
                     sine_waves_vec.push(val);
                 }
             }
         }
 
-        let sine_waves = Tensor::from_vec(
-            sine_waves_vec,
-            (b, num_harmonics, l),
-            &f0.device()
-        )?;
+        let sine_waves = Tensor::from_vec(sine_waves_vec, (b, num_harmonics, l), f0.device())?;
 
         // 4. UV
         let uv = f0.gt(self.voiced_threshold as f64)?.to_dtype(DType::F32)?;
@@ -233,10 +229,7 @@ impl SourceModuleHnNSF {
         // Check if weight_norm is on logic? generator.py: SourceModuleHnNSF uses regular Linear.
         let l_linear = candle_nn::linear(harmonic_num + 1, 1, vb.pp("l_linear"))?;
 
-        Ok(Self {
-            sine_gen,
-            l_linear,
-        })
+        Ok(Self { sine_gen, l_linear })
     }
 
     /// Forward pass with optional noise injection for parity testing.
@@ -410,10 +403,10 @@ impl F0Predictor {
                 let w = layer.weight();
                 if let Ok(flat) = w.flatten_all() {
                     if let Ok(vec) = flat.to_vec1::<f32>() {
-                         let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                         let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                         let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                         eprintln!("    [F0Predictor] Layer 0 weight (after norm): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+                        eprintln!("    [F0Predictor] Layer 0 weight (after norm): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
                     }
                 }
 
@@ -464,7 +457,10 @@ impl F0Predictor {
                     let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let sum: f32 = vec.iter().sum();
                     let mean = sum / vec.len() as f32;
-                    eprintln!("    Layer {} after ELU: min={:.6}, max={:.6}, mean={:.6}", i, min, max, mean);
+                    eprintln!(
+                        "    Layer {} after ELU: min={:.6}, max={:.6}, mean={:.6}",
+                        i, min, max, mean
+                    );
                 }
             }
         }
@@ -479,7 +475,10 @@ impl F0Predictor {
                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = vec.iter().sum();
                 let mean = sum / vec.len() as f32;
-                eprintln!("    Classifier out (pre-abs): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    Classifier out (pre-abs): min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 
@@ -513,12 +512,14 @@ impl HiFTGenerator {
 
         // Conv Pre
         // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
-        let conv_pre_k = if vb.pp("conv_pre").contains_tensor("weight.original1") {
-             5
-        } else if vb.pp("conv_pre").contains_tensor("parametrizations.weight.original1") {
-             5
+        let conv_pre_k = if vb.pp("conv_pre").contains_tensor("weight.original1")
+            || vb
+                .pp("conv_pre")
+                .contains_tensor("parametrizations.weight.original1")
+        {
+            5
         } else {
-             13
+            13
         };
         let conv_pre = load_conv1d(
             vb.pp("conv_pre"),
@@ -634,11 +635,13 @@ impl HiFTGenerator {
         let stft = crate::utils::InverseStftModule::new(
             config.istft_params_n_fft,
             config.istft_params_hop_len,
+            true,
             vb.device(),
         )?;
         let analysis_stft = crate::utils::StftModule::new(
             config.istft_params_n_fft,
             config.istft_params_hop_len,
+            true,
             vb.device(),
         )?;
 
@@ -683,7 +686,10 @@ impl HiFTGenerator {
                 let max = mel_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = mel_vec.iter().sum();
                 let mean = sum / mel_vec.len() as f32;
-                eprintln!("    input mel stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    input mel stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 
@@ -700,7 +706,10 @@ impl HiFTGenerator {
                 let max = f0_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = f0_vec.iter().sum();
                 let mean = sum / f0_vec.len() as f32;
-                eprintln!("    F0 stats: min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz", min, max, mean);
+                eprintln!(
+                    "    F0 stats: min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz",
+                    min, max, mean
+                );
             }
         }
 
@@ -711,7 +720,11 @@ impl HiFTGenerator {
             .unsqueeze(3)?
             .repeat((1, 1, 1, self.f0_upsamp_scale))?
             .reshape((b, c, l * self.f0_upsamp_scale))?;
-        eprintln!("    upsampled f0 shape: {:?} (scale={})", s.shape(), self.f0_upsamp_scale);
+        eprintln!(
+            "    upsampled f0 shape: {:?} (scale={})",
+            s.shape(),
+            self.f0_upsamp_scale
+        );
 
         // 3. Source Module
         let (s_source, _, _) = self.m_source.forward(&s, None, None, None)?; // [B, 1, L_up]
@@ -724,7 +737,10 @@ impl HiFTGenerator {
                 let max = src_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = src_vec.iter().sum();
                 let mean = sum / src_vec.len() as f32;
-                eprintln!("    source stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    source stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 
@@ -740,7 +756,10 @@ impl HiFTGenerator {
                 let max = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = audio_vec.iter().sum();
                 let mean = sum / audio_vec.len() as f32;
-                eprintln!("    [HiFT.forward] audio stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    [HiFT.forward] audio stats: min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
 
                 // Check for problems
                 if min < -1.0 || max > 1.0 {
@@ -776,7 +795,8 @@ impl HiFTGenerator {
             // Upsample
             let u = self.ups_rates[i];
             let (b, c, l) = x.dims3()?;
-            x = x.unsqueeze(3)?
+            x = x
+                .unsqueeze(3)?
                 .repeat((1, 1, 1, u))?
                 .reshape((b, c, l * u))?;
 
@@ -839,9 +859,14 @@ impl HiFTGenerator {
                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = vec.iter().sum();
                 let mean = sum / vec.len() as f32;
-                eprintln!("    [decode] mag_log (before exp): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    [decode] mag_log (before exp): min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
                 if max > 50.0 {
-                    eprintln!("      ⚠️  CRITICAL: mag_log has very large values, exp() will overflow!");
+                    eprintln!(
+                        "      ⚠️  CRITICAL: mag_log has very large values, exp() will overflow!"
+                    );
                 }
             }
         }
@@ -861,7 +886,10 @@ impl HiFTGenerator {
                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = vec.iter().sum();
                 let mean = sum / vec.len() as f32;
-                eprintln!("    [decode] magnitude (after exp): min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
+                eprintln!(
+                    "    [decode] magnitude (after exp): min={:.6}, max={:.6}, mean={:.6}",
+                    min, max, mean
+                );
             }
         }
 

@@ -11,15 +11,10 @@ use axum::{
 };
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use std::{
-    env,
-    net::SocketAddr,
-    sync::Arc,
-    time::Instant,
-};
+use std::{env, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::signal;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use shared::{config, ErrorResponse, HealthResponse, SynthesizeRequest};
@@ -64,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Prometheus metrics recorder installed");
 
     // Get model directory from env or use default
-    let model_dir = env::var("COSYVOICE_MODEL_DIR")
-        .unwrap_or_else(|_| config::DEFAULT_MODEL_DIR.to_string());
+    let model_dir =
+        env::var("COSYVOICE_MODEL_DIR").unwrap_or_else(|_| config::DEFAULT_MODEL_DIR.to_string());
 
     // Initialize TTS engine
     info!(model_dir = %model_dir, "Initializing CosyVoice TTS engine...");
@@ -117,38 +112,55 @@ async fn synthesize_handler(
         "Synthesizing speech"
     );
 
+    let SynthesizeRequest {
+        text,
+        prompt_audio,
+        prompt_text,
+        speaker,
+        speed,
+    } = request;
+
+    let prompt_audio = match prompt_audio {
+        Some(path) => path,
+        None => {
+            counter!("tts_requests_error").increment(1);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "prompt_audio is required for CosyVoice3 synthesis".to_string(),
+                    code: 400,
+                }),
+            )
+                .into_response();
+        }
+    };
+
     // Use spawn_blocking since Python inference is CPU-bound
     let result = tokio::task::spawn_blocking(move || {
-        // CosyVoice3 requires prompt audio for all synthesis modes
-        let prompt_audio = match &request.prompt_audio {
-            Some(path) => path.as_str(),
-            None => {
-                return Err(tts::TtsError::SynthesisError(
-                    "prompt_audio is required for CosyVoice3 synthesis".to_string()
-                ));
-            }
-        };
-
-        if let Some(prompt_text) = &request.prompt_text {
+        if let Some(prompt_text) = &prompt_text {
             // Zero-shot voice cloning
-            state.tts.synthesize_zero_shot(
-                &request.text,
-                prompt_audio,
-                prompt_text,
-                request.speed,
-            )
+            state
+                .tts
+                .synthesize_zero_shot(&text, &prompt_audio, prompt_text, speed)
         } else {
             // Instruct mode with default instruction
-            let instruct = request.speaker.as_deref().unwrap_or("Speak naturally in English.");
-            state.tts.synthesize_instruct(&request.text, instruct, prompt_audio, request.speed)
+            let instruct = speaker.as_deref().unwrap_or("Speak naturally in English.");
+            state
+                .tts
+                .synthesize_instruct(&text, instruct, &prompt_audio, speed)
         }
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(Ok((samples, sample_rate))) => {
             let duration = start.elapsed();
             let audio_duration = samples.len() as f32 / sample_rate as f32;
-            let rtf = duration.as_secs_f32() / audio_duration;
+            let rtf = if audio_duration > 0.0 {
+                duration.as_secs_f32() / audio_duration
+            } else {
+                0.0
+            };
 
             histogram!("tts_synthesis_duration_seconds").record(duration.as_secs_f64());
             histogram!("tts_rtf").record(rtf as f64);
@@ -300,8 +312,8 @@ fn ensure_library_path() -> anyhow::Result<()> {
     let _ = dotenvy::from_filename(".env");
 
     // Get the extra library path from .env (default to pixi env)
-    let lib_path_extra = env::var("LD_LIBRARY_PATH_EXTRA")
-        .unwrap_or_else(|_| ".pixi/envs/default/lib".to_string());
+    let lib_path_extra =
+        env::var("LD_LIBRARY_PATH_EXTRA").unwrap_or_else(|_| ".pixi/envs/default/lib".to_string());
 
     // Resolve to absolute path
     let lib_path_abs = cwd.join(&lib_path_extra);

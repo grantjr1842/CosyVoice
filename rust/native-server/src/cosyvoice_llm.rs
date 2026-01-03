@@ -14,9 +14,9 @@ use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 pub struct CosyVoiceLLMConfig {
     pub llm_input_size: usize,
     pub llm_output_size: usize,
-    pub speech_token_size: usize,    // Base speech token vocab size
-    pub speech_extra_tokens: usize,  // Special/stop tokens appended to speech vocab
-    pub sampling_vocab_size: usize,  // Valid output range (flow vocab size)
+    pub speech_token_size: usize,   // Base speech token vocab size
+    pub speech_extra_tokens: usize, // Special/stop tokens appended to speech vocab
+    pub sampling_vocab_size: usize, // Valid output range (flow vocab size)
     pub spk_embed_dim: usize,
     pub sampling_top_p: f32,
     pub ras_window_size: usize,
@@ -28,9 +28,9 @@ impl Default for CosyVoiceLLMConfig {
         Self {
             llm_input_size: 896,
             llm_output_size: 896,
-            speech_token_size: 6561,    // Fun-CosyVoice3-0.5B speech token size
-            speech_extra_tokens: 200,   // CosyVoice3 stop/special token range
-            sampling_vocab_size: 6561,  // Fun-CosyVoice3-0.5B Flow vocab size
+            speech_token_size: 6561,  // Fun-CosyVoice3-0.5B speech token size
+            speech_extra_tokens: 200, // CosyVoice3 stop/special token range
+            sampling_vocab_size: 6561, // Fun-CosyVoice3-0.5B Flow vocab size
             spk_embed_dim: 192,
             sampling_top_p: 0.8,
             ras_window_size: 10,
@@ -242,7 +242,11 @@ impl CosyVoiceLLM {
                 return Some(idx);
             }
         }
-        if probs.is_empty() { None } else { Some(probs.len() - 1) }
+        if probs.is_empty() {
+            None
+        } else {
+            Some(probs.len() - 1)
+        }
     }
 
     fn sample_nucleus(&self, probs: &[f32], top_p: f32, top_k: usize) -> Option<usize> {
@@ -364,10 +368,17 @@ impl CosyVoiceLLM {
 
         for i in 0..max_len {
             // Forward pass through LLM
-            let y_pred = self.llm.base_model.forward_embeds(&lm_input, seqlen_offset, None)?;
+            let y_pred = self
+                .llm
+                .base_model
+                .forward_embeds(&lm_input, seqlen_offset, None)?;
 
             // Get logits from last position
-            let logits = self.llm_decoder.forward(&y_pred.i((.., y_pred.dim(1)? - 1..y_pred.dim(1)?, ..))?)?;
+            let logits = self.llm_decoder.forward(&y_pred.i((
+                ..,
+                y_pred.dim(1)? - 1..y_pred.dim(1)?,
+                ..,
+            ))?)?;
             let logp = candle_nn::ops::log_softmax(&logits.squeeze(1)?, 1)?;
 
             // Sample next token
@@ -375,7 +386,10 @@ impl CosyVoiceLLM {
             let top_id = self.sample_ids(&logp, &out_tokens, sampling_k, ignore_stop)?;
 
             if self.is_stop_token(top_id) {
-                eprintln!("LLM: stop token reached at step {} (token id {})", i, top_id);
+                eprintln!(
+                    "LLM: stop token reached at step {} (token id {})",
+                    i, top_id
+                );
                 break;
             }
 
@@ -392,7 +406,11 @@ impl CosyVoiceLLM {
 }
 
 /// Create a random embedding layer (for weights not in safetensors)
-fn create_random_embedding(vocab_size: usize, hidden_size: usize, device: &Device) -> Result<Embedding> {
+fn create_random_embedding(
+    vocab_size: usize,
+    hidden_size: usize,
+    device: &Device,
+) -> Result<Embedding> {
     let weight = Tensor::randn(0.0f32, 0.02, (vocab_size, hidden_size), device)?;
     Ok(Embedding::new(weight, hidden_size))
 }

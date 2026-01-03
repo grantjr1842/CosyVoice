@@ -86,7 +86,10 @@ fn english_text_normalize_parity() -> Result<()> {
     let tokenizer_path = std::env::var("COSYVOICE_TOKENIZER_PATH")
         .unwrap_or_else(|_| "pretrained_models/Fun-CosyVoice3-0.5B/tokenizer.json".to_string());
     if !Path::new(&tokenizer_path).exists() {
-        eprintln!("Skipping parity test (tokenizer not found at {}).", tokenizer_path);
+        eprintln!(
+            "Skipping parity test (tokenizer not found at {}).",
+            tokenizer_path
+        );
         return Ok(());
     }
 

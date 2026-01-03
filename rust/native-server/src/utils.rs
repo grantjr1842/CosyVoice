@@ -52,15 +52,16 @@ impl STFT {
 }
 
 pub struct StftModule {
-    _n_fft: usize,
+    n_fft: usize,
     hop_length: usize,
     filters_real: Tensor, // [n_fft/2 + 1, 1, n_fft]
     filters_imag: Tensor, // [n_fft/2 + 1, 1, n_fft]
+    center: bool,
     _device: Device,
 }
 
 impl StftModule {
-    pub fn new(n_fft: usize, hop_length: usize, device: &Device) -> Result<Self> {
+    pub fn new(n_fft: usize, hop_length: usize, center: bool, device: &Device) -> Result<Self> {
         let window = hann_window(n_fft, device)?; // [n_fft]
         let (dft_real, dft_imag) = dft_matrix(n_fft, device)?; // [n_fft/2+1, n_fft]
 
@@ -74,20 +75,27 @@ impl StftModule {
         let filters_imag = filters_imag.unsqueeze(1)?;
 
         Ok(Self {
-            _n_fft: n_fft,
+            n_fft,
             hop_length,
             filters_real,
             filters_imag,
+            center,
             _device: device.clone(),
         })
     }
 
     pub fn transform(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        // x: [Batch, Time] -> need [Batch, 1, Time] for conv1d
-        let x_unsqueezed = if x.rank() == 2 {
-             x.unsqueeze(1)?
+        let x_in = if self.center {
+            reflect_pad_1d(x, self.n_fft / 2)?
         } else {
-             x.clone()
+            x.clone()
+        };
+
+        // x: [Batch, Time] -> need [Batch, 1, Time] for conv1d
+        let x_unsqueezed = if x_in.rank() == 2 {
+            x_in.unsqueeze(1)?
+        } else {
+            x_in
         };
 
         let real = x_unsqueezed.conv1d(
@@ -108,16 +116,20 @@ impl StftModule {
 use candle_nn::{ConvTranspose1d, ConvTranspose1dConfig, Module};
 
 pub struct InverseStftModule {
-    _n_fft: usize,
-    _hop_length: usize,
+    n_fft: usize,
+    hop_length: usize,
+    window: Vec<f32>,
     conv_real: ConvTranspose1d,
     conv_imag: ConvTranspose1d,
+    center: bool,
     _device: Device,
 }
 
 impl InverseStftModule {
-    pub fn new(n_fft: usize, hop_length: usize, device: &Device) -> Result<Self> {
+    pub fn new(n_fft: usize, hop_length: usize, center: bool, device: &Device) -> Result<Self> {
         let _window = hann_window(n_fft, device)?; // [n_fft]
+        let window_cpu = hann_window(n_fft, &Device::Cpu)?;
+        let window_vec = window_cpu.to_vec1::<f32>()?;
 
         let n_bins = n_fft / 2 + 1;
         let mut real_weights = Vec::with_capacity(n_bins * n_fft);
@@ -173,10 +185,12 @@ impl InverseStftModule {
         let conv_imag = ConvTranspose1d::new(w_imag, None, cfg);
 
         Ok(Self {
-            _n_fft: n_fft,
-            _hop_length: hop_length,
+            n_fft,
+            hop_length,
+            window: window_vec,
             conv_real,
             conv_imag,
+            center,
             _device: device.clone(),
         })
     }
@@ -197,9 +211,94 @@ impl InverseStftModule {
         // Sum components
         let y = (y_real + y_imag)?;
 
+        let frames = magnitude.dim(2)?;
+        let out_len = (frames - 1) * self.hop_length + self.n_fft;
+        let mut window_sums = vec![0.0f32; out_len];
+        for frame in 0..frames {
+            let start = frame * self.hop_length;
+            for n in 0..self.n_fft {
+                let idx = start + n;
+                if idx < out_len {
+                    let win = self.window[n];
+                    window_sums[idx] += win * win;
+                }
+            }
+        }
+        for v in window_sums.iter_mut() {
+            if *v < 1e-8 {
+                *v = 1.0;
+            }
+        }
+
+        let window_sums = Tensor::from_vec(window_sums, (1, 1, out_len), y.device())?;
+        let window_sums = window_sums.broadcast_as(y.shape())?;
+        let y = y.broadcast_div(&window_sums)?;
+
         // Output might be padded due to Centered STFT assumptions in PyTorch?
-        // HiFT generator output is `x`. User handles cropping.
+        // Match torch.istft(center=True) by trimming n_fft/2 on both sides.
+        if self.center {
+            let pad = self.n_fft / 2;
+            if out_len > 2 * pad {
+                return y.narrow(2, pad, out_len - 2 * pad);
+            }
+        }
+
         Ok(y)
+    }
+}
+
+fn reflect_pad_1d(x: &Tensor, pad: usize) -> Result<Tensor> {
+    if pad == 0 {
+        return Ok(x.clone());
+    }
+
+    let device = x.device();
+    let (b, c, t, rank) = if x.rank() == 2 {
+        let (b, t) = x.dims2()?;
+        (b, 1usize, t, 2usize)
+    } else if x.rank() == 3 {
+        let (b, c, t) = x.dims3()?;
+        (b, c, t, 3usize)
+    } else {
+        return Err(candle_core::Error::msg(
+            "reflect_pad_1d expects rank-2 or rank-3 input",
+        ));
+    };
+
+    if t <= pad {
+        return Err(candle_core::Error::msg(
+            "reflect_pad_1d pad >= signal length",
+        ));
+    }
+
+    let x_cpu = x.to_device(&Device::Cpu)?;
+    let x_vec = x_cpu.flatten_all()?.to_vec1::<f32>()?;
+
+    let out_t = t + 2 * pad;
+    let mut out = Vec::with_capacity(b * c * out_t);
+
+    for bi in 0..b {
+        for ci in 0..c {
+            let offset = (bi * c + ci) * t;
+            // Left pad
+            for i in 0..pad {
+                let idx = pad - i;
+                out.push(x_vec[offset + idx]);
+            }
+            // Original
+            out.extend_from_slice(&x_vec[offset..offset + t]);
+            // Right pad
+            for i in 0..pad {
+                let idx = t - 2 - i;
+                out.push(x_vec[offset + idx]);
+            }
+        }
+    }
+
+    if rank == 2 {
+        Tensor::from_vec(out, (b, out_t), device)
+    } else {
+        Tensor::from_vec(out, (b, c, out_t), device)
     }
 }
 

@@ -1,7 +1,7 @@
 //! Test binary for verifying native TTS component weight loading.
 
+use candle_core::{DType, Device, Tensor};
 use cosyvoice_native_server::tts::NativeTtsEngine;
-use candle_core::{Device, Tensor, DType};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,11 +34,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "tests/test_artifacts.safetensors".to_string());
     let artifact_path = Path::new(&artifact_path_str);
     if !artifact_path.exists() {
-        eprintln!("Error: {} not found. Run 'pixi run python tests/generate_test_artifacts.py' first.", artifact_path_str);
+        eprintln!(
+            "Error: {} not found. Run 'pixi run python tests/generate_test_artifacts.py' first.",
+            artifact_path_str
+        );
         std::process::exit(1);
     }
 
-    println!("Candle CUDA available: {}", candle_core::utils::cuda_is_available());
+    println!(
+        "Candle CUDA available: {}",
+        candle_core::utils::cuda_is_available()
+    );
     let device = if candle_core::utils::cuda_is_available() {
         match Device::new_cuda(0) {
             Ok(d) => d,
@@ -56,12 +62,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let artifacts = safe_load_artifacts(artifact_path.to_str().unwrap(), &cpu)?;
 
     // Unpack artifacts and move to device
-    let flow_feat_24k = artifacts.get("flow_feat_24k").expect("Missing flow_feat_24k").to_device(&device)?;
-    let _text_ids = artifacts.get("text_ids").expect("Missing text_ids").to_dtype(DType::U32)?.to_device(&device)?;
+    let flow_feat_24k = artifacts
+        .get("flow_feat_24k")
+        .expect("Missing flow_feat_24k")
+        .to_device(&device)?;
+    let _text_ids = artifacts
+        .get("text_ids")
+        .expect("Missing text_ids")
+        .to_dtype(DType::U32)?
+        .to_device(&device)?;
 
     // New artifacts for bypassing frontend
-    let speech_tokens = artifacts.get("speech_tokens").expect("Missing speech_tokens in artifacts. Did you upgrade generate_test_artifacts.py?").to_dtype(DType::U32)?.to_device(&device)?;
-    let speaker_embedding = artifacts.get("speaker_embedding").expect("Missing speaker_embedding in artifacts.").to_device(&device)?;
+    let speech_tokens = artifacts
+        .get("speech_tokens")
+        .expect("Missing speech_tokens in artifacts. Did you upgrade generate_test_artifacts.py?")
+        .to_dtype(DType::U32)?
+        .to_device(&device)?;
+    let speaker_embedding = artifacts
+        .get("speaker_embedding")
+        .expect("Missing speaker_embedding in artifacts.")
+        .to_device(&device)?;
 
     // Initialize Engine
     let engine = NativeTtsEngine::new(&model_dir, Some(device.clone()))?;
@@ -79,13 +99,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let embedding = Tensor::randn(0.0f32, 1.0f32, (1, 192), &device)?;
 
         println!("Running Flow inference...");
-        engine.flow.inference(&token, &prompt_token, &prompt_feat, &embedding, 10, None)?;
+        engine
+            .flow
+            .inference(&token, &prompt_token, &prompt_feat, &embedding, 10, None)?;
         println!("Flow test complete. Exiting.");
         return Ok(());
     }
 
     // Load additional artifacts
-    let flow_noise = artifacts.get("flow_noise").expect("Missing flow_noise").to_device(&device)?;
+    let flow_noise = artifacts
+        .get("flow_noise")
+        .expect("Missing flow_noise")
+        .to_device(&device)?;
 
     // We skip LLM generation and use speech_tokens from artifacts to test Flow+HiFT
     println!("\nSynthesizing (Flow + HiFT from Artifact Tokens)...");
@@ -119,12 +144,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &empty_prompt_token,
         &empty_prompt_mel,
         &speaker_embedding,
-        Some(&flow_noise)
+        Some(&flow_noise),
     )?;
 
     let duration_synth = start_synth.elapsed();
     println!("\n✅ Synthesis complete!");
-    println!("   Audio duration: {:.2}s", audio_samples.len() as f64 / 24000.0);
+    println!(
+        "   Audio duration: {:.2}s",
+        audio_samples.len() as f64 / 24000.0
+    );
     println!("   Time taken: {:?}", duration_synth);
 
     // Save to WAV
@@ -149,7 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // inspect_artifacts showed [1, 80, 171]. This is correct.
     let audio_samples_hift = engine.synthesize_from_mel(&flow_feat_24k)?;
 
-    let mut wav_writer_hift = hound::WavWriter::create("outputs/audio/native_hift_output.wav", spec)?;
+    let mut wav_writer_hift =
+        hound::WavWriter::create("outputs/audio/native_hift_output.wav", spec)?;
     for sample in audio_samples_hift {
         wav_writer_hift.write_sample(sample)?;
     }
@@ -159,7 +188,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn safe_load_artifacts(path: &str, device: &Device) -> Result<std::collections::HashMap<String, Tensor>, Box<dyn std::error::Error>> {
+fn safe_load_artifacts(
+    path: &str,
+    device: &Device,
+) -> Result<std::collections::HashMap<String, Tensor>, Box<dyn std::error::Error>> {
     use candle_core::safetensors::load;
     let tensors = load(path, device)?;
     Ok(tensors)

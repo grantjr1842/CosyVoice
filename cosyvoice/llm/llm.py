@@ -307,23 +307,31 @@ class Qwen2Encoder(torch.nn.Module):
 
         optimizer = GpuOptimizer()
 
-        # 2. Flash Attention 2 (requires Ampere GPUs or newer - compute capability 8.0+)
+        # 2. Prefer FlashAttention-2 on Ampere+, otherwise fall back to SDPA.
         attn_kwargs = {}
-        try:
-            import flash_attn
+        use_sdpa = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if optimizer.compute_capability[0] >= 8:
+            try:
+                import flash_attn  # noqa: F401
 
-            # Check if GPU supports FlashAttention-2 (requires Ampere 8.0+)
-            if optimizer.compute_capability[0] >= 8:
                 attn_kwargs["attn_implementation"] = "flash_attention_2"
                 logging.info("Using Flash Attention 2 for Qwen2Encoder")
-            else:
-                logging.info(
-                    f"FlashAttention-2 requires Ampere GPUs (8.0+), "
-                    f"found compute capability {optimizer.compute_capability}. Using SDPA instead."
-                )
+            except ImportError:
+                if use_sdpa:
+                    attn_kwargs["attn_implementation"] = "sdpa"
+                    logging.info(
+                        "Flash Attention 2 not available. Using SDPA attention."
+                    )
+                else:
+                    logging.info(
+                        "Flash Attention 2 not available and SDPA unsupported. Using default attention."
+                    )
+        else:
+            if use_sdpa:
                 attn_kwargs["attn_implementation"] = "sdpa"
-        except ImportError:
-            logging.info("Flash Attention 2 not available. Using SDPA attention.")
+                logging.info("Using SDPA attention for Qwen2Encoder")
+            else:
+                logging.info("SDPA not available. Using default attention.")
 
         self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path, **attn_kwargs)
 
@@ -333,7 +341,8 @@ class Qwen2Encoder(torch.nn.Module):
             attn_type = attn_kwargs.get("attn_implementation", "default")
             active_opts.append(f"Attention: {attn_type}")
         logging.info(
-            f"🚀 Qwen2Encoder loaded with optimizations: {', '.join(active_opts) if active_opts else 'None (FP16/FP32)'}"
+            "Qwen2Encoder loaded with optimizations: %s",
+            ", ".join(active_opts) if active_opts else "None (FP16/FP32)",
         )
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):

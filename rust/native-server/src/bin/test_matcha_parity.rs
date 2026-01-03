@@ -6,9 +6,9 @@
 //! Parent Issue: #44
 //! Sub-Issue: #47
 
+use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use std::path::Path;
-use anyhow::{Result, Context};
 
 /// Test sinusoidal embedding (timestep embedding base)
 fn test_sinusoidal_embedding(device: &Device) -> Result<()> {
@@ -22,9 +22,9 @@ fn test_sinusoidal_embedding(device: &Device) -> Result<()> {
     }
 
     let tensors = candle_core::safetensors::load(test_path, device)?;
-    let t_values = tensors.get("t_values")
-        .context("t_values not found")?;
-    let expected_emb = tensors.get("expected_emb")
+    let t_values = tensors.get("t_values").context("t_values not found")?;
+    let expected_emb = tensors
+        .get("expected_emb")
         .context("expected_emb not found")?;
 
     println!("Input t_values shape: {:?}", t_values.shape());
@@ -90,7 +90,9 @@ fn test_snake_activation(device: &Device) -> Result<()> {
     let tensors = candle_core::safetensors::load(test_path, device)?;
     let x = tensors.get("input_x").context("input_x not found")?;
     let alpha = tensors.get("alpha").context("alpha not found")?;
-    let expected_out = tensors.get("expected_out").context("expected_out not found")?;
+    let expected_out = tensors
+        .get("expected_out")
+        .context("expected_out not found")?;
 
     println!("Input x shape: {:?}", x.shape());
 
@@ -134,7 +136,9 @@ fn test_mel_spectrogram(device: &Device) -> Result<()> {
 
     let tensors = candle_core::safetensors::load(test_path, device)?;
     let test_audio = tensors.get("test_audio").context("test_audio not found")?;
-    let expected_mel = tensors.get("expected_mel").context("expected_mel not found")?;
+    let expected_mel = tensors
+        .get("expected_mel")
+        .context("expected_mel not found")?;
 
     println!("Input audio shape: {:?}", test_audio.shape());
     println!("Expected mel shape: {:?}", expected_mel.shape());
@@ -165,7 +169,8 @@ fn test_mel_spectrogram(device: &Device) -> Result<()> {
     println!("L1 error: {:.6}", l1_error);
     println!("Max error: {:.6}", max_error);
 
-    if l1_error < 1e-2 {  // Mel spectrograms can have larger variance
+    if l1_error < 1e-2 {
+        // Mel spectrograms can have larger variance
         println!("✅ PASS: Mel spectrogram parity within tolerance!");
     } else if l1_error < 0.1 {
         println!("⚠️  WARN: Mel spectrogram has moderate error (expected for FFT differences)");

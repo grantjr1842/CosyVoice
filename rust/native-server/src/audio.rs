@@ -444,7 +444,13 @@ pub fn stft(
 /// Returns mel spectrogram as (num_mels, n_frames) array with log compression.
 pub fn mel_spectrogram_ndarray(audio: &[f32], config: &MelConfig) -> Result<Array2<f32>> {
     // Compute STFT magnitude
-    let spec = stft(audio, config.n_fft, config.hop_size, config.win_size, config.center)?;
+    let spec = stft(
+        audio,
+        config.n_fft,
+        config.hop_size,
+        config.win_size,
+        config.center,
+    )?;
 
     // Create mel filterbank
     let mel_basis = create_mel_filterbank(config);
@@ -783,7 +789,12 @@ pub fn upsample_2x_cubic(samples: &[f32]) -> Vec<f32> {
 
         // Cubic interpolation at t=0.5
         let t = 0.5f32;
-        let interpolated = s_0 + 0.5 * t * (s_1 - s_m1 + t * (2.0 * s_m1 - 5.0 * s_0 + 4.0 * s_1 - s_2 + t * (3.0 * (s_0 - s_1) + s_2 - s_m1)));
+        let interpolated = s_0
+            + 0.5
+                * t
+                * (s_1 - s_m1
+                    + t * (2.0 * s_m1 - 5.0 * s_0 + 4.0 * s_1 - s_2
+                        + t * (3.0 * (s_0 - s_1) + s_2 - s_m1)));
         output.push(interpolated);
     }
 
@@ -872,8 +883,14 @@ mod tests {
         let audio: Vec<f32> = (0..24000).map(|i| (i as f32 * 0.01).sin()).collect();
         let config = MelConfig::inference();
 
-        let spec = stft(&audio, config.n_fft, config.hop_size, config.win_size, config.center)
-            .expect("STFT should succeed");
+        let spec = stft(
+            &audio,
+            config.n_fft,
+            config.hop_size,
+            config.win_size,
+            config.center,
+        )
+        .expect("STFT should succeed");
 
         // Check output shape
         assert_eq!(spec.ncols(), config.n_fft / 2 + 1);

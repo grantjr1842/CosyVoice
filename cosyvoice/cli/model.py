@@ -104,15 +104,15 @@ class CosyVoice3Model:
             optimizer = GpuOptimizer()
             compile_mode = optimizer.suggest_compile_mode()
 
-            logging.info(
-                f"Applying torch.compile to models with mode='{compile_mode}'..."
-            )
-
-            # We use the suggested mode
-            self.llm = torch.compile(self.llm, mode=compile_mode)
-
-            self.flow = torch.compile(self.flow, mode=compile_mode)
-            self.hift = torch.compile(self.hift, mode=compile_mode)
+            if compile_mode:
+                logging.info(
+                    f"Applying torch.compile to models with mode='{compile_mode}'..."
+                )
+                self.llm = torch.compile(self.llm, mode=compile_mode)
+                self.flow = torch.compile(self.flow, mode=compile_mode)
+                self.hift = torch.compile(self.hift, mode=compile_mode)
+            else:
+                logging.info("Skipping torch.compile (no compatible GPU detected).")
 
     def load_vllm(self, model_dir):
         """Load vLLM for accelerated inference."""
@@ -177,11 +177,24 @@ class CosyVoice3Model:
 
     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
         """LLM inference job for generating speech tokens."""
+        prompt_text = prompt_text.to(self.device)
+        prompt_text_len = torch.tensor(
+            [prompt_text.shape[1]], dtype=torch.int32, device=self.device
+        )
+        prompt_speech_token = llm_prompt_speech_token.to(self.device)
+        prompt_speech_token_len = torch.tensor(
+            [prompt_speech_token.shape[1]], dtype=torch.int32, device=self.device
+        )
+        embedding = llm_embedding.to(self.device)
+        autocast_enabled = (
+            self.fp16 is True
+            and self.device.type == "cuda"
+            and hasattr(self.llm, "vllm") is False
+        )
         with (
+            torch.inference_mode(),
             self.llm_context,
-            torch.amp.autocast(
-                "cuda", enabled=self.fp16 is True and hasattr(self.llm, "vllm") is False
-            ),
+            torch.amp.autocast("cuda", enabled=autocast_enabled),
         ):
             if isinstance(text, Generator):
                 assert not hasattr(self.llm, "vllm"), (
@@ -189,32 +202,26 @@ class CosyVoice3Model:
                 )
                 for i in self.llm.inference_bistream(
                     text=text,
-                    prompt_text=prompt_text.to(self.device),
-                    prompt_text_len=torch.tensor(
-                        [prompt_text.shape[1]], dtype=torch.int32
-                    ).to(self.device),
-                    prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                    prompt_speech_token_len=torch.tensor(
-                        [llm_prompt_speech_token.shape[1]], dtype=torch.int32
-                    ).to(self.device),
-                    embedding=llm_embedding.to(self.device),
+                    prompt_text=prompt_text,
+                    prompt_text_len=prompt_text_len,
+                    prompt_speech_token=prompt_speech_token,
+                    prompt_speech_token_len=prompt_speech_token_len,
+                    embedding=embedding,
                 ):
                     self.tts_speech_token_dict[uuid].append(i)
             else:
+                text = text.to(self.device)
+                text_len = torch.tensor(
+                    [text.shape[1]], dtype=torch.int32, device=self.device
+                )
                 for i in self.llm.inference(
-                    text=text.to(self.device),
-                    text_len=torch.tensor([text.shape[1]], dtype=torch.int32).to(
-                        self.device
-                    ),
-                    prompt_text=prompt_text.to(self.device),
-                    prompt_text_len=torch.tensor(
-                        [prompt_text.shape[1]], dtype=torch.int32
-                    ).to(self.device),
-                    prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                    prompt_speech_token_len=torch.tensor(
-                        [llm_prompt_speech_token.shape[1]], dtype=torch.int32
-                    ).to(self.device),
-                    embedding=llm_embedding.to(self.device),
+                    text=text,
+                    text_len=text_len,
+                    prompt_text=prompt_text,
+                    prompt_text_len=prompt_text_len,
+                    prompt_speech_token=prompt_speech_token,
+                    prompt_speech_token_len=prompt_speech_token_len,
+                    embedding=embedding,
                     uuid=uuid,
                 ):
                     self.tts_speech_token_dict[uuid].append(i)
@@ -238,22 +245,32 @@ class CosyVoice3Model:
         speed=1.0,
     ):
         """Convert speech tokens to waveform."""
-        with torch.amp.autocast("cuda", enabled=self.fp16):
+        if token.device != self.device or token.dtype != torch.int32:
+            token = token.to(self.device, dtype=torch.int32)
+        if prompt_token.device != self.device or prompt_token.dtype != torch.int32:
+            prompt_token = prompt_token.to(self.device, dtype=torch.int32)
+        if prompt_feat.device != self.device:
+            prompt_feat = prompt_feat.to(self.device)
+        if embedding.device != self.device:
+            embedding = embedding.to(self.device)
+        token_len = torch.tensor([token.shape[1]], dtype=torch.int32, device=self.device)
+        prompt_token_len = torch.tensor(
+            [prompt_token.shape[1]], dtype=torch.int32, device=self.device
+        )
+        prompt_feat_len = torch.tensor(
+            [prompt_feat.shape[1]], dtype=torch.int32, device=self.device
+        )
+        autocast_enabled = self.fp16 is True and self.device.type == "cuda"
+        with torch.amp.autocast("cuda", enabled=autocast_enabled):
             # timer for flow
             tts_mel, _ = self.flow.inference(
-                token=token.to(self.device, dtype=torch.int32),
-                token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(
-                    self.device
-                ),
-                prompt_token=prompt_token.to(self.device),
-                prompt_token_len=torch.tensor(
-                    [prompt_token.shape[1]], dtype=torch.int32
-                ).to(self.device),
-                prompt_feat=prompt_feat.to(self.device),
-                prompt_feat_len=torch.tensor(
-                    [prompt_feat.shape[1]], dtype=torch.int32
-                ).to(self.device),
-                embedding=embedding.to(self.device),
+                token=token,
+                token_len=token_len,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
                 streaming=stream,
                 finalize=finalize,
             )
@@ -384,7 +401,8 @@ class CosyVoice3Model:
             p.join()
             # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
             this_tts_speech_token = torch.tensor(
-                self.tts_speech_token_dict[this_uuid]
+                self.tts_speech_token_dict[this_uuid],
+                dtype=torch.int32,
             ).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(
                 token=this_tts_speech_token,
@@ -400,7 +418,8 @@ class CosyVoice3Model:
             # deal with all tokens
             p.join()
             this_tts_speech_token = torch.tensor(
-                self.tts_speech_token_dict[this_uuid]
+                self.tts_speech_token_dict[this_uuid],
+                dtype=torch.int32,
             ).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(
                 token=this_tts_speech_token,
@@ -417,6 +436,9 @@ class CosyVoice3Model:
             self.tts_speech_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
+        if (
+            torch.cuda.is_available()
+            and os.environ.get("COSYVOICE_CLEAR_CACHE", "0") == "1"
+        ):
             torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+            torch.cuda.synchronize()

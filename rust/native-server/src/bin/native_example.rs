@@ -59,9 +59,12 @@ fn main() -> Result<()> {
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     println!("Using device: {:?}", device);
 
-    let mut engine = NativeTtsEngine::new(model_dir.to_string_lossy().as_ref(), Some(device.clone()))?;
+    let mut engine =
+        NativeTtsEngine::new(model_dir.to_string_lossy().as_ref(), Some(device.clone()))?;
     if engine.frontend.is_none() {
-        return Err(anyhow!("ONNX frontend failed to initialize; cannot run native example."));
+        return Err(anyhow!(
+            "ONNX frontend failed to initialize; cannot run native example."
+        ));
     }
 
     let prompt_wav = repo_root.join(DEFAULT_PROMPT_WAV_REL);
@@ -78,9 +81,11 @@ fn main() -> Result<()> {
 
     let prompt_speech_16k = audio::whisper_log_mel_spectrogram(&prompt_16k, &Device::Cpu)?;
     let prompt_fbank = audio::kaldi_fbank(&prompt_16k, 16000, &Device::Cpu)?;
-    let mut prompt_speech_24k = audio::mel_spectrogram(&prompt_24k, &MelConfig::cosyvoice3(), &device)?;
+    let mut prompt_speech_24k =
+        audio::mel_spectrogram(&prompt_24k, &MelConfig::cosyvoice3(), &device)?;
 
-    let (mut prompt_speech_tokens, speaker_embedding) = engine.process_prompt_tensors(&prompt_speech_16k, &prompt_fbank)?;
+    let (mut prompt_speech_tokens, speaker_embedding) =
+        engine.process_prompt_tensors(&prompt_speech_16k, &prompt_fbank)?;
 
     // Align prompt mel length with prompt token length (token_mel_ratio = 2)
     let mel_len = prompt_speech_24k.dim(2)?;
@@ -111,7 +116,11 @@ fn main() -> Result<()> {
     for (idx, tts_text) in texts.iter().enumerate() {
         let segments = text_normalize_english(tts_text, &tokenizer, true, true)?;
         if segments.is_empty() {
-            println!("\nSkipping empty text segment for input [{}/{}]", idx + 1, texts.len());
+            println!(
+                "\nSkipping empty text segment for input [{}/{}]",
+                idx + 1,
+                texts.len()
+            );
             continue;
         }
 
@@ -144,7 +153,8 @@ fn main() -> Result<()> {
                 25,
             )?;
 
-            let output_path = output_dir.join(format!("native_voice_clone_{}_{}.wav", idx, seg_idx));
+            let output_path =
+                output_dir.join(format!("native_voice_clone_{}_{}.wav", idx, seg_idx));
             save_wav(&output_path, &audio_samples, engine.sample_rate)?;
             let duration = audio_samples.len() as f32 / engine.sample_rate as f32;
             println!("Saved: {:?} (duration {:.2}s)", output_path, duration);

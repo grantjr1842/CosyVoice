@@ -1,4 +1,5 @@
 use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::ops::sdpa;
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
@@ -137,14 +138,7 @@ impl Attention {
         let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
 
-        let use_flash_attn = if cfg!(feature = "cuda") {
-            // Check if device is CUDA and supports it (could be dynamic)
-            // For now, assume true if cuda feature is on and we are using CUDA device
-            // TODO: Implement Flash Attention call
-            false
-        } else {
-            false
-        };
+        let use_flash_attn = vb.device().is_cuda() || vb.device().is_metal();
 
         Ok(Self {
             q_proj,
@@ -198,24 +192,48 @@ impl Attention {
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        // Flash Attention Logic
+        let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+        let scale_f32 = scale as f32;
+
+        // SDPA path (fused attention) with fallback to the manual path.
         let attn_output = if self.use_flash_attn {
-            panic!("Flash Attention not supported without cuda feature");
+            match sdpa(
+                &query_states,
+                &key_states,
+                &value_states,
+                attention_mask,
+                false,
+                scale_f32,
+                1.0,
+            ) {
+                Ok(attn) => attn
+                    .transpose(1, 2)?
+                    .reshape((b_sz, q_len, self.hidden_size))?,
+                Err(_) => {
+                    let attn_weights =
+                        (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+                    let attn_weights = match attention_mask {
+                        None => attn_weights,
+                        Some(mask) => attn_weights.broadcast_add(mask)?,
+                    };
+                    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+                    attn_weights
+                        .matmul(&value_states)?
+                        .transpose(1, 2)?
+                        .reshape((b_sz, q_len, self.hidden_size))?
+                }
+            }
         } else {
-            let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-            let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
-
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
             let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
-
             let attn_weights = match attention_mask {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_weights = attn_weights.matmul(&value_states)?;
-
             attn_weights
+                .matmul(&value_states)?
                 .transpose(1, 2)?
                 .reshape((b_sz, q_len, self.hidden_size))?
         };
@@ -294,7 +312,10 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            eprintln!("Qwen2: Loading layer {}/{}...", layer_idx, cfg.num_hidden_layers);
+            eprintln!(
+                "Qwen2: Loading layer {}/{}...",
+                layer_idx, cfg.num_hidden_layers
+            );
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
