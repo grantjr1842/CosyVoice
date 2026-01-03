@@ -634,11 +634,13 @@ impl HiFTGenerator {
         let stft = crate::utils::InverseStftModule::new(
             config.istft_params_n_fft,
             config.istft_params_hop_len,
+            true,
             vb.device(),
         )?;
         let analysis_stft = crate::utils::StftModule::new(
             config.istft_params_n_fft,
             config.istft_params_hop_len,
+            true,
             vb.device(),
         )?;
 
