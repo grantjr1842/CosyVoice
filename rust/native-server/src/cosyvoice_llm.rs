@@ -222,7 +222,7 @@ impl CosyVoiceLLM {
 
     fn is_stop_token(&self, token_id: u32) -> bool {
         let idx = token_id as usize;
-        self.stop_token_ids.iter().any(|&stop| stop == idx)
+        self.stop_token_ids.contains(&idx)
     }
 
     pub fn stop_token_ids(&self) -> &[usize] {

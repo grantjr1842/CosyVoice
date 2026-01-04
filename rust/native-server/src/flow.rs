@@ -384,7 +384,7 @@ impl Attention {
             let k = k.contiguous()?;
             let k_t = k.transpose(2, 3)?;
             let attn = q.matmul(&k_t)?;
-            let mut attn = (attn * self.scale)?;
+            let attn = (attn * self.scale)?;
 
             let attn = if let Some(mask) = attn_mask {
                 attn.broadcast_add(&mask)?
@@ -461,7 +461,7 @@ fn apply_rotary_pos_emb_flat(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
     let freq = freqs
         .narrow(0, 0, n)?
         .to_dtype(x.dtype())?
-        .to_device(&device)?
+        .to_device(device)?
         .unsqueeze(0)?;
     let cos = freq.cos()?;
     let sin = freq.sin()?;
