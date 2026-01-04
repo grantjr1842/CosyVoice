@@ -286,6 +286,11 @@ impl Attention {
         let to_v = linear(dim, inner_dim, vb.pp("to_v"))?;
         let to_out = linear(inner_dim, dim, vb.pp("to_out.0"))?;
         let use_flash_attn = vb.device().is_cuda() || vb.device().is_metal();
+        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+        LOG_ONCE.call_once(|| {
+            eprintln!("    [Attn DEBUG] Attention::new called: device={:?}, use_flash_attn={}", vb.device(), use_flash_attn);
+        });
+
         Ok(Self {
             to_q,
             to_k,
@@ -344,12 +349,12 @@ impl Attention {
                 .affine(-1.0, 1.0)?   // 1 -> 0, 0 -> 1
                 .affine(1e10, 0.0)?   // multiply by large value
                 .neg()?;              // 0 -> 0, 1e10 -> -1e10
-            (Some(chunk_inv), true)
+            Some(chunk_inv)
         } else {
             eprintln!("    [Attn DEBUG] mask shape: {:?}", mask.shape());
             let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
             let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?.neg()?;
-            (Some(m_inv), true)
+            Some(m_inv)
         };
 
         let out = if self.use_flash_attn {
