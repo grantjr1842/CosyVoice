@@ -46,7 +46,7 @@ impl Module for Snake {
         let scaled_x = xs.broadcast_mul(norm)?;
         let sin_sq = scaled_x.sin()?.sqr()?;
 
-        Ok((xs + one_over_norm.broadcast_mul(&sin_sq)?)?)
+        xs + one_over_norm.broadcast_mul(&sin_sq)?
     }
 }
 
@@ -605,15 +605,10 @@ impl HiFTGenerator {
         let base_ch = config.base_channels;
 
         // Determine if causal
-        let is_causal = if vb.pp("conv_pre").contains_tensor("weight.original1")
+        let is_causal = vb.pp("conv_pre").contains_tensor("weight.original1")
             || vb
                 .pp("conv_pre")
-                .contains_tensor("parametrizations.weight.original1")
-        {
-            true
-        } else {
-            false
-        };
+                .contains_tensor("parametrizations.weight.original1");
 
         // Conv Pre
         // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
@@ -689,12 +684,10 @@ impl HiFTGenerator {
                 } else {
                     (0, u - 1)
                 }
+            } else if u == 1 {
+                (0, 0)
             } else {
-                if u == 1 {
-                    (0, 0)
-                } else {
-                    (u / 2, 0)
-                } // Standard logic line 593: u/2
+                (u / 2, 0)
             };
             source_down_pads.push(sd_manual_pad);
 
