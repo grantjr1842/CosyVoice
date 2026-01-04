@@ -41,6 +41,15 @@ If your TensorRT libs are not on the default linker path, set
 `LD_LIBRARY_PATH` includes it. The `rust/start-server.sh` script will try to
 discover pixi-installed TensorRT libs automatically when the flag is enabled.
 
+### Flash Attention
+Flash Attention v2 is supported for `native-server` on compatible NVIDIA GPUs (Compute Capability 8.0+ / Ampere and newer).
+It is enabled via the `cuda` feature, which includes `candle-transformers/flash-attn`.
+To verify it is active, check the dependency tree:
+```bash
+cd rust/native-server
+cargo tree --features cuda | grep candle-flash-attn
+```
+
 ## Voice cloning smoke test
 
 With either server running, use the example script to send a zero-shot request:
