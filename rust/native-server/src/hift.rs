@@ -239,7 +239,6 @@ fn load_conv1d(
             }
         }
 
-        eprintln!("    [Conv {}] Bias loaded successfully.", name);
         Some(b)
     } else {
         eprintln!(
@@ -526,7 +525,6 @@ impl F0Predictor {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [Batch, 80, Time]
-        eprintln!("  [F0Predictor] input shape: {:?}", x.shape());
 
         let mut h = x.clone();
         for (i, conv) in self.condnet.iter().enumerate() {
@@ -616,7 +614,6 @@ impl HiFTGenerator {
         } else {
             false
         };
-        eprintln!("    [HiFT] is_causal: {}", is_causal);
 
         // Conv Pre
         // Fun-CosyVoice3-0.5B has kernel_size=5, padding=2
@@ -798,7 +795,6 @@ impl HiFTGenerator {
     }
 
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        eprintln!("\n  [HiFT.forward] Starting...");
         eprintln!("    input mel shape: {:?}", mel.shape());
 
         // Log input mel stats
@@ -868,7 +864,6 @@ impl HiFTGenerator {
         let audio = self.decode(mel, &s_source)?;
 
         // Print final audio stats
-        eprintln!("    [HiFT.forward] output shape: {:?}", audio.shape());
         if let Ok(audio_flat) = audio.flatten_all() {
             if let Ok(audio_vec) = audio_flat.to_vec1::<f32>() {
                 let min = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -964,7 +959,6 @@ impl HiFTGenerator {
             // Debug source signal si
             if let Ok(flat_si) = si.flatten_all() {
                  let mean_si = flat_si.mean(0)?.to_scalar::<f32>().unwrap_or(0.0);
-                 eprintln!("    [decode] loop {} source si mean: {:.4e}", i, mean_si);
             }
 
             let common_len = x_len.min(si_len);
@@ -976,7 +970,6 @@ impl HiFTGenerator {
             // Debug after fusion
             if let Ok(flat_x) = x.flatten_all() {
                  let mean_x = flat_x.mean(0)?.to_scalar::<f32>().unwrap_or(0.0);
-                 eprintln!("    [decode] loop {} post-fusion x mean: {:.4e}", i, mean_x);
             }
 
             // ResBlocks
@@ -1028,11 +1021,9 @@ impl HiFTGenerator {
         // Remove DC offset (Explicitly force 0 mean)
         let mean_tensor = audio.mean(2)?.broadcast_as(audio.shape())?;
         if let Ok(m) = mean_tensor.mean_all()?.to_scalar::<f32>() {
-             eprintln!("    [decode] DC mean before removal: {:.6}", m);
         }
         let audio = (audio - mean_tensor)?;
         if let Ok(m) = audio.mean_all()?.to_scalar::<f32>() {
-             eprintln!("    [decode] DC mean after removal: {:.6}", m);
         }
 
         // Apply Gain Correction to match Python output range
@@ -1045,7 +1036,6 @@ impl HiFTGenerator {
             if let Ok(vec) = flat.to_vec1::<f32>() {
                 let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                eprintln!("    [decode] Audio Pre-Clamp: min={:.6}, max={:.6}", min, max);
             }
         }
 
