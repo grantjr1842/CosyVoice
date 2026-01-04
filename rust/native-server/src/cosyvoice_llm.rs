@@ -299,7 +299,7 @@ impl CosyVoiceLLM {
         let logp_vec: Vec<f32> = logp.to_vec1()?;
         let mut probs: Vec<f32> = logp_vec.iter().map(|v| v.exp()).collect();
         if ignore_stop {
-            let stop_start = self.sampling_vocab_size.min(probs.len());
+            let stop_start = self.config.sampling_vocab_size.min(probs.len());
             for p in probs.iter_mut().skip(stop_start) {
                 *p = 0.0;
             }

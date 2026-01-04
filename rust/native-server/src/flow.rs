@@ -288,7 +288,6 @@ impl Attention {
         let use_flash_attn = vb.device().is_cuda() || vb.device().is_metal();
         static LOG_ONCE: std::sync::Once = std::sync::Once::new();
         LOG_ONCE.call_once(|| {
-            eprintln!("    [Attn DEBUG] Attention::new called: device={:?}, use_flash_attn={}", vb.device(), use_flash_attn);
         });
 
         Ok(Self {
@@ -326,7 +325,6 @@ impl Attention {
             k
         };
 
-        eprintln!("    [Attn DEBUG] q after RoPE shape: {:?}", q.shape());
         let q = q
             .reshape((b, n, self.heads, self.dim_head))?
             .transpose(1, 2)?;
@@ -336,13 +334,10 @@ impl Attention {
         let v = v
             .reshape((b, n, self.heads, self.dim_head))?
             .transpose(1, 2)?;
-        eprintln!("    [Attn DEBUG] q after reshape/transpose: {:?}", q.shape());
-        eprintln!("    [Attn DEBUG] k shape: {:?}, v shape: {:?}", k.shape(), v.shape());
 
         let scale_f32 = self.scale as f32;
 
         let attn_mask = if let Some(chunk_mask) = chunk_mask {
-            eprintln!("    [Attn DEBUG] chunk_mask shape: {:?}", chunk_mask.shape());
             // chunk_mask is [B, 1, N, N]
             // For sdpa, we need an additive mask (0 for valid, -inf for masked)
             let chunk_inv = chunk_mask
@@ -351,7 +346,6 @@ impl Attention {
                 .neg()?;              // 0 -> 0, 1e10 -> -1e10
             Some(chunk_inv)
         } else {
-            eprintln!("    [Attn DEBUG] mask shape: {:?}", mask.shape());
             let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
             let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?.neg()?;
             Some(m_inv)
@@ -469,26 +463,19 @@ fn apply_rotary_pos_emb_flat(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
         .to_dtype(x.dtype())?
         .to_device(&device)?
         .unsqueeze(0)?;
-    eprintln!("    [RoPE DEBUG] freq (after unsqueeze(0)) shape: {:?}", freq.shape());
     let cos = freq.cos()?;
     let sin = freq.sin()?;
     let rot_dim = cos.dim(2)?;
-    eprintln!("    [RoPE DEBUG] rot_dim={}, d={}", rot_dim, d);
 
     let x_rot = x.narrow(2, 0, rot_dim)?;
-    eprintln!("    [RoPE DEBUG] x_rot shape: {:?}", x_rot.shape());
     let rotated = rotate_half(&x_rot)?;
-    eprintln!("    [RoPE DEBUG] rotated shape: {:?}", rotated.shape());
     let rotated = rotated.broadcast_mul(&sin)?;
     let mut x_rotated = x_rot.broadcast_mul(&cos)?;
     x_rotated = x_rotated.broadcast_add(&rotated)?;
-    eprintln!("    [RoPE DEBUG] x_rotated shape: {:?}", x_rotated.shape());
 
     if rot_dim < d {
         let rest = x.narrow(2, rot_dim, d - rot_dim)?;
-        eprintln!("    [RoPE DEBUG] rest shape: {:?}", rest.shape());
         let result = Tensor::cat(&[&x_rotated, &rest], 2)?;
-        eprintln!("    [RoPE DEBUG] result shape: {:?}", result.shape());
         Ok(result)
     } else {
         Ok(x_rotated)
@@ -971,7 +958,6 @@ impl ConditionalCFM {
                     break;
                 }
             }
-            eprintln!("    [Flow parity] solver step {}/{}", i, t_span.len() - 1);
 
             let x_in = Tensor::cat(&[&x, &x], 0)?;
             let mask_in = Tensor::cat(&[&mask_flat, &mask_flat], 0)?;
