@@ -45,6 +45,8 @@ pub struct NativeTtsEngine {
     pub device: Device,
     /// Sample rate
     pub sample_rate: u32,
+    /// DType (F16 or F32)
+    pub dtype: DType,
 }
 
 const MIN_TOKEN_TEXT_RATIO: f32 = 2.0;
@@ -57,7 +59,12 @@ impl NativeTtsEngine {
 
         // Initialize device
         let device = device.unwrap_or_else(|| Device::cuda_if_available(0).unwrap_or(Device::Cpu));
-        eprintln!("Native TTS Engine using device: {:?}", device);
+        let dtype = if device.is_cuda() || device.is_metal() {
+            DType::F16
+        } else {
+            DType::F32
+        };
+        eprintln!("Native TTS Engine using device: {:?}, dtype: {:?}", device, dtype);
 
         // Load configurations
         let config_str = std::fs::read_to_string(model_path.join("config.json"))?;
@@ -88,7 +95,7 @@ impl NativeTtsEngine {
         };
         eprintln!("Loading LLM from {:?}", llm_path);
         let llm_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&llm_path], DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[&llm_path], dtype, &device)
                 .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to load LLM: {}", e)))?
         };
 
@@ -102,7 +109,7 @@ impl NativeTtsEngine {
         let flow_path = model_path.join("flow.safetensors");
         eprintln!("Loading Flow from {:?}", flow_path);
         let flow_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&flow_path], DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[&flow_path], dtype, &device)
                 .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to load Flow: {}", e)))?
         };
 
@@ -114,6 +121,8 @@ impl NativeTtsEngine {
         eprintln!("Flow initialized successfully");
 
         // Load HiFT from safetensors
+        // HiFT must use F32 to avoid precision loss in weight normalization (F16 causes
+        // F0Predictor to output ~5M Hz instead of ~200 Hz due to precision issues in g/v norm)
         let hift_path = model_path.join("hift.safetensors");
         eprintln!("Loading HiFT from {:?}", hift_path);
         let hift_vb = unsafe {
@@ -152,6 +161,7 @@ impl NativeTtsEngine {
             frontend,
             device,
             sample_rate: 24000,
+            dtype,
         })
     }
 
@@ -230,10 +240,10 @@ impl NativeTtsEngine {
         let mel = self.flow.inference(
             speech_tokens,
             prompt_tokens,
-            prompt_mel,
-            speaker_embedding,
+            &prompt_mel.to_dtype(self.dtype)?,
+            &speaker_embedding.to_dtype(self.dtype)?,
             10, // n_timesteps
-            flow_noise,
+            flow_noise.map(|t| t.to_dtype(self.dtype)).transpose()?.as_ref(),
         )?;
         if debug {
             eprintln!("Flow output shape: {:?}", mel.shape());
@@ -321,7 +331,7 @@ impl NativeTtsEngine {
 
         // Run HiFT
         eprintln!("\n--- Running HiFT inference (Direct Mel)... ---");
-        let audio = self.hift.forward(mel)?;
+        let audio = self.hift.forward(&mel.to_dtype(self.dtype)?)?;
         eprintln!("HiFT output shape: {:?}", audio.shape());
         print_tensor_stats("hift_output_audio", &audio);
 
