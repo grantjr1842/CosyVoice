@@ -1,4 +1,5 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_nn::ops::sdpa;
 use candle_nn::{linear, LayerNorm, Linear, VarBuilder};
 
 // Force rebuild marker: REBUILD_V1
@@ -274,6 +275,7 @@ pub struct Attention {
     heads: usize,
     dim_head: usize,
     scale: f64,
+    use_flash_attn: bool,
 }
 
 impl Attention {
@@ -283,6 +285,12 @@ impl Attention {
         let to_k = linear(dim, inner_dim, vb.pp("to_k"))?;
         let to_v = linear(dim, inner_dim, vb.pp("to_v"))?;
         let to_out = linear(inner_dim, dim, vb.pp("to_out.0"))?;
+        let use_flash_attn = vb.device().is_cuda() || vb.device().is_metal();
+        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+        LOG_ONCE.call_once(|| {
+            eprintln!("    [Attn DEBUG] Attention::new called: device={:?}, use_flash_attn={}", vb.device(), use_flash_attn);
+        });
+
         Ok(Self {
             to_q,
             to_k,
@@ -291,6 +299,7 @@ impl Attention {
             heads,
             dim_head,
             scale: 1.0 / (dim_head as f64).sqrt(),
+            use_flash_attn,
         })
     }
 
@@ -330,37 +339,68 @@ impl Attention {
         eprintln!("    [Attn DEBUG] q after reshape/transpose: {:?}", q.shape());
         eprintln!("    [Attn DEBUG] k shape: {:?}, v shape: {:?}", k.shape(), v.shape());
 
-        // Ensure contiguous layout for matmul
-        let q = q.contiguous()?;
-        let k = k.contiguous()?;
-        let k_t = k.transpose(2, 3)?;
-        eprintln!("    [Attn DEBUG] k_t shape: {:?}", k_t.shape());
-        let attn = q.matmul(&k_t)?;
-        eprintln!("    [Attn DEBUG] attn after matmul: {:?}", attn.shape());
-        let mut attn = (attn * self.scale)?;
+        let scale_f32 = self.scale as f32;
 
-        if let Some(chunk_mask) = chunk_mask {
+        let attn_mask = if let Some(chunk_mask) = chunk_mask {
             eprintln!("    [Attn DEBUG] chunk_mask shape: {:?}", chunk_mask.shape());
-            // chunk_mask is [B, 1, N, N] - no need to unsqueeze further
-            // We invert it: 0 -> large negative (masked), 1 -> 0 (not masked)
+            // chunk_mask is [B, 1, N, N]
+            // For sdpa, we need an additive mask (0 for valid, -inf for masked)
             let chunk_inv = chunk_mask
                 .affine(-1.0, 1.0)?   // 1 -> 0, 0 -> 1
-                .affine(1e10, 0.0)?;  // multiply by large value
-            eprintln!("    [Attn DEBUG] chunk_inv shape: {:?}", chunk_inv.shape());
-            attn = candle_nn::ops::softmax(&attn.broadcast_sub(&chunk_inv)?, 3)?;
-
+                .affine(1e10, 0.0)?   // multiply by large value
+                .neg()?;              // 0 -> 0, 1e10 -> -1e10
+            Some(chunk_inv)
         } else {
             eprintln!("    [Attn DEBUG] mask shape: {:?}", mask.shape());
             let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
-            eprintln!("    [Attn DEBUG] m shape: {:?}", m.shape());
-            let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?;
-            attn = candle_nn::ops::softmax(&attn.broadcast_sub(&m_inv)?, 3)?;
-        }
-        eprintln!("    [Attn DEBUG] attn after softmax: {:?}", attn.shape());
+            let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?.neg()?;
+            Some(m_inv)
+        };
 
-        let v = v.contiguous()?;
-        eprintln!("    [Attn DEBUG] v shape before final matmul: {:?}", v.shape());
-        let out = attn.matmul(&v)?;
+        let out = if self.use_flash_attn {
+            match sdpa(
+                &q.contiguous()?,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                attn_mask.as_ref(),
+                false,
+                scale_f32,
+                1.0,
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("    [Attn WARNING] sdpa failed: {:?}, falling back to manual path", e);
+                    let q = q.contiguous()?;
+                    let k = k.contiguous()?;
+                    let k_t = k.transpose(2, 3)?;
+                    let attn = q.matmul(&k_t)?;
+                    let mut attn = (attn * self.scale)?;
+
+                    let attn = if let Some(mask) = attn_mask {
+                        attn.broadcast_add(&mask)?
+                    } else {
+                        attn
+                    };
+                    let attn = candle_nn::ops::softmax(&attn, 3)?;
+                    attn.matmul(&v.contiguous()?)?
+                }
+            }
+        } else {
+            let q = q.contiguous()?;
+            let k = k.contiguous()?;
+            let k_t = k.transpose(2, 3)?;
+            let attn = q.matmul(&k_t)?;
+            let mut attn = (attn * self.scale)?;
+
+            let attn = if let Some(mask) = attn_mask {
+                attn.broadcast_add(&mask)?
+            } else {
+                attn
+            };
+            let attn = candle_nn::ops::softmax(&attn, 3)?;
+            attn.matmul(&v.contiguous()?)?
+        };
+
         self.to_out.forward(
             &out.transpose(1, 2)?
                 .reshape((b, n, self.heads * self.dim_head))?,
