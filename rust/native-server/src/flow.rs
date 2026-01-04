@@ -7,25 +7,29 @@ const _FORCE_REBUILD: u32 = 1;
 
 use serde::Deserialize;
 
-fn log_v_stats(name: &str, t: &Tensor) -> Result<()> {
-    let t = if t.dtype() != DType::F32 {
-        t.to_dtype(DType::F32)?
-    } else {
-        t.clone()
-    };
-    let flat = t.flatten_all()?;
-    let vec = flat.to_vec1::<f32>()?;
-    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-    eprintln!(
-        "    [V DEBUG] {} stats: min={:.6}, max={:.6}, mean={:.6}, first 5={:?}",
-        name,
-        min,
-        max,
-        mean,
-        &vec[0..usize::min(vec.len(), 5)]
-    );
+fn log_v_stats(_name: &str, _t: &Tensor) -> Result<()> {
+    // Debug logging disabled for production. Set FLOW_DEBUG=1 to enable.
+    #[cfg(feature = "debug_flow")]
+    {
+        let t = if _t.dtype() != DType::F32 {
+            _t.to_dtype(DType::F32)?
+        } else {
+            _t.clone()
+        };
+        let flat = t.flatten_all()?;
+        let vec = flat.to_vec1::<f32>()?;
+        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+        eprintln!(
+            "    [V DEBUG] {} stats: min={:.6}, max={:.6}, mean={:.6}, first 5={:?}",
+            _name,
+            min,
+            max,
+            mean,
+            &vec[0..usize::min(vec.len(), 5)]
+        );
+    }
     Ok(())
 }
 
