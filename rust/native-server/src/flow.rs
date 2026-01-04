@@ -104,8 +104,8 @@ pub struct AdaLayerNormZero {
 impl AdaLayerNormZero {
     pub fn new(vb: VarBuilder, dim: usize) -> Result<Self> {
         let device = vb.device();
-        let weight = Tensor::ones((dim,), DType::F32, device)?;
-        let bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let weight = Tensor::ones((dim,), vb.dtype(), device)?;
+        let bias = Tensor::zeros((dim,), vb.dtype(), device)?;
         let norm = LayerNorm::new(weight, bias, 1e-6);
 
         let linear = linear(dim, dim * 6, vb.pp("linear"))?;
@@ -143,8 +143,8 @@ impl AdaLayerNormZeroFinal {
         // Python: elementwise_affine=False, so no weights/bias.
         // candle LayerNorm requires Tensors. We create them manually (weight=1, bias=0).
         let device = vb.device();
-        let weight = Tensor::ones((dim,), DType::F32, device)?;
-        let bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let weight = Tensor::ones((dim,), vb.dtype(), device)?;
+        let bias = Tensor::zeros((dim,), vb.dtype(), device)?;
         let norm = LayerNorm::new(weight, bias, 1e-6);
 
         let linear = linear(dim, dim * 2, vb.pp("linear"))?;
@@ -183,8 +183,8 @@ impl DiTBlock {
         let attn_norm = AdaLayerNormZero::new(vb.pp("attn_norm"), dim)?;
         let attn = Attention::new(vb.pp("attn"), dim, heads, dim_head)?;
 
-        let ff_norm_weight = Tensor::ones((dim,), DType::F32, device)?;
-        let ff_norm_bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let ff_norm_weight = Tensor::ones((dim,), vb.dtype(), device)?;
+        let ff_norm_bias = Tensor::zeros((dim,), vb.dtype(), device)?;
         let ff_norm = LayerNorm::new(ff_norm_weight, ff_norm_bias, 1e-6);
 
         let ff = FeedForward::new(vb.pp("ff"), dim, 2)?;
@@ -347,13 +347,13 @@ impl Attention {
             // For sdpa, we need an additive mask (0 for valid, -inf for masked)
             let chunk_inv = chunk_mask
                 .affine(-1.0, 1.0)?   // 1 -> 0, 0 -> 1
-                .affine(1e10, 0.0)?   // multiply by large value
-                .neg()?;              // 0 -> 0, 1e10 -> -1e10
+                .affine(100.0, 0.0)?   // multiply by safe value for F16
+                .neg()?;              // 0 -> 0, 100 -> -100
             Some(chunk_inv)
         } else {
             eprintln!("    [Attn DEBUG] mask shape: {:?}", mask.shape());
             let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
-            let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?.neg()?;
+            let m_inv = (m.affine(-1.0, 1.0)? * 1e4)?.neg()?;
             Some(m_inv)
         };
 
@@ -365,7 +365,7 @@ impl Attention {
                 attn_mask.as_ref(),
                 false,
                 scale_f32,
-                1.0,
+                0.0,
             ) {
                 Ok(out) => out,
                 Err(e) => {
@@ -373,7 +373,12 @@ impl Attention {
                     let q = q.contiguous()?;
                     let k = k.contiguous()?;
                     let k_t = k.transpose(2, 3)?;
+                    log_v_stats("attn_q", &q)?;
+                    log_v_stats("attn_k_t", &k_t)?;
+                    let attn = q.matmul(&k_t)?;
+                    log_v_stats("attn_matmul", &attn)?;
                     let attn = (attn * self.scale)?;
+                    log_v_stats("attn_scaled", &attn)?;
 
                     let attn = if let Some(mask) = attn_mask {
                         attn.broadcast_add(&mask)?
@@ -381,7 +386,10 @@ impl Attention {
                         attn
                     };
                     let attn = candle_nn::ops::softmax(&attn, 3)?;
-                    attn.matmul(&v.contiguous()?)?
+                    log_v_stats("attn_softmax", &attn)?;
+                    let out = attn.matmul(&v.contiguous()?)?;
+                    log_v_stats("attn_out", &out)?;
+                    out
                 }
             }
         } else {
@@ -546,7 +554,7 @@ fn subsequent_chunk_mask(
     device: &Device,
 ) -> Result<Tensor> {
     if chunk_size == 0 {
-        return Tensor::ones((size, size), DType::F32, device);
+        return Tensor::ones((size, size), DType::F16, device); // Default to F16 for masks if on CUDA? No, let's use F32 and cast if needed, or pass it.
     }
     let mut data = vec![0f32; size * size];
     for i in 0..size {
@@ -599,7 +607,7 @@ fn sinusoidal_embedding(x: &Tensor, dim: usize) -> Result<Tensor> {
     if dim % 2 == 1 {
         emb = Tensor::cat(&[&emb, &emb.narrow(1, 0, 1)?.zeros_like()?], 1)?;
     }
-    Ok(emb)
+    Ok(emb.to_dtype(x.dtype())?)
 }
 
 pub struct CausalConvPositionEmbedding {
@@ -697,7 +705,12 @@ impl InputEmbedding {
     pub fn forward(&self, x: &Tensor, cond: &Tensor, mu: &Tensor, spks: &Tensor) -> Result<Tensor> {
         let seq_len = x.dim(2)?;
         let spks = spks.unsqueeze(2)?.repeat((1, 1, seq_len))?;
+        log_v_stats("InputEmbedding x", x)?;
+        log_v_stats("InputEmbedding cond", cond)?;
+        log_v_stats("InputEmbedding mu", mu)?;
+        log_v_stats("InputEmbedding spks", &spks)?;
         let cat = Tensor::cat(&[x, cond, mu, &spks], 1)?;
+        log_v_stats("InputEmbedding cat", &cat)?;
         let x = self.proj.forward(&cat.transpose(1, 2)?)?;
 
         let pos = self.conv_pos_embed.forward(&x)?;
@@ -808,6 +821,7 @@ impl DiT {
         streaming: bool,
     ) -> Result<Tensor> {
         let mut x = self.input_embed.forward(x, cond, mu, spks)?;
+        log_v_stats("DiT_after_input_embed", &x)?;
 
         // TimestepEmbedding handles sinusoidal embedding internally now
         let t_emb = self.time_embed.forward(t)?;
@@ -823,13 +837,20 @@ impl DiT {
             None
         };
 
-        for block in self.transformer_blocks.iter() {
+        for (i, block) in self.transformer_blocks.iter().enumerate() {
             x = block.forward(&x, &t_emb, mask, chunk_mask.as_ref(), rope)?;
+            // Log every block to find where NaN first appears
+            if i < 10 {
+                log_v_stats(&format!("DiT_after_block_{}", i), &x)?;
+            }
         }
+        log_v_stats("DiT_after_all_blocks", &x)?;
 
         let x = self.norm_out.forward(&x, &t_emb)?;
+        log_v_stats("DiT_after_norm_out", &x)?;
 
         let out = self.proj_out.forward(&x)?.transpose(1, 2)?;
+        log_v_stats("DiT_final_output", &out)?;
 
         Ok(out)
     }
@@ -953,7 +974,7 @@ impl ConditionalCFM {
             let t_prev = t_span[i - 1];
             let t_curr = t_span[i];
             let dt = t_curr - t_prev; // Restore dt
-            let t_tensor = Tensor::from_vec(vec![t_prev, t_prev], (2,), device)?; // [2]
+            let t_tensor = Tensor::from_vec(vec![t_prev, t_prev], (2,), device)?.to_dtype(mu.dtype())?; // [2]
 
             // CFG Guidance: Batch 2
             // inputs must be &[&Tensor]
@@ -979,7 +1000,7 @@ impl ConditionalCFM {
             // Handle spks (Option<&Tensor> arg -> Tensor)
             let spks_tensor = match spks {
                 Some(s) => s.clone(),
-                None => Tensor::zeros((1, 80), DType::F32, device)?,
+                None => Tensor::zeros((1, 80), mu.dtype(), device)?,
             };
             // Ensure concatenated zeros match spks rank (2) not mu rank (3)
             let spks_in = Tensor::cat(&[&spks_tensor, &spks_tensor.zeros_like()?], 0)?;
@@ -990,6 +1011,11 @@ impl ConditionalCFM {
             } else {
                 mu.zeros_like()? // Placeholder if cond is None
             };
+            log_v_stats("inference_x_in", &x_in)?;
+            log_v_stats("inference_mu_in", &mu_in)?;
+            log_v_stats("inference_spks_in", &spks_in)?;
+            log_v_stats("inference_cond_in", &cond_in_tensor)?;
+
             // forward expects &Tensor for cond.
             // cond_in_tensor is always initialized (zeros if None)
             let v = self.estimator.forward(
@@ -1000,16 +1026,19 @@ impl ConditionalCFM {
                 &spks_in,
                 &cond_in_tensor,
             )?;
+            log_v_stats("estimator_output_v", &v)?;
             let chunks = v.chunk(2, 0)?;
             let (v1, v2) = (&chunks[0], &chunks[1]);
+            log_v_stats("v1", v1)?;
+            log_v_stats("v2", v2)?;
 
             let cfg_rate = 0.7;
             // v1 * (1.7) - v2 * (0.7)
             // Use broadcast_mul to be safe with Result vs Tensor return
             let v1_scaled =
-                v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?))?;
+                v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?.to_dtype(v1.dtype())?))?;
             let v2_scaled =
-                v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?))?;
+                v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?.to_dtype(v2.dtype())?))?;
             let v_cfg = (v1_scaled - v2_scaled)?;
 
             if log_v {
@@ -1027,7 +1056,7 @@ impl ConditionalCFM {
                 }
             }
 
-            let d = v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], (1,), device)?))?;
+            let d = v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], (1,), device)?.to_dtype(v_cfg.dtype())?))?;
             x = (x + d)?;
             if let Some(map) = step_debug_map.as_mut() {
                 map.insert(format!("step{}_x", i), x.clone());

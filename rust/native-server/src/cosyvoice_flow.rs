@@ -6,7 +6,7 @@
 //! 3. Speaker embedding projection
 //! 4. DiT decoder with ODE solver
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::{
     conv1d, embedding, linear, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder,
 };
@@ -361,7 +361,7 @@ impl CosyVoiceFlow {
 /// L2 normalize along dimension 1
 fn l2_normalize(x: &Tensor) -> Result<Tensor> {
     let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?;
-    let norm = norm.broadcast_add(&Tensor::new(&[1e-8f32], x.device())?)?;
+    let norm = norm.broadcast_add(&Tensor::new(&[1e-8f32], x.device())?.to_dtype(x.dtype())?)?;
     x.broadcast_div(&norm)
 }
 
