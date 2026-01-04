@@ -52,9 +52,9 @@ pub struct CosyVoiceLLM {
     /// Decoder head for speech tokens
     llm_decoder: Linear,
     /// Decoder vocabulary size (including special tokens)
-    speech_vocab_size: usize,
+    _speech_vocab_size: usize,
     /// Valid sampling range limit
-    sampling_vocab_size: usize,
+    _sampling_vocab_size: usize,
     /// Configuration
     config: CosyVoiceLLMConfig,
     /// Stop token IDs used to truncate generation
@@ -171,8 +171,8 @@ impl CosyVoiceLLM {
             llm_embedding,
             speech_embedding,
             llm_decoder,
-            speech_vocab_size,
-            sampling_vocab_size: llm_config.sampling_vocab_size,
+            _speech_vocab_size: speech_vocab_size,
+            _sampling_vocab_size: llm_config.sampling_vocab_size,
             config: llm_config,
             device,
             use_speech_special_tokens,

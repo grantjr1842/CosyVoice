@@ -23,9 +23,9 @@ impl Snake {
             vb.get((1, channels, 1), "alpha")?
         };
         if let Ok(flat) = alpha.flatten_all() {
-            let mean = flat.mean(0)?.to_scalar::<f32>()?;
-            let min = flat.min(0)?.to_scalar::<f32>()?;
-            let max = flat.max(0)?.to_scalar::<f32>()?;
+            let _mean = flat.mean(0)?.to_scalar::<f32>()?;
+            let _min = flat.min(0)?.to_scalar::<f32>()?;
+            let _max = flat.max(0)?.to_scalar::<f32>()?;
 
         }
         Ok(Self { alpha })

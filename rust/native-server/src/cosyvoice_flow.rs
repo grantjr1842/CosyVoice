@@ -262,7 +262,7 @@ impl CosyVoiceFlow {
         // Build conditioning tensor: [1, 80, total_len]
         let mut conds = Tensor::zeros(
             (1, self.config.output_size, prompt_mel_len + target_mel_len),
-            DType::F32,
+            prompt_feat.dtype(),
             &self.device,
         )?;
 
@@ -271,7 +271,7 @@ impl CosyVoiceFlow {
             // Build conds by concatenating [1, 80, prompt_len] and [1, 80, target_len]
             let zeros_part = Tensor::zeros(
                 (1, self.config.output_size, target_mel_len),
-                DType::F32,
+                prompt_feat.dtype(),
                 &self.device,
             )?;
             conds = Tensor::cat(&[prompt_feat, &zeros_part], 2)?; // Cat along dim 2
@@ -279,7 +279,7 @@ impl CosyVoiceFlow {
         eprintln!("    conds shape: {:?}", conds.shape());
 
         // Create mask (all ones for now)
-        let mask = Tensor::ones((1, total_mel_len), DType::F32, &self.device)?;
+        let mask = Tensor::ones((1, total_mel_len), h.dtype(), &self.device)?;
 
         // mu = h transposed
         let mu = h.transpose(1, 2)?; // [batch, hidden_dim, mel_len]

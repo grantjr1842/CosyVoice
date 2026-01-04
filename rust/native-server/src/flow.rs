@@ -373,8 +373,7 @@ impl Attention {
                     let q = q.contiguous()?;
                     let k = k.contiguous()?;
                     let k_t = k.transpose(2, 3)?;
-                    let attn = q.matmul(&k_t)?;
-                    let mut attn = (attn * self.scale)?;
+                    let attn = (attn * self.scale)?;
 
                     let attn = if let Some(mask) = attn_mask {
                         attn.broadcast_add(&mask)?
@@ -390,7 +389,7 @@ impl Attention {
             let k = k.contiguous()?;
             let k_t = k.transpose(2, 3)?;
             let attn = q.matmul(&k_t)?;
-            let mut attn = (attn * self.scale)?;
+            let attn = (attn * self.scale)?;
 
             let attn = if let Some(mask) = attn_mask {
                 attn.broadcast_add(&mask)?

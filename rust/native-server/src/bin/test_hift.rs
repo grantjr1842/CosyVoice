@@ -1,6 +1,6 @@
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use cosyvoice_native_server::tts::NativeTtsEngine;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== HiFT Parity Test ===");
