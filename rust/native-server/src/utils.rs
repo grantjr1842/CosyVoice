@@ -1,4 +1,4 @@
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use std::f64::consts::PI;
 
 #[allow(dead_code)]
@@ -252,49 +252,6 @@ impl InverseStftModule {
         }
 
         Ok(y)
-    }
-
-    fn run_manual_conv(&self, x: &Tensor, conv: &ConvTranspose1d) -> Result<Tensor> {
-        // x: [Batch, InCh, Time]
-        let (b, c, t) = x.dims3()?;
-        let k = self.n_fft;
-        let stride = self.hop_length;
-        let out_len = (t - 1) * stride + k;
-
-        let x_cpu = x.to_device(&Device::Cpu)?;
-        let x_vec = x_cpu.flatten_all()?.to_vec1::<f32>()?;
-
-        // Weights: [InCh, OutCh, K] -> [InCh, 1, K]
-        let w = conv.weight();
-        let w_cpu = w.to_device(&Device::Cpu)?;
-        // Shape check?
-        let w_vec = w_cpu.flatten_all()?.to_vec1::<f32>()?;
-
-        // Output buffer
-        let mut out = vec![0.0f32; b * 1 * out_len];
-
-        // Loop
-        // weights layout: [c_in, 0, k_idx]. Flat: c_in * K + k_idx.
-        // input layout: [b_idx, c_in, t_idx]. Flat: b_idx*c*t + c_in*t + t_idx.
-
-        for b_idx in 0..b {
-            for c_in in 0..c {
-               for t_idx in 0..t {
-                   let in_val = x_vec[b_idx * c * t + c_in * t + t_idx];
-                   let out_start = t_idx * stride;
-                   // Add weighted kernel
-                   for k_idx in 0..k {
-                       let w_val = w_vec[c_in * k + k_idx];
-                       let out_idx = b_idx * out_len + out_start + k_idx;
-                       if out_idx < out.len() {
-                           out[out_idx] += in_val * w_val;
-                       }
-                   }
-               }
-            }
-        }
-
-        Tensor::from_vec(out, (b, 1, out_len), x.device())
     }
 }
 
