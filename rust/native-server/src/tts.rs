@@ -93,16 +93,37 @@ impl NativeTtsEngine {
         } else {
             model_path.join("llm.safetensors")
         };
-        eprintln!("Loading LLM from {:?}", llm_path);
+        eprintln!("Loading LLM weights (safetensors) from {:?}", llm_path);
         let llm_vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[&llm_path], dtype, &device)
                 .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to load LLM: {}", e)))?
         };
 
         let llm_config = CosyVoiceLLMConfig::default();
-        // Pass root VarBuilder - CosyVoiceLLM::new handles prefixing internally
-        let llm = CosyVoiceLLM::new(&qwen_config, llm_config, llm_vb)
-            .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize LLM: {}", e)))?;
+
+        // Check for GGUF
+        let gguf_env = std::env::var("COSYVOICE_LLM_GGUF").ok();
+        let gguf_path = if let Some(p) = gguf_env {
+            Some(PathBuf::from(p))
+        } else {
+            let default_gguf = model_path.join("llm.gguf");
+            if default_gguf.exists() {
+                Some(default_gguf)
+            } else {
+                None
+            }
+        };
+
+        let llm = if let Some(gp) = gguf_path {
+             eprintln!("Found GGUF model at {:?}, using quantized LLM.", gp);
+             // Pass root VarBuilder - CosyVoiceLLM::from_gguf handles loading speech_embedding/decoder from it
+             CosyVoiceLLM::from_gguf(gp, llm_config, llm_vb)
+                .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize Quantized LLM: {}", e)))?
+        } else {
+             // Pass root VarBuilder - CosyVoiceLLM::new handles prefixing internally
+             CosyVoiceLLM::new(&qwen_config, llm_config, llm_vb)
+                .map_err(|e| NativeTtsError::ModelLoad(format!("Failed to initialize LLM: {}", e)))?
+        };
         eprintln!("LLM initialized successfully");
 
         // Load Flow from safetensors

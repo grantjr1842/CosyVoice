@@ -5,6 +5,7 @@ pub mod flow;
 pub mod hift;
 pub mod onnx_frontend;
 pub mod qwen;
+pub mod quantized_qwen;
 pub mod text_frontend;
 pub mod tts;
 pub mod utils;

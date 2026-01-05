@@ -2,12 +2,14 @@
 //!
 //! This module wraps the Qwen2 model and adds speech token generation capabilities.
 
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{quantized::gguf_file, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use rand::Rng;
 use std::cmp::Ordering;
+use std::path::Path;
 
 use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
+use crate::quantized_qwen::ModelForCausalLM as QuantizedModelForCausalLM;
 
 /// Configuration for CosyVoice LLM
 #[derive(Debug, Clone)]
@@ -41,10 +43,44 @@ impl Default for CosyVoiceLLMConfig {
     }
 }
 
+enum QwenModel {
+    Standard(ModelForCausalLM),
+    Quantized(QuantizedModelForCausalLM),
+}
+
+impl QwenModel {
+    fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Tensor,
+        seqlen_offset: usize,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Standard(m) => m.base_model.forward_embeds(inputs_embeds, seqlen_offset, attn_mask),
+            Self::Quantized(m) => m.base_model.forward_embeds(inputs_embeds, seqlen_offset, attn_mask),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+         match self {
+            Self::Standard(m) => m.clear_kv_cache(),
+            Self::Quantized(m) => m.clear_kv_cache(),
+        }
+    }
+
+    fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
+         match self {
+            Self::Standard(m) => m.base_model.embed_tokens.forward(tokens),
+            Self::Quantized(m) => m.base_model.embed_tokens.forward(tokens),
+        }
+    }
+}
+
+
 /// CosyVoice LLM for speech token generation
 pub struct CosyVoiceLLM {
     /// Core Qwen2 model
-    llm: ModelForCausalLM,
+    llm: QwenModel,
     /// LLM embedding for SOS and task_id tokens
     llm_embedding: Option<Embedding>,
     /// Speech token embedding
@@ -70,11 +106,6 @@ pub struct CosyVoiceLLM {
 
 impl CosyVoiceLLM {
     /// Create a new CosyVoice LLM from safetensors weights
-    ///
-    /// # Arguments
-    /// * `qwen_config` - Qwen2 model configuration
-    /// * `llm_config` - CosyVoice LLM configuration
-    /// * `vb` - VarBuilder at the ROOT level (no prefix) for llm.safetensors
     pub fn new(
         qwen_config: &QwenConfig,
         llm_config: CosyVoiceLLMConfig,
@@ -87,6 +118,31 @@ impl CosyVoiceLLM {
         let llm = ModelForCausalLM::new(qwen_config, vb.pp("llm.model"))?;
         eprintln!("Qwen2 model loaded successfully");
 
+        Self::build(QwenModel::Standard(llm), llm_config, vb, device)
+    }
+
+    pub fn from_gguf<P: AsRef<Path>>(
+        gguf_path: P,
+        llm_config: CosyVoiceLLMConfig,
+        vb_extras: VarBuilder, // For speech_embedding and llm_decoder
+    ) -> Result<Self> {
+        let device = vb_extras.device().clone();
+
+        eprintln!("Loading Quantized Qwen2 from {:?}...", gguf_path.as_ref());
+        let mut file = std::fs::File::open(gguf_path)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let llm = QuantizedModelForCausalLM::from_gguf(&content, &mut file, &device)?;
+        eprintln!("Quantized Qwen2 loaded successfully");
+
+        Self::build(QwenModel::Quantized(llm), llm_config, vb_extras, device)
+    }
+
+    fn build(
+        llm: QwenModel,
+        llm_config: CosyVoiceLLMConfig,
+        vb: VarBuilder,
+        device: Device,
+    ) -> Result<Self> {
         // Load speech embedding using weights to infer vocab size.
         eprintln!("Loading speech_embedding from top-level...");
         let speech_emb_weight = vb.pp("speech_embedding").get_unchecked("weight")?;
@@ -212,7 +268,7 @@ impl CosyVoiceLLM {
 
     /// Embed text tokens using the underlying LLM's embedding layer
     pub fn embed_text_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
-        self.llm.base_model.embed_tokens.forward(tokens)
+        self.llm.embed_tokens(tokens)
     }
 
     /// Embed speech tokens
@@ -398,7 +454,6 @@ impl CosyVoiceLLM {
             // Forward pass through LLM
             let y_pred = self
                 .llm
-                .base_model
                 .forward_embeds(&lm_input, seqlen_offset, None)?;
 
             // Get logits from last position

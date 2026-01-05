@@ -788,6 +788,7 @@ impl HiFTGenerator {
     }
 
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        let mel = mel.to_dtype(DType::F32)?; // Force F32 to avoid F16 precision issues
         eprintln!("    input mel shape: {:?}", mel.shape());
 
         // Log input mel stats
@@ -802,7 +803,7 @@ impl HiFTGenerator {
         }
 
         // 1. F0 Predictor
-        let f0 = self.f0_predictor.forward(mel)?; // [Batch, 1, Length_f0]
+        let f0 = self.f0_predictor.forward(&mel)?; // [Batch, 1, Length_f0]
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
         eprintln!("    F0 predictor output shape: {:?}", f0.shape());
@@ -854,7 +855,7 @@ impl HiFTGenerator {
 
         // 4. Decode
         eprintln!("    Running decode...");
-        let audio = self.decode(mel, &s_source)?;
+        let audio = self.decode(&mel, &s_source)?;
 
         // Print final audio stats
         if let Ok(audio_flat) = audio.flatten_all() {

@@ -47,8 +47,7 @@ def main():
         return
 
     mel_data = load_file(mel_path)
-    mel = mel_data["mel"]
-
+    mel = mel_data["flow_output"]
     log_stats("Input Mel", mel)
 
     # Forward pass with intermediate logging

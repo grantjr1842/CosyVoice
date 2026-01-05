@@ -27,6 +27,7 @@ def main():
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
     import torch
+
     from cosyvoice.cli.cosyvoice import AutoModel
 
     def determine_device() -> torch.device:
@@ -158,7 +159,7 @@ def main():
             reset_cuda_state(device)
 
         if "flow_output" in saved_data:
-            save_path = "debug_flow_data.safetensors"
+            save_path = "debug_mel.safetensors"
             save_file(saved_data, save_path)
             print(f"\nSaved Flow debug data to {save_path}")
             print(f"  token shape: {saved_data['token'].shape}")
