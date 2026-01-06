@@ -1,5 +1,5 @@
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Embedding; // Using standard RotaryEmbedding if compatible, or usually manual for Qwen
 use std::sync::Arc;
 

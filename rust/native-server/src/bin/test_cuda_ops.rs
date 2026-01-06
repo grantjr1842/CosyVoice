@@ -22,12 +22,12 @@ fn main() -> Result<()> {
     println!("Cast I32->U32 on CPU passed");
 
     // Move to GPU
-    let t_u32_gpu = t_u32_cpu.to_device(&device)?;
+    let _t_u32_gpu = t_u32_cpu.to_device(&device)?;
     println!("Move U32 to GPU passed");
 
     // Test I32 -> F32 on CPU -> GPU
     let t_f32_cpu = t_i32.to_dtype(DType::F32)?;
-    let t_f32_gpu = t_f32_cpu.to_device(&device)?;
+    let _t_f32_gpu = t_f32_cpu.to_device(&device)?;
     println!("Move F32 to GPU passed");
 
     println!("SUCCESS: All ops passed");

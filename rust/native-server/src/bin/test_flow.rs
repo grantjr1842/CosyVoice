@@ -1,5 +1,5 @@
 use anyhow::{Result, Context};
-use candle_core::{Device, DType, Tensor};
+use candle_core::{Device, DType};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use cosyvoice_native_server::cosyvoice_flow::{CosyVoiceFlow, CosyVoiceFlowConfig};

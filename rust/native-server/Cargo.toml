@@ -41,6 +41,7 @@ rustfft = "6.2"
 realfft = "3.3"
 tokenizers = "0.20"
 rubato = "0.16"
+clap = { version = "4", features = ["derive"] }
 
 [features]
 default = ["cuda"]

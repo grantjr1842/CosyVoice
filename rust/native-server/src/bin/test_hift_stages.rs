@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use cosyvoice_native_server::hift::{HiFTConfig, HiFTGenerator};
-use std::collections::HashMap;
 
 fn log_stats(name: &str, t: &Tensor) -> Result<()> {
     let flat = t.flatten_all()?.to_dtype(DType::F32)?;

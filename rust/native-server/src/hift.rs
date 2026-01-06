@@ -132,10 +132,9 @@ impl SineGen {
 
         for i in 0..b {
             let offset_f0 = i * l;
-            for h in 0..num_harmonics {
+            for (h, &phase_offset) in phase_offsets.iter().enumerate().take(num_harmonics) {
                 let mult = (h + 1) as f32;
                 let mut running_phase = 0.0f32;
-                let phase_offset = phase_offsets[h];
 
                 for t in 0..l {
                     let current_f0 = f0_vec[offset_f0 + t];
@@ -179,6 +178,7 @@ fn get_padding(kernel_size: usize, dilation: usize) -> usize {
     (kernel_size - 1) * dilation / 2
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_conv1d(
     vb: VarBuilder,
     in_c: usize,
@@ -541,38 +541,10 @@ impl F0Predictor {
             }
             h = conv.forward(&h)?;
             h = h.elu(1.0)?; // ELU
-
-            // Debug each layer
-            if let Ok(flat) = h.flatten_all() {
-                if let Ok(vec) = flat.to_vec1::<f32>() {
-                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let sum: f32 = vec.iter().sum();
-                    let mean = sum / vec.len() as f32;
-                    eprintln!(
-                        "    Layer {} after ELU: min={:.6}, max={:.6}, mean={:.6}",
-                        i, min, max, mean
-                    );
-                }
-            }
         }
         // h: [Batch, Cond, Time] -> transpose -> [Batch, Time, Cond]
         let h_t = h.transpose(1, 2)?;
         let out = self.classifier.forward(&h_t)?;
-
-        // Debug classifier output
-        if let Ok(flat) = out.flatten_all() {
-            if let Ok(vec) = flat.to_vec1::<f32>() {
-                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = vec.iter().sum();
-                let mean = sum / vec.len() as f32;
-                eprintln!(
-                    "    Classifier out (pre-abs): min={:.6}, max={:.6}, mean={:.6}",
-                    min, max, mean
-                );
-            }
-        }
 
         // out: [Batch, Time, 1]
         let f0 = out.transpose(1, 2)?.abs()?; // [Batch, 1, Time]
@@ -633,7 +605,7 @@ impl HiFTGenerator {
             let out_c = base_ch / (1 << (i + 1));
             // CausalConv1dUpsample is Upsample + CausalConv1d with padding k-1
             // If causal, padding is 0, manual padding k-1
-            let conv_pad = if is_causal { 0 } else { 0 }; // Upsample convs typically have 0 padding, manual padding for causal
+            let conv_pad = 0; // Both causal and non-causal use 0 padding for upsample convs, manual padding for causal
 
             let name = format!("ups_{}", i);
             let conv = load_conv1d(vb_ups.pp(i), in_c, out_c, k, 1, 1, conv_pad, &name)?;
@@ -789,95 +761,22 @@ impl HiFTGenerator {
 
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let mel = mel.to_dtype(DType::F32)?; // Force F32 to avoid F16 precision issues
-        eprintln!("    input mel shape: {:?}", mel.shape());
-
-        // Log input mel stats
-        if let Ok(flat) = mel.flatten_all() {
-            let min = flat.min(0)?.to_scalar::<f32>()?;
-            let max = flat.max(0)?.to_scalar::<f32>()?;
-            let mean = flat.mean(0)?.to_scalar::<f32>()?;
-            eprintln!(
-                "    [HiFT.forward] input mel stats: min={:.6}, max={:.6}, mean={:.6}",
-                min, max, mean
-            );
-        }
 
         // 1. F0 Predictor
         let f0 = self.f0_predictor.forward(&mel)?; // [Batch, 1, Length_f0]
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
-        eprintln!("    F0 predictor output shape: {:?}", f0.shape());
-
-        // Print F0 stats
-        if let Ok(f0_flat) = f0.flatten_all() {
-            if let Ok(f0_vec) = f0_flat.to_vec1::<f32>() {
-                let min = f0_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = f0_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = f0_vec.iter().sum();
-                let mean = sum / f0_vec.len() as f32;
-                eprintln!(
-                    "    F0 stats: min={:.6} Hz, max={:.6} Hz, mean={:.6} Hz",
-                    min, max, mean
-                );
-            }
-        }
 
         // 2. Upsample F0 to Source Resolution
-        // Nearest neighbor upsample: [B, 1, L] -> [B, 1, L, Scale] -> [B, 1, L*Scale]
         let (b, c, l) = f0.dims3()?;
-        // Use manual linear interpolation for parity
         let s = self.interpolate_linear(&f0, self.f0_upsamp_scale)?;
-
         let s = s.reshape((b, c, l * self.f0_upsamp_scale))?;
-        eprintln!(
-            "    upsampled f0 shape: {:?} (scale={})",
-            s.shape(),
-            self.f0_upsamp_scale
-        );
 
         // 3. Source Module
         let (s_source, _, _) = self.m_source.forward(&s, None, None, None)?; // [B, 1, L_up]
-        eprintln!("    source output shape: {:?}", s_source.shape());
-
-        // Print source stats
-        if let Ok(src_flat) = s_source.flatten_all() {
-            if let Ok(src_vec) = src_flat.to_vec1::<f32>() {
-                let min = src_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = src_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = src_vec.iter().sum();
-                let mean = sum / src_vec.len() as f32;
-                eprintln!(
-                    "    source stats: min={:.6}, max={:.6}, mean={:.6}",
-                    min, max, mean
-                );
-            }
-        }
 
         // 4. Decode
-        eprintln!("    Running decode...");
         let audio = self.decode(&mel, &s_source)?;
-
-        // Print final audio stats
-        if let Ok(audio_flat) = audio.flatten_all() {
-            if let Ok(audio_vec) = audio_flat.to_vec1::<f32>() {
-                let min = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = audio_vec.iter().sum();
-                let mean = sum / audio_vec.len() as f32;
-                eprintln!(
-                    "    [HiFT.forward] audio stats: min={:.6}, max={:.6}, mean={:.6}",
-                    min, max, mean
-                );
-
-                // Check for problems
-                if min < -1.0 || max > 1.0 {
-                    eprintln!("    ⚠️  ISSUE: Audio out of [-1, 1] range!");
-                }
-                if mean.abs() > 0.1 {
-                    eprintln!("    ⚠️  ISSUE: Large DC offset: {}", mean);
-                }
-            }
-        }
 
         Ok(audio)
     }
@@ -950,21 +849,12 @@ impl HiFTGenerator {
             // Robust slice to handle boundary effects
             let x_len = x.dim(2)?;
             let si_len = si.dim(2)?;
-            // Debug source signal si
-            if let Ok(flat_si) = si.flatten_all() {
-                 let mean_si = flat_si.mean(0)?.to_scalar::<f32>().unwrap_or(0.0);
-            }
 
             let common_len = x_len.min(si_len);
             let x_slice = x.i((.., .., ..common_len))?;
             let si_slice = si.i((.., .., ..common_len))?;
 
             x = x_slice.add(&si_slice)?;
-
-            // Debug after fusion
-            if let Ok(flat_x) = x.flatten_all() {
-                 let mean_x = flat_x.mean(0)?.to_scalar::<f32>().unwrap_or(0.0);
-            }
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
@@ -1011,23 +901,10 @@ impl HiFTGenerator {
 
         let audio = self.stft.forward(&magnitude, &phase)?;
 
-        // Remove DC offset (Explicitly force 0 mean)
-        // Remove DC offset (Explicitly force 0 mean)
+        // Remove DC offset
         let mean_tensor = audio.mean(2)?.broadcast_as(audio.shape())?;
-        if let Ok(m) = mean_tensor.mean_all()?.to_scalar::<f32>() {
-        }
         let audio = (audio - mean_tensor)?;
-        if let Ok(m) = audio.mean_all()?.to_scalar::<f32>() {
-        }
 
-        // Apply Gain Correction to match Python output range\n        // NOTE: Previously had a 0.13x factor here due to incorrect ISTFT normalization.\n        // Now that InverseStftModule uses corrected normalization,\n        // we no longer need this hack. The raw ISTFT output should match Python's range.\n        // REMOVED: let audio = (audio * 0.13)?;\n
-        // Debug pre-clamp stats
-        if let Ok(flat) = audio.flatten_all() {
-            if let Ok(vec) = flat.to_vec1::<f32>() {
-                let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            }
-        }
 
         // Clamp audio to [-audio_limit, audio_limit] like Python does
         // Python: x = torch.clamp(x, -self.audio_limit, self.audio_limit) where audio_limit = 0.99

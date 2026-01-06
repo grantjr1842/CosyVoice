@@ -400,7 +400,7 @@ impl Attention {
 
                     let k_t_f32 = k_f32.transpose(2, 3)?;
                     let attn_f32 = q_f32.matmul(&k_t_f32)?;
-                    let attn_f32 = (attn_f32 * (self.scale as f64))?;
+                    let attn_f32 = (attn_f32 * self.scale)?;
 
                     let attn_f32 = if let Some(mask) = attn_mask {
                         // Cast mask to F32 if needed
@@ -832,6 +832,7 @@ impl DiT {
         self.forward_with_streaming(x, mask, mu, t, spks, cond, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_streaming(
         &self,
         x: &Tensor,
