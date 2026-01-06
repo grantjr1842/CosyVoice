@@ -101,18 +101,22 @@ impl NativeTtsEngine {
 
         let llm_config = CosyVoiceLLMConfig::default();
 
-        // Check for GGUF
+        // Check for GGUF - if env var is "OFF", skip GGUF loading entirely
         let gguf_env = std::env::var("COSYVOICE_LLM_GGUF").ok();
-        let gguf_path = if let Some(p) = gguf_env {
-            Some(PathBuf::from(p))
-        } else {
-            let default_gguf = model_path.join("llm.gguf");
-            if default_gguf.exists() {
-                Some(default_gguf)
-            } else {
-                None
+        let gguf_path = match gguf_env.as_deref() {
+            Some("OFF") | Some("off") | Some("0") | Some("") => None,  // Explicit disable
+            Some(p) => Some(PathBuf::from(p)),  // Explicit path
+            None => {
+                // Check for default GGUF
+                let default_gguf = model_path.join("llm.gguf");
+                if default_gguf.exists() {
+                    Some(default_gguf)
+                } else {
+                    None
+                }
             }
         };
+
 
         let llm = if let Some(gp) = gguf_path {
              eprintln!("Found GGUF model at {:?}, using quantized LLM.", gp);
