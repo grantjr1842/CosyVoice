@@ -554,6 +554,7 @@ dependencies = [
  "candle-kernels",
  "candle-nn",
  "candle-transformers",
+ "clap",
  "dotenvy",
  "hound",
  "metrics",
