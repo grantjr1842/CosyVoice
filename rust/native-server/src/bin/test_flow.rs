@@ -1,140 +1,159 @@
-// Minimal test to isolate AdaLayerNormZero and DiTBlock forward issues
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{layer_norm_no_bias, linear, Module, VarBuilder};
-use std::collections::HashMap;
+use anyhow::{Result, Context};
+use candle_core::{Device, DType, Tensor};
+use candle_nn::VarBuilder;
+use clap::Parser;
+use cosyvoice_native_server::cosyvoice_flow::{CosyVoiceFlow, CosyVoiceFlowConfig};
+use cosyvoice_native_server::flow::FlowConfig;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long, default_value = "pretrained_models/Fun-CosyVoice3-0.5B")]
+    model_dir: String,
+
+    #[arg(long, default_value = "debug_artifacts.safetensors")]
+    artifacts_path: String,
+}
 
 fn main() -> Result<()> {
-    eprintln!("=== Minimal Flow Test ===");
+    let args = Args::parse();
 
-    let device = Device::Cpu;
+    // Choose device
+    let device = if candle_core::utils::cuda_is_available() {
+        Device::new_cuda(0)?
+    } else {
+        Device::Cpu
+    };
+    println!("Using device: {:?}", device);
+    // Force F32 for parity verification to avoid F16 instability
+    let dtype = DType::F32; // if device.is_cuda() { DType::F16 } else { DType::F32 };
 
-    // Create dummy weights using HashMap
-    let mut weights: HashMap<String, Tensor> = HashMap::new();
+    // Load Flow Model manually to avoid LLM issues
+    println!("Loading Flow model from {}...", args.model_dir);
+    let flow_path = PathBuf::from(&args.model_dir).join("flow.safetensors");
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[flow_path], dtype, &device)? };
 
-    // AdaLayerNormZero weights (attn_norm)
-    weights.insert(
-        "attn_norm.linear.weight".to_string(),
-        Tensor::randn(0.0f32, 0.01, (6144, 1024), &device)?,
-    );
-    weights.insert(
-        "attn_norm.linear.bias".to_string(),
-        Tensor::zeros((6144,), DType::F32, &device)?,
-    );
-    weights.insert(
-        "attn_norm.weight".to_string(),
-        Tensor::ones((1024,), DType::F32, &device)?,
-    );
+    let flow_config = CosyVoiceFlowConfig::default();
+    let dit_config = FlowConfig::default();
 
-    // ff_norm weights
-    weights.insert(
-        "ff_norm.weight".to_string(),
-        Tensor::ones((1024,), DType::F32, &device)?,
-    );
+    let flow = CosyVoiceFlow::new(flow_config, &dit_config, vb)?;
 
-    let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+    // Load Artifacts
+    println!("Loading artifacts from {}...", args.artifacts_path);
+    // Artifacts are typically F32 (or I32). Load to CPU first to avoid missing kernels for casting.
+    let artifacts = candle_core::safetensors::load(&args.artifacts_path, &Device::Cpu)?;
 
-    // Create components for DiTBlock
-    let attn_norm_linear = linear(1024, 1024 * 6, vb.pp("attn_norm.linear"))?;
-    let attn_norm_norm = layer_norm_no_bias(1024, 1e-6, vb.pp("attn_norm"))?;
-    let ff_norm = layer_norm_no_bias(1024, 1e-6, vb.pp("ff_norm"))?;
-    let silu = candle_nn::Activation::Silu;
+    let token = artifacts.get("token").context("token not found")?;
+    let prompt_token = artifacts.get("prompt_token").context("prompt_token not found")?;
+    let prompt_feat = artifacts.get("prompt_feat").context("prompt_feat not found")?;
+    let embedding = artifacts.get("embedding").context("embedding not found")?;
+    let expected_mel = artifacts.get("python_flow_output").context("python_flow_output not found")?;
+    let rand_noise = artifacts.get("rand_noise").context("rand_noise not found")?;
 
-    // Test inputs (mimicking CFG with batch=2)
-    let batch = 2;
-    let seq_len = 10;
-    let dim = 1024;
+    println!("  token: {:?}", token.shape());
+    println!("  prompt_token: {:?}", prompt_token.shape());
+    println!("  prompt_feat: {:?}", prompt_feat.shape());
+    println!("  embedding: {:?}", embedding.shape());
+    println!("  rand_noise: {:?}", rand_noise.shape());
 
-    let x = Tensor::randn(0.0f32, 1.0, (batch, seq_len, dim), &device)?;
-    let t_emb = Tensor::randn(0.0f32, 1.0, (batch, dim), &device)?;
+    // Cast inputs to dtype if needed (embedding, prompt_feat, rand_noise are float)
+    // token outputs are int/long usually?
+    // token: Long/Int? check python.
+    // Actually Rust `CosyVoiceFlow::inference` expects Tensor.
+    // `input_embedding` expects Int/Long indices.
+    // `token` and `prompt_token` should be DType::U32 or I64?
+    // Artifact loading loads as is. Python saved Long as I64 usually.
+    // Candle Embedding layer expects U32.
+    // We should cast tokens.
 
-    eprintln!("=== DiTBlock Forward Test ===");
-    eprintln!("x shape: {:?}", x.shape());
-    eprintln!("t_emb shape: {:?}", t_emb.shape());
+    // Check loaded dtype
+    println!("  token dtype: {:?}", token.dtype());
 
-    // Replicate DiTBlock::forward logic
-    eprintln!("\n1. Computing emb = attn_norm.linear.forward(t_emb.apply(&silu))");
-    let emb = attn_norm_linear.forward(&t_emb.apply(&silu)?)?;
-    eprintln!("   emb shape: {:?}", emb.shape());
+    println!("Casting token to U32 (via F32 workaround)...");
+    let token = if token.dtype() != DType::U32 {
+        token.to_dtype(DType::F32)?.to_dtype(DType::U32)?
+    } else {
+        token.clone()
+    };
+    println!("Casting prompt_token to U32 (via F32 workaround)...");
+    let prompt_token = if prompt_token.dtype() != DType::U32 {
+        prompt_token.to_dtype(DType::F32)?.to_dtype(DType::U32)?
+    } else {
+        prompt_token.clone()
+    };
 
-    eprintln!("\n2. Chunking emb into 6 parts");
-    let chunks = emb.chunk(6, 1)?;
-    eprintln!(
-        "   chunk shapes: {:?}",
-        chunks.iter().map(|c| c.dims()).collect::<Vec<_>>()
-    );
+    // Feature tensors to model dtype
+    // prompt_feat from python is [B, T, D], inference expects [B, D, T]
+    // Feature tensors to model dtype (on CPU)
+    println!("Processing prompt_feat (cast + transpose on CPU)...");
+    let prompt_feat = prompt_feat.to_dtype(dtype)?.transpose(1, 2)?;
+    println!("Processing embedding...");
+    let embedding = embedding.to_dtype(dtype)?;
 
-    let shift_msa = chunks[0].unsqueeze(1)?;
-    let scale_msa = chunks[1].unsqueeze(1)?;
-    let gate_msa = chunks[2].unsqueeze(1)?;
-    let shift_mlp = chunks[3].unsqueeze(1)?;
-    let scale_mlp = chunks[4].unsqueeze(1)?;
-    let gate_mlp = chunks[5].unsqueeze(1)?;
+    println!("Moving inputs to device...");
+    let token = token.to_device(&device)?;
+    let prompt_token = prompt_token.to_device(&device)?;
+    let prompt_feat = prompt_feat.to_device(&device)?;
+    let embedding = embedding.to_device(&device)?;
 
-    eprintln!("\n3. After unsqueeze(1):");
-    eprintln!("   shift_msa: {:?}", shift_msa.shape());
-    eprintln!("   scale_msa: {:?}", scale_msa.shape());
-    eprintln!("   gate_msa: {:?}", gate_msa.shape());
+    println!("Running Flow Inference...");
 
-    // MSA branch
-    eprintln!("\n4. MSA: res_msa = x.clone()");
-    let res_msa = x.clone();
-    eprintln!("   res_msa: {:?}", res_msa.shape());
+    let rand_noise_cast = rand_noise.to_dtype(dtype)?.to_device(&device)?;
 
-    eprintln!("\n5. MSA: x_norm = attn_norm_norm.forward(x)");
-    let x_norm = attn_norm_norm.forward(&x)?;
-    eprintln!("   x_norm: {:?}", x_norm.shape());
+    let generated_mel = flow.inference(
+        &token,
+        &prompt_token,
+        &prompt_feat,
+        &embedding,
+        1, // n_timesteps - Python uses 1 in CausalMaskedDiffWithXvec.inference()
+        Some(&rand_noise_cast)
+    )?;
 
-    eprintln!("\n6. MSA: x_norm.broadcast_mul(scale_msa.affine(1.0, 1.0))");
-    let scale_plus = scale_msa.affine(1.0, 1.0)?;
-    eprintln!("   scale_plus: {:?}", scale_plus.shape());
-    let x_norm = x_norm.broadcast_mul(&scale_plus)?;
-    eprintln!("   x_norm after mul: {:?}", x_norm.shape());
+    println!("  generated_mel: {:?}", generated_mel.shape());
+    println!("  expected_mel: {:?}", expected_mel.shape());
 
-    eprintln!("\n7. MSA: x_norm.broadcast_add(&shift_msa)");
-    let x_norm = x_norm.broadcast_add(&shift_msa)?;
-    eprintln!("   x_norm after add: {:?}", x_norm.shape());
+    // Compare
+    // Cast generated back to F32 for comparison with expected (which is likely F32 from python cpu save)
+    // Move generated to CPU first
+    let generated_cpu = generated_mel.to_device(&Device::Cpu)?;
+    let generated_f32 = generated_cpu.to_dtype(DType::F32)?;
+    let expected_f32 = expected_mel.to_dtype(DType::F32)?; // Should ideally already be F32
 
-    // Simulate attention output (just identity for now)
-    let x_attn = x_norm.clone();
-    eprintln!("\n8. MSA: x_attn (simulated): {:?}", x_attn.shape());
+    // Check for NaNs via vector
+    let generated_vec = generated_f32.flatten_all()?.to_vec1::<f32>()?;
+    let nan_count = generated_vec.iter().filter(|x| x.is_nan()).count();
 
-    eprintln!("\n9. MSA: mul_msa = x_attn.broadcast_mul(&gate_msa)");
-    let mul_msa = x_attn.broadcast_mul(&gate_msa)?;
-    eprintln!("   mul_msa: {:?}", mul_msa.shape());
+    if nan_count > 0 {
+        println!("FAIL: Output contains {} NaNs", nan_count);
+        // Save failure
+        let debug_save = std::collections::HashMap::from([
+            ("generated".to_string(), generated_f32),
+            ("expected".to_string(), expected_f32),
+        ]);
+        candle_core::safetensors::save(&debug_save, "flow_nan_debug.safetensors")?;
+        return Ok(());
+    }
 
-    eprintln!("\n10. MSA: x = res_msa.broadcast_add(&mul_msa)");
-    let x = res_msa.broadcast_add(&mul_msa)?;
-    eprintln!("    x after MSA: {:?}", x.shape());
+    let diff = (generated_f32 - expected_f32)?.abs()?;
+    let max_diff = diff.max_all()?.to_scalar::<f32>()?;
+    let mean_diff = diff.mean_all()?.to_scalar::<f32>()?;
 
-    // MLP branch
-    eprintln!("\n11. MLP: res_mlp = x.clone()");
-    let res_mlp = x.clone();
+    println!("Max Diff: {:.6}", max_diff);
+    println!("Mean Diff: {:.6}", mean_diff);
 
-    eprintln!("\n12. MLP: x_norm = ff_norm.forward(&x)");
-    let x_norm = ff_norm.forward(&x)?;
-    eprintln!("    x_norm: {:?}", x_norm.shape());
-
-    eprintln!("\n13. MLP: x_norm.broadcast_mul(scale_mlp.affine(1.0, 1.0))");
-    let scale_plus = scale_mlp.affine(1.0, 1.0)?;
-    let x_norm = x_norm.broadcast_mul(&scale_plus)?;
-    eprintln!("    x_norm after mul: {:?}", x_norm.shape());
-
-    eprintln!("\n14. MLP: x_norm.broadcast_add(&shift_mlp)");
-    let x_norm = x_norm.broadcast_add(&shift_mlp)?;
-    eprintln!("    x_norm after add: {:?}", x_norm.shape());
-
-    // Simulate FF output
-    let x_mlp = x_norm.clone();
-
-    eprintln!("\n15. MLP: mul_mlp = x_mlp.broadcast_mul(&gate_mlp)");
-    let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
-    eprintln!("    mul_mlp: {:?}", mul_mlp.shape());
-
-    eprintln!("\n16. MLP: x = res_mlp.broadcast_add(&mul_mlp)");
-    let x = res_mlp.broadcast_add(&mul_mlp)?;
-    eprintln!("    x after MLP: {:?}", x.shape());
-
-    eprintln!("\n=== All DiTBlock operations succeeded! ===");
+    if max_diff > 1e-2 { // F32 can have ~0.01 diff across different implementations
+        println!("FAIL: Max diff {:.6} > 1e-2", max_diff);
+        let debug_save = std::collections::HashMap::from([
+            ("diff".to_string(), diff),
+            ("generated".to_string(), generated_mel.to_dtype(DType::F32)?), // save as F32
+            ("expected".to_string(), expected_mel.clone()),
+        ]);
+        candle_core::safetensors::save(&debug_save, "flow_failure_debug.safetensors")?;
+        println!("Saved failure debug tensors to flow_failure_debug.safetensors");
+    } else {
+        println!("SUCCESS: Flow output matches Python reference");
+    }
 
     Ok(())
 }

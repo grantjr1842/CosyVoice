@@ -87,7 +87,11 @@ impl TimestepEmbedding {
     }
 
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
-        let t_emb = sinusoidal_embedding(t, 256)?; // 256 is default dim for SinusPositionEmbedding
+        // Do NOT scale t here - sinusoidal_embedding applies scale=1000 internally
+        // (matching Python's SinusPositionEmbedding.forward(x, scale=1000))
+        let t_emb = sinusoidal_embedding(t, 256)?; // 256 is freq_embed_dim
+        let dtype = self.linear_1.weight().dtype();
+        let t_emb = t_emb.to_dtype(dtype)?;
         t_emb
             .apply(&self.linear_1)?
             .apply(&self.silu)?
@@ -104,9 +108,10 @@ pub struct AdaLayerNormZero {
 impl AdaLayerNormZero {
     pub fn new(vb: VarBuilder, dim: usize) -> Result<Self> {
         let device = vb.device();
-        let weight = Tensor::ones((dim,), DType::F32, device)?;
-        let bias = Tensor::zeros((dim,), DType::F32, device)?;
-        let norm = LayerNorm::new(weight, bias, 1e-6);
+        let dtype = vb.dtype();
+        let weight = Tensor::ones((dim,), dtype, device)?;
+        let bias = Tensor::zeros((dim,), dtype, device)?;
+        let norm = LayerNorm::new(weight, bias, 1e-5);
 
         let linear = linear(dim, dim * 6, vb.pp("linear"))?;
         Ok(Self {
@@ -143,9 +148,10 @@ impl AdaLayerNormZeroFinal {
         // Python: elementwise_affine=False, so no weights/bias.
         // candle LayerNorm requires Tensors. We create them manually (weight=1, bias=0).
         let device = vb.device();
-        let weight = Tensor::ones((dim,), DType::F32, device)?;
-        let bias = Tensor::zeros((dim,), DType::F32, device)?;
-        let norm = LayerNorm::new(weight, bias, 1e-6);
+        let dtype = vb.dtype();
+        let weight = Tensor::ones((dim,), dtype, device)?;
+        let bias = Tensor::zeros((dim,), dtype, device)?;
+        let norm = LayerNorm::new(weight, bias, 1e-5);
 
         let linear = linear(dim, dim * 2, vb.pp("linear"))?;
         Ok(Self {
@@ -180,11 +186,12 @@ pub struct DiTBlock {
 impl DiTBlock {
     pub fn new(vb: VarBuilder, dim: usize, heads: usize, dim_head: usize) -> Result<Self> {
         let device = vb.device();
+        let dtype = vb.dtype();
         let attn_norm = AdaLayerNormZero::new(vb.pp("attn_norm"), dim)?;
         let attn = Attention::new(vb.pp("attn"), dim, heads, dim_head)?;
 
-        let ff_norm_weight = Tensor::ones((dim,), DType::F32, device)?;
-        let ff_norm_bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let ff_norm_weight = Tensor::ones((dim,), dtype, device)?;
+        let ff_norm_bias = Tensor::zeros((dim,), dtype, device)?;
         let ff_norm = LayerNorm::new(ff_norm_weight, ff_norm_bias, 1e-6);
 
         let ff = FeedForward::new(vb.pp("ff"), dim, 2)?;
@@ -218,24 +225,46 @@ impl DiTBlock {
         let gate_mlp = chunks[5].unsqueeze(1)?;
 
         // MSA
+        // eprintln!("    [DiTBlock DEBUG] MSA start");
+        let log_v = std::env::var("FLOW_DEBUG_LOG_V").is_ok();
+
         let res_msa = x.clone();
         let x_norm = self.attn_norm.norm.forward(x)?;
+        if log_v { log_v_stats("msa_norm", &x_norm)?; }
+        // eprintln!("    [DiTBlock DEBUG] MSA norm done");
+
         let x_norm = x_norm
             .broadcast_mul(&(scale_msa.affine(1.0, 1.0)?))?
             .broadcast_add(&shift_msa)?;
+        if log_v { log_v_stats("msa_scale", &x_norm)?; }
+        // eprintln!("    [DiTBlock DEBUG] MSA scale/shift done");
+
         let x_attn = self.attn.forward(&x_norm, mask, chunk_mask, rope)?;
+        if log_v { log_v_stats("msa_attn_out", &x_attn)?; }
+        // eprintln!("    [DiTBlock DEBUG] Attn forward done");
+
         let mul_msa = x_attn.broadcast_mul(&gate_msa)?;
         let x = res_msa.broadcast_add(&mul_msa)?;
+        if log_v { log_v_stats("msa_res_out", &x)?; }
 
         // MLP
+        // eprintln!("    [DiTBlock DEBUG] MLP start");
         let res_mlp = x.clone();
         let x_norm = self.ff_norm.forward(&x)?;
+        if log_v { log_v_stats("mlp_norm", &x_norm)?; }
+
         let x_norm = x_norm
             .broadcast_mul(&(scale_mlp.affine(1.0, 1.0)?))?
             .broadcast_add(&shift_mlp)?;
+        if log_v { log_v_stats("mlp_scale", &x_norm)?; }
+
         let x_mlp = self.ff.forward(&x_norm)?;
+        if log_v { log_v_stats("mlp_out", &x_mlp)?; }
+        // eprintln!("    [DiTBlock DEBUG] MLP forward done");
+
         let mul_mlp = x_mlp.broadcast_mul(&gate_mlp)?;
         let x = res_mlp.broadcast_add(&mul_mlp)?;
+        if log_v { log_v_stats("block_out", &x)?; }
 
         Ok(x)
     }
@@ -342,12 +371,12 @@ impl Attention {
             // For sdpa, we need an additive mask (0 for valid, -inf for masked)
             let chunk_inv = chunk_mask
                 .affine(-1.0, 1.0)?   // 1 -> 0, 0 -> 1
-                .affine(1e10, 0.0)?   // multiply by large value
-                .neg()?;              // 0 -> 0, 1e10 -> -1e10
+                .affine(1e4, 0.0)?    // multiply by safe large value (1e10 -> Inf in F16)
+                .neg()?;              // 0 -> 0, 1e4 -> -1e4
             Some(chunk_inv)
         } else {
             let m = mask.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, N]
-            let m_inv = (m.affine(-1.0, 1.0)? * 1e10)?.neg()?;
+            let m_inv = (m.affine(-1.0, 1.0)? * 1e4)?.neg()?;
             Some(m_inv)
         };
 
@@ -363,20 +392,28 @@ impl Attention {
             ) {
                 Ok(out) => out,
                 Err(e) => {
-                    eprintln!("    [Attn WARNING] sdpa failed: {:?}, falling back to manual path", e);
-                    let q = q.contiguous()?;
-                    let k = k.contiguous()?;
-                    let k_t = k.transpose(2, 3)?;
-                    let attn = q.matmul(&k_t)?;
-                    let attn = (attn * self.scale)?;
+                    eprintln!("    [Attn WARNING] sdpa failed: {:?}, falling back to manual path (F32)", e);
+                    // Cast to F32 for matmul stability to avoid F16 overflow doing accumulation
+                    let q_f32 = q.contiguous()?.to_dtype(candle_core::DType::F32)?;
+                    let k_f32 = k.contiguous()?.to_dtype(candle_core::DType::F32)?;
+                    let v_f32 = v.contiguous()?.to_dtype(candle_core::DType::F32)?;
 
-                    let attn = if let Some(mask) = attn_mask {
-                        attn.broadcast_add(&mask)?
+                    let k_t_f32 = k_f32.transpose(2, 3)?;
+                    let attn_f32 = q_f32.matmul(&k_t_f32)?;
+                    let attn_f32 = (attn_f32 * (self.scale as f64))?;
+
+                    let attn_f32 = if let Some(mask) = attn_mask {
+                        // Cast mask to F32 if needed
+                         let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
+                        attn_f32.broadcast_add(&mask_f32)?
                     } else {
-                        attn
+                        attn_f32
                     };
-                    let attn = candle_nn::ops::softmax(&attn, 3)?;
-                    attn.matmul(&v.contiguous()?)?
+
+                    let attn_f32 = candle_nn::ops::softmax(&attn_f32, 3)?;
+                    let res_f32 = attn_f32.matmul(&v_f32)?;
+
+                    res_f32.to_dtype(q.dtype())?
                 }
             }
         } else {
@@ -391,7 +428,12 @@ impl Attention {
             } else {
                 attn
             };
-            let attn = candle_nn::ops::softmax(&attn, 3)?;
+
+            // Cast to F32 for softmax stability
+            let attn_f32 = attn.to_dtype(candle_core::DType::F32)?;
+            let attn_f32 = candle_nn::ops::softmax(&attn_f32, 3)?;
+            let attn = attn_f32.to_dtype(attn.dtype())?;
+
             attn.matmul(&v.contiguous()?)?
         };
 
@@ -557,9 +599,13 @@ fn subsequent_chunk_mask(
 fn mish(x: &Tensor) -> Result<Tensor> {
     // x * tanh(softplus(x))
     // softplus(x) = log(1 + exp(x))
-    let softplus = x.exp()?.broadcast_add(&Tensor::ones_like(x)?)?.log()?;
+    // Compute in F32 to avoid overflow/underflow in F16
+    let dtype = x.dtype();
+    let x_f32 = x.to_dtype(candle_core::DType::F32)?;
+    let softplus = x_f32.exp()?.broadcast_add(&Tensor::ones_like(&x_f32)?)?.log()?;
     let tanh = softplus.tanh()?;
-    x.broadcast_mul(&tanh)
+    let res = x_f32.broadcast_mul(&tanh)?;
+    res.to_dtype(dtype)
 }
 
 fn sinusoidal_embedding(x: &Tensor, dim: usize) -> Result<Tensor> {
@@ -769,6 +815,7 @@ impl DiT {
             mask_float.unsqueeze(2)?
         };
         let combined = mask_expand.broadcast_mul(&chunk)?;
+        let combined = combined.to_dtype(mask.dtype())?;
         Ok(Some(combined))
     }
 
@@ -831,7 +878,9 @@ fn _t_to_sinusoidal(t: &Tensor, dim: usize) -> Result<Tensor> {
         .map(|i| 1.0 / 10000.0f32.powf(i as f32 / (half_dim as f32 - 1.0)))
         .collect();
     let inv_freq = Tensor::from_vec(inv_freq, half_dim, device)?;
-    let outer = t
+    // Scale t by 1000.0 to match Python SinusoidalPosEmb default scale
+    let t_scaled = (t * 1000.0)?;
+    let outer = t_scaled
         .reshape((t.elem_count(), 1))?
         .matmul(&inv_freq.reshape((1, half_dim))?)?;
     Tensor::cat(&[outer.sin()?, outer.cos()?], 1)
@@ -918,12 +967,15 @@ impl ConditionalCFM {
             // spks is [1, 80]. No time dim usually.
         }
 
-        let mut t_span: Vec<f32> = (0..=n_timesteps)
+        let t_span: Vec<f32> = (0..=n_timesteps)
             .map(|i| i as f32 / n_timesteps as f32)
             .collect();
-        for t in t_span.iter_mut() {
-            *t = 1.0 - (*t * 0.5 * std::f32::consts::PI).cos();
-        }
+        // NOTE: cosyvoice3.yaml says t_scheduler: 'cosine', but empirical testing shows
+        // the Python artifacts in flow_inputs.safetensors were generated with LINEAR schedule.
+        // Enabling cosine worsens parity (5.67 vs 4.49 Max Diff). Keep linear for now.
+        // for t in t_span.iter_mut() {
+        //     *t = 1.0 - (*t * 0.5 * std::f32::consts::PI).cos();
+        // }
 
         let max_steps = std::env::var("FLOW_DEBUG_MAX_STEPS")
             .ok()
@@ -979,6 +1031,15 @@ impl ConditionalCFM {
             };
             // forward expects &Tensor for cond.
             // cond_in_tensor is always initialized (zeros if None)
+
+            if log_v {
+                log_v_stats("x_in", &x_in)?;
+                log_v_stats("mu_in", &mu_in)?;
+                log_v_stats("spks_in", &spks_in)?;
+                log_v_stats("cond_in", &cond_in_tensor)?;
+                log_v_stats("t_tensor", &t_tensor)?;
+            }
+
             let v = self.estimator.forward(
                 &x_in,
                 &mask_in,
@@ -993,10 +1054,10 @@ impl ConditionalCFM {
             let cfg_rate = 0.7;
             // v1 * (1.7) - v2 * (0.7)
             // Use broadcast_mul to be safe with Result vs Tensor return
-            let v1_scaled =
-                v1.broadcast_mul(&(Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], 1, device)?))?;
-            let v2_scaled =
-                v2.broadcast_mul(&(Tensor::from_vec(vec![cfg_rate as f32], 1, device)?))?;
+            let factor1 = Tensor::from_vec(vec![(1.0 + cfg_rate) as f32], (1,), device)?.to_dtype(v1.dtype())?;
+            let v1_scaled = v1.broadcast_mul(&factor1)?;
+            let factor2 = Tensor::from_vec(vec![cfg_rate as f32], (1,), device)?.to_dtype(v2.dtype())?;
+            let v2_scaled = v2.broadcast_mul(&factor2)?;
             let v_cfg = (v1_scaled - v2_scaled)?;
 
             if log_v {
@@ -1014,7 +1075,8 @@ impl ConditionalCFM {
                 }
             }
 
-            let d = v_cfg.broadcast_mul(&(Tensor::from_vec(vec![dt], (1,), device)?))?;
+            let dt_tensor = Tensor::from_vec(vec![dt], (1,), device)?.to_dtype(v_cfg.dtype())?;
+            let d = v_cfg.broadcast_mul(&dt_tensor)?;
             x = (x + d)?;
             if let Some(map) = step_debug_map.as_mut() {
                 map.insert(format!("step{}_x", i), x.clone());
