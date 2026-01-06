@@ -3,6 +3,7 @@ use candle_nn::ops::sdpa;
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -305,22 +306,22 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
-        eprintln!("Qwen2: Loading embed_tokens...");
+        info!("Qwen2: Loading embed_tokens...");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        eprintln!("Qwen2: Loading rotary_emb...");
+        info!("Qwen2: Loading rotary_emb...");
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            eprintln!(
+            info!(
                 "Qwen2: Loading layer {}/{}...",
                 layer_idx, cfg.num_hidden_layers
             );
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        eprintln!("Qwen2: Loading norm...");
+        info!("Qwen2: Loading norm...");
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         Ok(Self {
             embed_tokens,

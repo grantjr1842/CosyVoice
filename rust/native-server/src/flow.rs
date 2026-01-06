@@ -1,6 +1,7 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::ops::sdpa;
 use candle_nn::{linear, LayerNorm, Linear, VarBuilder};
+use tracing::{debug, warn};
 
 // Force rebuild marker: REBUILD_V1
 const _FORCE_REBUILD: u32 = 1;
@@ -18,7 +19,7 @@ fn log_v_stats(name: &str, t: &Tensor) -> Result<()> {
     let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-    eprintln!(
+    debug!(
         "    [V DEBUG] {} stats: min={:.6}, max={:.6}, mean={:.6}, first 5={:?}",
         name,
         min,
@@ -392,7 +393,7 @@ impl Attention {
             ) {
                 Ok(out) => out,
                 Err(e) => {
-                    eprintln!("    [Attn WARNING] sdpa failed: {:?}, falling back to manual path (F32)", e);
+                    warn!("    [Attn WARNING] sdpa failed: {:?}, falling back to manual path (F32)", e);
                     // Cast to F32 for matmul stability to avoid F16 overflow doing accumulation
                     let q_f32 = q.contiguous()?.to_dtype(candle_core::DType::F32)?;
                     let k_f32 = k.contiguous()?.to_dtype(candle_core::DType::F32)?;
@@ -495,7 +496,7 @@ pub fn apply_rotary_pos_emb(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
 fn apply_rotary_pos_emb_flat(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
     let (_b, n, d) = x.dims3()?;
     let device = x.device();
-    eprintln!(
+    debug!(
         "    [RoPE DEBUG] x shape: {:?}, freqs shape: {:?}",
         x.shape(),
         freqs.shape()
@@ -1004,7 +1005,7 @@ impl ConditionalCFM {
 
             if let Some(max) = max_steps {
                 if i > max {
-                    eprintln!(
+                    debug!(
                         "    [Flow parity] reached debug max steps ({}) -> stopping early",
                         max
                     );
@@ -1090,7 +1091,7 @@ impl ConditionalCFM {
 
         // Debug
         if std::env::var("SAVE_FLOW_DEBUG").is_ok() {
-            eprintln!("Saving flow debug tensors to rust_flow_debug.safetensors...");
+            debug!("Saving flow debug tensors to rust_flow_debug.safetensors...");
             let mut debug_map = std::collections::HashMap::new();
             debug_map.insert("mu".to_string(), mu.clone());
             debug_map.insert("mask".to_string(), mask.clone());

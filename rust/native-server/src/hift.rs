@@ -1,6 +1,7 @@
 // use crate::utils::StftModule; // Commented out until used
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
+use tracing::debug;
 
 /// Snake Activation: x + (1/alpha) * sin^2(alpha * x)
 /// Actually, the paper usually uses: x + (1/alpha) * sin(alpha * x)^2 ?
@@ -217,7 +218,7 @@ fn load_conv1d(
             let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
             let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-            eprintln!(
+            debug!(
                 "    [Conv {}] weight stats: min={:.4e}, max={:.4e}, mean={:.4e}, shape=[{},{},{}]",
                 name, min, max, mean, out_c, in_c, k
             );
@@ -232,7 +233,7 @@ fn load_conv1d(
                 let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                eprintln!(
+                debug!(
                     "    [Conv {}] bias stats: min={:.4e}, max={:.4e}, mean={:.4e}",
                     name, min, max, mean
                 );
@@ -241,7 +242,7 @@ fn load_conv1d(
 
         Some(b)
     } else {
-        eprintln!(
+        debug!(
             "    [Conv {}] WARNING: Bias NOT found for path: {}",
             name,
             vb.prefix()
@@ -491,7 +492,7 @@ impl F0Predictor {
                     let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
                     let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                    eprintln!(
+                    debug!(
                         "    [F0Predictor] Layer {} weights: min={:.6}, max={:.6}, mean={:.6}",
                         i, min, max, mean
                     );
@@ -503,7 +504,7 @@ impl F0Predictor {
                         let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
                         let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                        eprintln!(
+                        debug!(
                             "    [F0Predictor] Layer {} bias: min={:.6}, max={:.6}, mean={:.6}",
                             i, min, max, mean
                         );

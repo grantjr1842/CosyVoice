@@ -18,6 +18,7 @@ use ort::value::Value;
 use std::env;
 use std::path::PathBuf;
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Error, Debug)]
 pub enum FrontendError {
@@ -43,28 +44,28 @@ pub struct OnnxFrontend {
 impl OnnxFrontend {
     /// Create a new ONNX frontend
     pub fn new(model_dir: &str, device: Device) -> Result<Self, FrontendError> {
-        println!("OnnxFrontend::new called");
+        info!("OnnxFrontend::new called");
         let model_path = PathBuf::from(model_dir);
 
         // Initialize ORT
-        println!("Initializing ORT...");
+        info!("Initializing ORT...");
         let _ = ort::init().with_name("cosyvoice").commit();
-        println!("ORT initialized.");
+        info!("ORT initialized.");
 
         let speech_tokenizer_path = model_path.join("speech_tokenizer_v3.onnx");
         let campplus_path = model_path.join("campplus.onnx");
 
         // Load models into memory
-        println!("Reading model files...");
+        info!("Reading model files...");
         let speech_tokenizer_bytes = std::fs::read(&speech_tokenizer_path).map_err(|e| {
             FrontendError::ModelLoad(format!("Failed to read speech tokenizer: {}", e))
         })?;
         let campplus_bytes = std::fs::read(&campplus_path)
             .map_err(|e| FrontendError::ModelLoad(format!("Failed to read campplus: {}", e)))?;
-        println!("Model files read.");
+        info!("Model files read.");
 
         // Initialize ORT sessions
-        eprintln!("Creating speech_tokenizer session (builder init)...");
+        info!("Creating speech_tokenizer session (builder init)...");
         let intra_threads = env::var("COSYVOICE_ORT_INTRA_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -100,14 +101,14 @@ impl OnnxFrontend {
                 .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?
         };
 
-        eprintln!("Speech Tokenizer bytes: {}", speech_tokenizer_bytes.len());
-        eprintln!("Threads set. Committing from memory...");
+        info!("Speech Tokenizer bytes: {}", speech_tokenizer_bytes.len());
+        info!("Threads set. Committing from memory...");
         let speech_tokenizer = builder
             .commit_from_memory(&speech_tokenizer_bytes)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
-        eprintln!("Speech tokenizer session created.");
+        info!("Speech tokenizer session created.");
 
-        eprintln!("Creating campplus session...");
+        info!("Creating campplus session...");
         let builder = Session::builder()
             .map_err(|e| FrontendError::OrtError(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -134,12 +135,12 @@ impl OnnxFrontend {
                 .map_err(|e: ort::Error| FrontendError::OrtError(e.to_string()))?
         };
 
-        eprintln!("Campplus bytes: {}", campplus_bytes.len());
-        eprintln!("Committing campplus from memory...");
+        info!("Campplus bytes: {}", campplus_bytes.len());
+        info!("Committing campplus from memory...");
         let campplus = builder
             .commit_from_memory(&campplus_bytes)
             .map_err(|e| FrontendError::OrtError(e.to_string()))?;
-        eprintln!("Campplus session created.");
+        info!("Campplus session created.");
 
         Ok(Self {
             speech_tokenizer,

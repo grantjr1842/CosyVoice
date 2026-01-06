@@ -10,6 +10,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{
     conv1d, embedding, linear, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder,
 };
+use tracing::debug;
 
 use crate::flow::{ConditionalCFM, DiT, FlowConfig};
 
@@ -114,7 +115,7 @@ impl PreLookaheadLayer {
             outputs.pad_with_zeros(2, 0, self.pre_lookahead_len)?
         };
 
-        eprintln!("PreLookahead conv1 input shape: {:?}", outputs.shape());
+        debug!("PreLookahead conv1 input shape: {:?}", outputs.shape());
         // Conv1 + LeakyReLU
         let outputs = self.conv1.forward(&outputs)?;
         let outputs = leaky_relu(&outputs, 0.01)?;
@@ -224,37 +225,37 @@ impl CosyVoiceFlow {
         n_timesteps: usize,
         noise: Option<&Tensor>,
     ) -> Result<Tensor> {
-        eprintln!("\n  [Flow.inference] Starting...");
-        eprintln!("    token shape: {:?}", token.shape());
-        eprintln!("    prompt_token shape: {:?}", prompt_token.shape());
-        eprintln!("    prompt_feat shape: {:?}", prompt_feat.shape());
-        eprintln!("    embedding shape: {:?}", embedding.shape());
+        debug!("\n  [Flow.inference] Starting...");
+        debug!("    token shape: {:?}", token.shape());
+        debug!("    prompt_token shape: {:?}", prompt_token.shape());
+        debug!("    prompt_feat shape: {:?}", prompt_feat.shape());
+        debug!("    embedding shape: {:?}", embedding.shape());
 
         // Normalize speaker embedding
         let embedding_norm = l2_normalize(embedding)?;
         let embedding_proj = self.spk_embed_affine_layer.forward(&embedding_norm)?;
-        eprintln!("    embedding_proj shape: {:?}", embedding_proj.shape());
+        debug!("    embedding_proj shape: {:?}", embedding_proj.shape());
 
         // Concatenate prompt and target tokens
         let combined_token = Tensor::cat(&[prompt_token, token], 1)?;
-        eprintln!("    combined_token shape: {:?}", combined_token.shape());
+        debug!("    combined_token shape: {:?}", combined_token.shape());
 
         // Embed tokens
         let token_emb = self.input_embedding.forward(&combined_token)?;
-        eprintln!("    token_emb shape: {:?}", token_emb.shape());
+        debug!("    token_emb shape: {:?}", token_emb.shape());
 
         // Apply pre-lookahead layer (finalize mode, no context)
         let h = self.pre_lookahead_layer.forward(&token_emb, None)?;
-        eprintln!("    pre_lookahead output shape: {:?}", h.shape());
+        debug!("    pre_lookahead output shape: {:?}", h.shape());
 
         // Repeat interleave for token_mel_ratio
         let h = repeat_interleave(&h, self.config.token_mel_ratio, 1)?;
-        eprintln!("    after repeat_interleave shape: {:?}", h.shape());
+        debug!("    after repeat_interleave shape: {:?}", h.shape());
 
         let prompt_mel_len = prompt_feat.dim(2)?; // [B, D, T], use dim 2
         let total_mel_len = h.dim(1)?;
         let target_mel_len = total_mel_len - prompt_mel_len;
-        eprintln!(
+        debug!(
             "    prompt_mel_len={}, total_mel_len={}, target_mel_len={}",
             prompt_mel_len, total_mel_len, target_mel_len
         );
@@ -276,14 +277,14 @@ impl CosyVoiceFlow {
             )?;
             conds = Tensor::cat(&[prompt_feat, &zeros_part], 2)?; // Cat along dim 2
         }
-        eprintln!("    conds shape: {:?}", conds.shape());
+        debug!("    conds shape: {:?}", conds.shape());
 
         // Create mask (all ones for now)
         let mask = Tensor::ones((1, total_mel_len), DType::F32, &self.device)?;
 
         // mu = h transposed
         let mu = h.transpose(1, 2)?; // [batch, hidden_dim, mel_len]
-        eprintln!("    mu (to decoder) shape: {:?}", mu.shape());
+        debug!("    mu (to decoder) shape: {:?}", mu.shape());
 
         // Print mu statistics
         if let Ok(mu_flat) = mu.flatten_all() {
@@ -292,7 +293,7 @@ impl CosyVoiceFlow {
                 let max = mu_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = mu_vec.iter().sum();
                 let mean = sum / mu_vec.len() as f32;
-                eprintln!(
+                debug!(
                     "    mu stats: min={:.6}, max={:.6}, mean={:.6}",
                     min, max, mean
                 );
@@ -300,7 +301,7 @@ impl CosyVoiceFlow {
         }
 
         // Run CFM decoder
-        eprintln!("    Running CFM decoder with {} timesteps...", n_timesteps);
+        debug!("    Running CFM decoder with {} timesteps...", n_timesteps);
         let feat = self.decoder.forward(
             &mu,
             &mask,
@@ -310,7 +311,7 @@ impl CosyVoiceFlow {
             Some(&conds),
             noise,
         )?;
-        eprintln!("    decoder output shape: {:?}", feat.shape());
+        debug!("    decoder output shape: {:?}", feat.shape());
 
         // Print decoder output statistics
         if let Ok(feat_flat) = feat.flatten_all() {
@@ -319,7 +320,7 @@ impl CosyVoiceFlow {
                 let max = feat_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = feat_vec.iter().sum();
                 let mean = sum / feat_vec.len() as f32;
-                eprintln!(
+                debug!(
                     "    decoder output stats: min={:.6}, max={:.6}, mean={:.6}",
                     min, max, mean
                 );
@@ -332,13 +333,13 @@ impl CosyVoiceFlow {
         let available_len = actual_dim.saturating_sub(prompt_mel_len);
         let final_len = usize::min(target_mel_len, available_len);
         if final_len != target_mel_len {
-            eprintln!(
+            debug!(
                 "    [Flow.inference] Warning: Output truncated from {} to {}",
                 target_mel_len, final_len
             );
         }
         let feat = feat.narrow(2, prompt_mel_len, final_len)?;
-        eprintln!("    final feat shape: {:?}", feat.shape());
+        debug!("    final feat shape: {:?}", feat.shape());
 
         // Print final mel statistics
         if let Ok(feat_flat) = feat.flatten_all() {
@@ -347,7 +348,7 @@ impl CosyVoiceFlow {
                 let max = feat_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = feat_vec.iter().sum();
                 let mean = sum / feat_vec.len() as f32;
-                eprintln!(
+                debug!(
                     "    [Flow.inference] Final mel stats: min={:.6}, max={:.6}, mean={:.6}",
                     min, max, mean
                 );

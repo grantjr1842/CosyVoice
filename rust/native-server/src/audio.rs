@@ -3,6 +3,7 @@
 //! Provides mel spectrogram computation and audio I/O without Python dependencies.
 
 use anyhow::{anyhow, Result};
+use tracing::debug;
 use candle_core::{npy::NpzTensors, Device, Tensor};
 use hound::WavReader;
 use ndarray::Array2;
@@ -141,7 +142,7 @@ pub fn create_mel_filterbank(config: &MelConfig) -> Array2<f32> {
         let width = f_m_plus - f_m_minus;
         let norm_factor = 2.0 / width;
         if m == 0 {
-            eprintln!("[Audio] Mel band 0: width={:.4} Hz, norm_factor={:.6}", width, norm_factor);
+            debug!("[Audio] Mel band 0: width={:.4} Hz, norm_factor={:.6}", width, norm_factor);
         }
         for k in 0..n_fft_bins {
             filterbank[[m, k]] *= norm_factor as f32;
@@ -752,7 +753,7 @@ pub fn normalize_audio(samples: &mut [f32], target_peak: f32) -> f32 {
 
     // Calculate and apply gain
     let gain = target_peak / current_peak;
-    println!(
+    debug!(
         "normalize_audio: current_peak={:.6}, target_peak={:.6}, gain={:.6}",
         current_peak, target_peak, gain
     );

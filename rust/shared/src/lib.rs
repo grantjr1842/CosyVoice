@@ -1,4 +1,4 @@
-//! Shared types for CosyVoice TTS server and client.
+//! Shared types for `CosyVoice` TTS server and client.
 
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +56,7 @@ pub struct ErrorResponse {
 pub mod config {
     /// Default server port.
     pub const DEFAULT_PORT: u16 = 3000;
-    /// Default sample rate for CosyVoice.
+    /// Default sample rate for `CosyVoice`.
     pub const SAMPLE_RATE: u32 = 24000;
     /// Server version.
     pub const VERSION: &str = env!("CARGO_PKG_VERSION");

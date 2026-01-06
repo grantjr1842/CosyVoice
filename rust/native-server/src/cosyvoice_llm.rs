@@ -7,6 +7,7 @@ use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use rand::Rng;
 use std::cmp::Ordering;
 use std::path::Path;
+use tracing::{debug, info};
 
 use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 use crate::quantized_qwen::ModelForCausalLM as QuantizedModelForCausalLM;
@@ -114,9 +115,9 @@ impl CosyVoiceLLM {
         let device = vb.device().clone();
 
         // Load core Qwen2 model - it's under "llm.model" prefix
-        eprintln!("Loading Qwen2 model from llm.model prefix...");
+        info!("Loading Qwen2 model from llm.model prefix...");
         let llm = ModelForCausalLM::new(qwen_config, vb.pp("llm.model"))?;
-        eprintln!("Qwen2 model loaded successfully");
+        info!("Qwen2 model loaded successfully");
 
         Self::build(QwenModel::Standard(llm), llm_config, vb, device)
     }
@@ -128,11 +129,11 @@ impl CosyVoiceLLM {
     ) -> Result<Self> {
         let device = vb_extras.device().clone();
 
-        eprintln!("Loading Quantized Qwen2 from {:?}...", gguf_path.as_ref());
+        info!("Loading Quantized Qwen2 from {:?}...", gguf_path.as_ref());
         let mut file = std::fs::File::open(gguf_path)?;
         let content = gguf_file::Content::read(&mut file)?;
         let llm = QuantizedModelForCausalLM::from_gguf(&content, &mut file, &device)?;
-        eprintln!("Quantized Qwen2 loaded successfully");
+        info!("Quantized Qwen2 loaded successfully");
 
         Self::build(QwenModel::Quantized(llm), llm_config, vb_extras, device)
     }
@@ -144,7 +145,7 @@ impl CosyVoiceLLM {
         device: Device,
     ) -> Result<Self> {
         // Load speech embedding using weights to infer vocab size.
-        eprintln!("Loading speech_embedding from top-level...");
+        info!("Loading speech_embedding from top-level...");
         let speech_emb_weight = vb.pp("speech_embedding").get_unchecked("weight")?;
         let (speech_vocab_size, speech_emb_dim) = speech_emb_weight.dims2()?;
         if speech_emb_dim != llm_config.llm_input_size {
@@ -159,11 +160,11 @@ impl CosyVoiceLLM {
                 speech_vocab_size, llm_config.sampling_vocab_size
             )));
         }
-        eprintln!("speech_embedding loaded successfully");
+        info!("speech_embedding loaded successfully");
         let speech_embedding = Embedding::new(speech_emb_weight, llm_config.llm_input_size);
 
         // Load decoder head (weight is transposed: [vocab_size, hidden_size])
-        eprintln!("Loading llm_decoder from top-level...");
+        info!("Loading llm_decoder from top-level...");
         let decoder_weight = vb.pp("llm_decoder").get_unchecked("weight")?;
         let (decoder_vocab_size, decoder_hidden) = decoder_weight.dims2()?;
         if decoder_hidden != llm_config.llm_output_size {
@@ -179,7 +180,7 @@ impl CosyVoiceLLM {
             )));
         }
         let llm_decoder = Linear::new(decoder_weight, None);
-        eprintln!("llm_decoder loaded successfully");
+        info!("llm_decoder loaded successfully");
 
         let extra_tokens = speech_vocab_size - llm_config.sampling_vocab_size;
         let use_speech_special_tokens = extra_tokens >= 3;
@@ -216,7 +217,7 @@ impl CosyVoiceLLM {
                 }
                 Embedding::new(llm_emb_weight, llm_config.llm_input_size)
             } else {
-                eprintln!("Creating llm_embedding (2 tokens)...");
+                debug!("Creating llm_embedding (2 tokens)...");
                 create_random_embedding(2, llm_config.llm_input_size, &device)?
             };
             (Some(llm_embedding), 0, 1)
@@ -469,7 +470,7 @@ impl CosyVoiceLLM {
             let top_id = self.sample_ids(&logp, &out_tokens, sampling_k, ignore_stop)?;
 
             if self.is_stop_token(top_id) {
-                eprintln!(
+                debug!(
                     "LLM: stop token reached at step {} (token id {})",
                     i, top_id
                 );
