@@ -1020,11 +1020,7 @@ impl HiFTGenerator {
         if let Ok(m) = audio.mean_all()?.to_scalar::<f32>() {
         }
 
-        // Apply Gain Correction to match Python output range
-        // Pre-clamp peaks ~7.5. Target 0.99. Factor ~ 0.13.
-        // Ensures no hard clipping before normalization.
-        let audio = (audio * 0.13)?;
-
+        // Apply Gain Correction to match Python output range\n        // NOTE: Previously had a 0.13x factor here due to incorrect ISTFT normalization.\n        // Now that InverseStftModule uses corrected normalization,\n        // we no longer need this hack. The raw ISTFT output should match Python's range.\n        // REMOVED: let audio = (audio * 0.13)?;\n
         // Debug pre-clamp stats
         if let Ok(flat) = audio.flatten_all() {
             if let Ok(vec) = flat.to_vec1::<f32>() {
