@@ -430,9 +430,13 @@ impl CosyVoiceLLM {
         // Clear KV cache for fresh generation
         self.llm.clear_kv_cache();
 
+        // Use text_embeds dtype as the target dtype for all embeddings
+        let target_dtype = text_embeds.dtype();
+
         // Build initial input: [sos, text, task_id, prompt_speech]
-        let sos_emb = self.get_sos_emb()?;
-        let task_id_emb = self.get_task_id_emb()?;
+        // Cast all embeddings to target dtype to avoid F16/F32 mismatch
+        let sos_emb = self.get_sos_emb()?.to_dtype(target_dtype)?;
+        let task_id_emb = self.get_task_id_emb()?.to_dtype(target_dtype)?;
 
         let mut parts = vec![sos_emb];
         parts.push(text_embeds.clone());
@@ -440,7 +444,7 @@ impl CosyVoiceLLM {
 
         if let Some(prompt_tokens) = prompt_speech_tokens {
             if prompt_tokens.dim(1)? > 0 {
-                let prompt_emb = self.embed_speech_tokens(prompt_tokens)?;
+                let prompt_emb = self.embed_speech_tokens(prompt_tokens)?.to_dtype(target_dtype)?;
                 parts.push(prompt_emb);
             }
         }
@@ -458,12 +462,14 @@ impl CosyVoiceLLM {
                 .forward_embeds(&lm_input, seqlen_offset, None)?;
 
             // Get logits from last position
+            // Get logits from last position and cast to F32 for sampling
             let logits = self.llm_decoder.forward(&y_pred.i((
                 ..,
                 y_pred.dim(1)? - 1..y_pred.dim(1)?,
                 ..,
             ))?)?;
-            let logp = candle_nn::ops::log_softmax(&logits.squeeze(1)?, 1)?;
+            let logits_f32 = logits.to_dtype(candle_core::DType::F32)?;
+            let logp = candle_nn::ops::log_softmax(&logits_f32.squeeze(1)?, 1)?;
 
             // Sample next token
             let ignore_stop = i < min_len;
@@ -480,12 +486,18 @@ impl CosyVoiceLLM {
             out_tokens.push(top_id);
 
             // Prepare next input (just the new token embedding)
+            // Cast to target dtype to maintain consistency
             seqlen_offset += lm_input.dim(1)?;
             let token_tensor = Tensor::new(&[top_id], &self.device)?;
-            lm_input = self.embed_speech_tokens(&token_tensor.unsqueeze(0)?)?;
+            lm_input = self.embed_speech_tokens(&token_tensor.unsqueeze(0)?)?.to_dtype(target_dtype)?;
         }
 
         Ok(out_tokens)
+    }
+
+    /// Clear KV cache to free memory
+    pub fn clear_kv_cache(&mut self) {
+        self.llm.clear_kv_cache();
     }
 }
 

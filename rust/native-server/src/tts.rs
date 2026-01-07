@@ -179,6 +179,7 @@ impl NativeTtsEngine {
             }
         };
 
+
         Ok(Self {
             llm,
             flow,
@@ -436,6 +437,9 @@ impl NativeTtsEngine {
             max_len,
         )?;
         eprintln!("Generated {} speech tokens", speech_tokens.len());
+
+        // Clear KV cache immediately to free memory for Flow/HiFT
+        self.llm.clear_kv_cache();
 
         // Convert to tensor
         let token_len = speech_tokens.len();
