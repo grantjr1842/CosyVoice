@@ -318,15 +318,14 @@ impl NativeTtsEngine {
             .map(|&x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect();
 
-        eprintln!("=== END SYNTHESIS DEBUG ===\n");
+
 
         Ok(samples)
     }
 
     /// Synthesize audio directly from a mel spectrogram (bypassing LLM and Flow)
     pub fn synthesize_from_mel(&self, mel: &Tensor) -> Result<Vec<i16>, NativeTtsError> {
-        eprintln!("\n=== SYNTHESIS FROM MEL DEBUG ===");
-        eprintln!("Input mel shape: {:?}", mel.shape());
+
 
         // Print tensor statistics helper (duplicated logic for now)
         fn print_tensor_stats(name: &str, t: &Tensor) {
@@ -391,7 +390,7 @@ impl NativeTtsEngine {
             .map(|&x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect();
 
-        eprintln!("=== END SYNTHESIS FROM MEL DEBUG ===\n");
+
         Ok(samples)
     }
 
@@ -423,10 +422,6 @@ impl NativeTtsEngine {
         let max_len = (effective_len as f32 * MAX_TOKEN_TEXT_RATIO) as usize;
 
         // 1. Generate speech tokens via LLM
-        eprintln!(
-            "Generating speech tokens... (min={}, max={})",
-            min_len, max_len
-        );
         let speech_tokens = self.llm.generate(
             text_embeds,
             prompt_speech_tokens,
@@ -435,7 +430,7 @@ impl NativeTtsEngine {
             min_len,
             max_len,
         )?;
-        eprintln!("Generated {} speech tokens", speech_tokens.len());
+
 
         // Convert to tensor
         let token_len = speech_tokens.len();

@@ -352,7 +352,7 @@ impl CosyVoiceLLM {
         sampling_k: usize,
         ignore_stop: bool,
     ) -> Result<u32> {
-        let logp = logp.squeeze(0)?;
+        let logp = logp.to_dtype(candle_core::DType::F32)?.squeeze(0)?;
         let logp_vec: Vec<f32> = logp.to_vec1()?;
         let mut probs: Vec<f32> = logp_vec.iter().map(|v| v.exp()).collect();
         if ignore_stop {
