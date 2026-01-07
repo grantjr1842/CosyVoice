@@ -25,21 +25,36 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 struct RmsNorm {
-    inner: candle_nn::RmsNorm,
+    scale: Tensor,
+    eps: f64,
 }
 
 impl RmsNorm {
     fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let inner = candle_nn::rms_norm(size, eps, vb)?;
-        Ok(Self { inner })
+        let scale = vb.get(size, "weight")?;
+        Ok(Self { scale, eps })
     }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.inner.forward(x)
+        let x_dtype = x.dtype();
+        // Use F32 internally for F16/BF16 to avoid precision loss
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden_size = x.dim(x.rank() - 1)?;
+        let x = x.to_dtype(internal_dtype)?;
+        let norm_x = (x.sqr()?.sum_keepdim(x.rank() - 1)? / (hidden_size as f64))?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        // Cast back to original dtype and multiply by scale (also casted)
+        let x_normed = x_normed.to_dtype(x_dtype)?;
+        let scale = self.scale.to_dtype(x_dtype)?;
+        x_normed.broadcast_mul(&scale)
     }
 }
+
 
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
@@ -73,8 +88,10 @@ impl RotaryEmbedding {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let target_dtype = q.dtype();
+        // Cast sin/cos to match input dtype (e.g., F16)
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?.to_dtype(target_dtype)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?.to_dtype(target_dtype)?;
         let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
@@ -360,6 +377,7 @@ impl Model {
     }
 
     pub fn clear_kv_cache(&mut self) {
+
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }

@@ -144,6 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &prompt_fbank,
             1,
         )?;
+
+
         let duration = start.elapsed();
         total_duration += duration;
         println!("Iteration {}: {:.2?}", i+1, duration);
