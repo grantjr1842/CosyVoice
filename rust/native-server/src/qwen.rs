@@ -1,9 +1,11 @@
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::ops::sdpa;
+#[cfg(feature = "flash-attn")]
+use candle_flash_attn::flash_attn;
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -126,6 +128,7 @@ struct Attention {
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<(Tensor, Tensor)>,
     use_flash_attn: bool,
+    use_sdpa: bool,
 }
 
 impl Attention {
@@ -140,7 +143,8 @@ impl Attention {
         let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
 
-        let use_flash_attn = vb.device().is_cuda() || vb.device().is_metal();
+        let use_flash_attn = cfg!(feature = "flash-attn") && vb.device().is_cuda();
+        let use_sdpa = vb.device().is_metal();
 
         Ok(Self {
             q_proj,
@@ -155,7 +159,30 @@ impl Attention {
             rotary_emb,
             kv_cache: None,
             use_flash_attn,
+            use_sdpa,
         })
+    }
+
+    fn manual_attention(
+        &self,
+        query_states: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+        scale: f64,
+        b_sz: usize,
+        q_len: usize,
+    ) -> Result<Tensor> {
+        let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+        let attn_weights = match attention_mask {
+            None => attn_weights,
+            Some(mask) => attn_weights.broadcast_add(mask)?,
+        };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        attn_weights
+            .matmul(value_states)?
+            .transpose(1, 2)?
+            .reshape((b_sz, q_len, self.hidden_size))
     }
 
     fn forward(
@@ -194,50 +221,104 @@ impl Attention {
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
         let scale_f32 = scale as f32;
 
-        // SDPA path (fused attention) with fallback to the manual path.
         let attn_output = if self.use_flash_attn {
+            #[cfg(feature = "flash-attn")]
+            {
+                let q_flash = query_states.transpose(1, 2)?.contiguous()?;
+                let k_flash = key_states.transpose(1, 2)?.contiguous()?;
+                let v_flash = value_states.transpose(1, 2)?.contiguous()?;
+                match flash_attn(
+                    &q_flash,
+                    &k_flash,
+                    &v_flash,
+                    scale_f32,
+                    attention_mask.is_some(),
+                ) {
+                    Ok(attn) => attn
+                        .transpose(1, 2)?
+                        .reshape((b_sz, q_len, self.hidden_size))?,
+                    Err(err) => {
+                        warn!(
+                            "Qwen2 flash-attn failed, falling back to manual attention: {:?}",
+                            err
+                        );
+                        let key_states =
+                            repeat_kv(key_states.clone(), self.num_kv_groups)?.contiguous()?;
+                        let value_states =
+                            repeat_kv(value_states.clone(), self.num_kv_groups)?.contiguous()?;
+                        self.manual_attention(
+                            &query_states,
+                            &key_states,
+                            &value_states,
+                            attention_mask,
+                            scale,
+                            b_sz,
+                            q_len,
+                        )?
+                    }
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                let key_states = repeat_kv(key_states.clone(), self.num_kv_groups)?.contiguous()?;
+                let value_states =
+                    repeat_kv(value_states.clone(), self.num_kv_groups)?.contiguous()?;
+                self.manual_attention(
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    attention_mask,
+                    scale,
+                    b_sz,
+                    q_len,
+                )?
+            }
+        } else if self.use_sdpa {
+            let key_states = repeat_kv(key_states.clone(), self.num_kv_groups)?.contiguous()?;
+            let value_states = repeat_kv(value_states.clone(), self.num_kv_groups)?.contiguous()?;
             match sdpa(
                 &query_states,
                 &key_states,
                 &value_states,
                 attention_mask,
-                false,
+                false, // causal mask is passed explicitly in attention_mask if query_len > 1
                 scale_f32,
-                1.0,
+                0.0,
             ) {
                 Ok(attn) => attn
                     .transpose(1, 2)?
                     .reshape((b_sz, q_len, self.hidden_size))?,
-                Err(_) => {
-                    let attn_weights =
-                        (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
-                    let attn_weights = match attention_mask {
-                        None => attn_weights,
-                        Some(mask) => attn_weights.broadcast_add(mask)?,
-                    };
-                    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-                    attn_weights
-                        .matmul(&value_states)?
-                        .transpose(1, 2)?
-                        .reshape((b_sz, q_len, self.hidden_size))?
+                Err(err) => {
+                    warn!(
+                        "Qwen2 sdpa failed, falling back to manual attention: {:?}",
+                        err
+                    );
+                    self.manual_attention(
+                        &query_states,
+                        &key_states,
+                        &value_states,
+                        attention_mask,
+                        scale,
+                        b_sz,
+                        q_len,
+                    )?
                 }
             }
         } else {
-            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
-            let attn_weights = match attention_mask {
-                None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights
-                .matmul(&value_states)?
-                .transpose(1, 2)?
-                .reshape((b_sz, q_len, self.hidden_size))?
+            let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+            let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+            self.manual_attention(
+                &query_states,
+                &key_states,
+                &value_states,
+                attention_mask,
+                scale,
+                b_sz,
+                q_len,
+            )?
         };
 
         attn_output.apply(&self.o_proj)

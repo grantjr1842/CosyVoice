@@ -573,6 +573,7 @@ dependencies = [
  "axum",
  "bytes",
  "candle-core",
+ "candle-flash-attn",
  "candle-kernels",
  "candle-nn",
  "candle-transformers",

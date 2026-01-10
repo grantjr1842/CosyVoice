@@ -136,8 +136,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // But let's try with empty prompt (which is valid for Zero-Shot if prompt is effectively handled or if SFT).
     // Or create dummy zero prompt.
 
-    let empty_prompt_token = Tensor::zeros((1, 0), DType::U32, &device)?;
-    let empty_prompt_mel = Tensor::zeros((1, 80, 0), DType::F32, &device)?;
+    // Avoid zero-length prompt tensors on CUDA (can trigger invalid argument errors).
+    let empty_prompt_token = Tensor::zeros((1, 1), DType::U32, &device)?;
+    let empty_prompt_mel = Tensor::zeros((1, 80, 1), DType::F32, &device)?;
 
     let audio_samples = engine.synthesize_from_tokens(
         &speech_tokens,

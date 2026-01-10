@@ -74,6 +74,10 @@ def main():
     # Run LLM (non-streaming)
     # inference yield tokens, we collect them
     tts_speech_tokens = []
+    print(f"Prompt text tokens: {prompt_text_t}")
+    print(f"Target text tokens: {text}")
+    print(f"Combined text tokens: {torch.cat([prompt_text_t, text], dim=1)}")
+
     with torch.inference_mode():
         for i in llm.inference(
             text=text,
@@ -83,7 +87,8 @@ def main():
             prompt_speech_token=llm_prompt_speech_token,
             prompt_speech_token_len=llm_prompt_speech_token_len,
             embedding=llm_embedding,
-            uuid="test_uuid"
+            uuid="test_uuid",
+            sampling=25
         ):
             tts_speech_tokens.append(i)
 
@@ -115,6 +120,7 @@ def main():
 
     token = torch.tensor(full_speech_token_list, dtype=torch.int32, device=device).unsqueeze(0)
     print(f"Generated {token.shape[1]} speech tokens.")
+    print(f"First 20 speech tokens: {full_speech_token_list[:20]}")
 
     # 3. Flow Inference
     print("Running Flow...")
@@ -150,7 +156,7 @@ def main():
     hift = cosyvoice.model.hift
 
     with torch.inference_mode():
-        audio, _ = hift.inference(speech_feat=flow_out, finalize=True)
+        audio, source = hift.inference(speech_feat=flow_out, finalize=True)
 
     print(f"HiFT output (audio) shape: {audio.shape}")
 
@@ -176,6 +182,7 @@ def main():
 
         # Audio Output
         "python_audio_output": audio.contiguous().cpu(),
+        "python_hift_source": source.contiguous().cpu(),
 
         # Internal Noise Buffer (for parity)
         "rand_noise": flow.decoder.rand_noise.contiguous().cpu()

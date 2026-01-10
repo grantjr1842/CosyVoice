@@ -3,7 +3,9 @@
 use anyhow::{anyhow, Context, Result};
 use candle_core::{Device, Tensor};
 use cosyvoice_native_server::audio::{self, MelConfig};
-use cosyvoice_native_server::text_frontend::text_normalize_english;
+use cosyvoice_native_server::text_frontend::{
+    clean_special_tokens, ensure_prompt_prefix, split_prompt_and_content, text_normalize_english,
+};
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use hound::WavWriter;
 use std::fs;
@@ -91,7 +93,10 @@ fn main() -> Result<()> {
     let mel_len = prompt_speech_24k.dim(2)?;
     let token_len = prompt_speech_tokens.dim(1)?;
     let aligned_token_len = usize::min(mel_len / 2, token_len);
-    println!("DEBUG: mel_len={}, token_len={}, aligned_token_len={}", mel_len, token_len, aligned_token_len);
+    println!(
+        "DEBUG: mel_len={}, token_len={}, aligned_token_len={}",
+        mel_len, token_len, aligned_token_len
+    );
     if aligned_token_len == 0 {
         return Err(anyhow!("Prompt token length is zero after alignment"));
     }
@@ -141,8 +146,14 @@ fn main() -> Result<()> {
     fs::create_dir_all(&output_dir)?;
     println!("Output directory: {:?}", output_dir);
 
-    let full_prompt_text = format!("{}{}", PROMPT_PREFIX, DEFAULT_PROMPT_TEXT);
-    let prompt_texts = text_normalize_english(&full_prompt_text, &tokenizer, false, true)?;
+    // Build full prompt with prefix (like Python does)
+    let full_prompt_text = ensure_prompt_prefix(DEFAULT_PROMPT_TEXT);
+
+    // Split prompt and content like Python does
+    let (prompt_part, _) = split_prompt_and_content(&full_prompt_text);
+
+    // Process prompt text separately (only the part before <|endofprompt|>)
+    let prompt_texts = text_normalize_english(&prompt_part, &tokenizer, false, true)?;
     let prompt_text = prompt_texts
         .into_iter()
         .next()
@@ -150,7 +161,10 @@ fn main() -> Result<()> {
     let prompt_tokens = encode_tokens(&tokenizer, &prompt_text)?;
 
     for (idx, tts_text) in texts.iter().enumerate() {
-        let segments = text_normalize_english(tts_text, &tokenizer, true, true)?;
+        // Clean the TTS text to remove any special tokens
+        let cleaned_tts_text = clean_special_tokens(tts_text);
+
+        let segments = text_normalize_english(&cleaned_tts_text, &tokenizer, true, true)?;
         if segments.is_empty() {
             println!(
                 "\nSkipping empty text segment for input [{}/{}]",
@@ -170,24 +184,47 @@ fn main() -> Result<()> {
             );
             let tts_tokens = encode_tokens(&tokenizer, segment)?;
 
+            // Create the model input like Python does:
+            // - prompt_text goes to the prompt field
+            // - text goes to the text field
+            // They are NOT concatenated for the LLM
+
+            println!(
+                "DEBUG: Prompt tokens: {:?}",
+                prompt_tokens.iter().take(20).collect::<Vec<_>>()
+            );
+            println!(
+                "DEBUG: TTS tokens: {:?}",
+                tts_tokens.iter().take(20).collect::<Vec<_>>()
+            );
+
+            // For the LLM, we need to combine prompt + text like Python's zero_shot mode
             let mut text_tokens = Vec::with_capacity(prompt_tokens.len() + tts_tokens.len());
             text_tokens.extend_from_slice(&prompt_tokens);
             text_tokens.extend_from_slice(&tts_tokens);
 
-            let text_tensor = Tensor::from_vec(
-                text_tokens,
-                (1, prompt_tokens.len() + tts_tokens.len()),
-                &device,
-            )?;
+            let text_tensor =
+                Tensor::from_vec(text_tokens.clone(), (1, text_tokens.len()), &device)?;
+            println!(
+                "DEBUG: Input text tokens (first 40): {:?}",
+                text_tokens.iter().take(40).collect::<Vec<_>>()
+            );
             let text_embeds = engine.llm.embed_text_tokens(&text_tensor)?;
 
             // Check for forced Python speech tokens (from debug_artifacts.safetensors)
-            let forced_speech_tokens = if std::path::Path::new("debug_artifacts.safetensors").exists() {
-                let tensors = candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
+            let forced_speech_tokens = if std::path::Path::new("debug_artifacts.safetensors")
+                .exists()
+            {
+                let tensors =
+                    candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
                 if let Some(py_st) = tensors.get("python_speech_tokens") {
-                     println!("=== DEBUG: USING FORCED PYTHON SPEECH TOKENS FROM ARTIFACT ===");
-                     // Python shape [1, N]. Rust needs [1, N].
-                     Some(py_st.to_dtype(candle_core::DType::U32)?.to_device(&device)?)
+                    println!("=== DEBUG: USING FORCED PYTHON SPEECH TOKENS FROM ARTIFACT ===");
+                    // Python shape [1, N]. Rust needs [1, N].
+                    Some(
+                        py_st
+                            .to_dtype(candle_core::DType::U32)?
+                            .to_device(&device)?,
+                    )
                 } else {
                     None
                 }
@@ -195,54 +232,62 @@ fn main() -> Result<()> {
                 None
             };
 
-            let audio_samples = if let Some(speech_tokens) = forced_speech_tokens {
-                 // Skip LLM, run Flow + HiFT directly
-                 println!("Skipping LLM generation, using {} forced tokens.", speech_tokens.dim(1)?);
+            let (speech_tokens, audio_samples) = if let Some(speech_tokens) = forced_speech_tokens {
+                // Skip LLM, run Flow + HiFT directly
+                println!(
+                    "Skipping LLM generation, using {} forced tokens.",
+                    speech_tokens.dim(1)?
+                );
 
-                 // Flow Inference
-                 // speech_tokens: [1, N]
-                 // prompt_tokens: prompt_tokens vector -> Tensor [1, P]
-                 // Flow inputs
-                 let prompt_mel = &prompt_speech_24k; // 80-dim mel
-                 let flow_embed = &speaker_embedding;
+                let prompt_mel = &prompt_speech_24k;
+                let flow_embed = &speaker_embedding;
 
-                 // Run Flow
-                 // Note: tts.rs synthesizes full flow. We replicate logic here or reuse engine methods?
-                 // engine.flow is public? No, usually private.
-                 // But NativeTtsEngine fields are usually public in this crate?
-                 // Let's check cosyvoice-native-server/src/tts.rs definition.
-                 // If not public, we might need to modify tts.rs or use a method.
-                 // Wait, `process_prompt_tensors` was available.
-                 // Let's assume `engine.flow` is accessible for now (crate visibility?).
-                 // If not, I'll need to make it public.
-
-                 // ERROR: `engine` fields might be private.
-                 // Changing strategy: Modify `native_example.rs` assuming public access,
-                 // if fails, I will edit `tts.rs` to make fields public.
-
-                 // For now, let's try to call a new method on engine `synthesize_flow_hift`?
-                 // Or just assume I can access fields.
-
-                 // Actually, `synthesize_full_with_prompt_len` is high level.
-                 // I will assume for this "Deep Dive" I can modify `tts.rs` to add a `debug_synthesize_from_tokens` method.
-                 // That's cleaner.
-                 engine.synthesize_flow_hift(
-                     &speech_tokens,
-                     &prompt_speech_tokens,
-                     prompt_mel,
-                     flow_embed
-                 )?
+                let audio = engine.synthesize_flow_hift(
+                    &speech_tokens,
+                    &prompt_speech_tokens,
+                    prompt_mel,
+                    flow_embed,
+                )?;
+                (speech_tokens, audio)
             } else {
-                engine.synthesize_full_with_prompt_len(
+                let tts_text_len = tts_tokens.len();
+                let prompt_text_len = prompt_tokens.len();
+                let min_len = ((tts_text_len - prompt_text_len) as f32 * 2.0) as usize;
+                let max_len = ((tts_text_len - prompt_text_len) as f32 * 20.0) as usize;
+
+                let speech_tokens_vec = engine.llm.generate(
                     &text_embeds,
-                    prompt_tokens.len(),
                     Some(&prompt_speech_tokens),
+                    Some(&speaker_embedding),
+                    25,
+                    min_len,
+                    max_len,
+                )?;
+                // Convert Vec<u32> to Tensor [1, N]
+                let speech_tokens = Tensor::from_vec(
+                    speech_tokens_vec.clone(),
+                    (1, speech_tokens_vec.len()),
+                    &device,
+                )?;
+                println!(
+                    "Generated {} speech tokens: {:?}",
+                    speech_tokens.dim(1)?,
+                    speech_tokens_vec.iter().take(20).collect::<Vec<_>>()
+                );
+
+                let audio = engine.synthesize_from_tokens(
+                    &speech_tokens,
+                    &prompt_speech_tokens,
                     &prompt_speech_24k,
                     &speaker_embedding,
-                    25,
-                )?
+                    None,
+                )?;
+                (speech_tokens, audio)
             };
-            println!("DEBUG: Generated audio duration: {:.2}s", audio_samples.len() as f32 / engine.sample_rate as f32);
+            println!(
+                "DEBUG: Generated audio duration: {:.2}s",
+                audio_samples.len() as f32 / engine.sample_rate as f32
+            );
 
             let output_path =
                 output_dir.join(format!("native_voice_clone_{}_{}.wav", idx, seg_idx));

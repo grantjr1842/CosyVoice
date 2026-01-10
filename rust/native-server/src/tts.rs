@@ -77,8 +77,11 @@ impl NativeTtsEngine {
             .map(|v| v != "0")
             .unwrap_or(true);
         let llm_path = if use_rl {
+            let patched_path = model_path.join("llm.rl.patched.safetensors");
             let rl_path = model_path.join("llm.rl.safetensors");
-            if rl_path.exists() {
+            if patched_path.exists() {
+                patched_path
+            } else if rl_path.exists() {
                 rl_path
             } else {
                 let rl_pt = model_path.join("llm.rl.pt");

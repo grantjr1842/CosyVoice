@@ -22,11 +22,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use shared::{config, ErrorResponse, HealthResponse, SynthesizeRequest};
 
 use cosyvoice_native_server::audio::{self, MelConfig};
-use cosyvoice_native_server::text_frontend::text_normalize_english;
+use cosyvoice_native_server::text_frontend::{
+    clean_special_tokens, ensure_prompt_prefix, text_normalize_english,
+};
 use cosyvoice_native_server::tts::NativeTtsEngine;
 
 mod qwen_special_tokens;
-
 
 // Use jemalloc for better memory allocation performance
 #[global_allocator]
@@ -96,8 +97,10 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     tokenizer.add_special_tokens(&tokens);
 
-    info!("Tokenizer initialized successfully with {} additional special tokens", special_tokens.len());
-
+    info!(
+        "Tokenizer initialized successfully with {} additional special tokens",
+        special_tokens.len()
+    );
 
     let state = Arc::new(AppState {
         tts: Mutex::new(tts),
@@ -153,7 +156,7 @@ async fn synthesize_handler(
         }
     };
 
-    let prompt_text = match request.prompt_text.as_deref() {
+    let prompt_text = ensure_prompt_prefix(&match request.prompt_text.as_deref() {
         Some(text) if !text.trim().is_empty() => text.to_string(),
         Some(_) => {
             return error_response(StatusCode::BAD_REQUEST, "prompt_text is empty".to_string())
@@ -162,7 +165,7 @@ async fn synthesize_handler(
             .speaker
             .clone()
             .unwrap_or_else(|| "Speak naturally in English.".to_string()),
-    };
+    });
 
     let prompt_segments = match text_normalize_english(&prompt_text, &state.tokenizer, false, true)
     {
@@ -189,8 +192,12 @@ async fn synthesize_handler(
     };
     let prompt_text_len = prompt_tokens.len();
 
-    let mut tts_segments = match text_normalize_english(&request.text, &state.tokenizer, true, true)
-    {
+    let mut tts_segments = match text_normalize_english(
+        &clean_special_tokens(&request.text),
+        &state.tokenizer,
+        true,
+        true,
+    ) {
         Ok(segments) => segments,
         Err(e) => {
             return error_response(

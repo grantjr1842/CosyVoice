@@ -5,10 +5,46 @@ use regex::Regex;
 use tokenizers::Tokenizer;
 
 pub const PROMPT_PREFIX: &str = "You are a helpful assistant.<|endofprompt|>";
-const EN_PREFIX: &str = "<|en|>";
+const EN_PREFIX: &str = ""; // Removed <|en|> to prevent it from being spoken
 const EN_TOKEN_MAX: usize = 80;
 const EN_TOKEN_MIN: usize = 60;
 const EN_MERGE_LEN: usize = 20;
+
+/// Clean text by removing special tokens that shouldn't be spoken
+pub fn clean_special_tokens(text: &str) -> String {
+    // Only remove <|en|> from TTS text, keep <|endofprompt|> as it's a critical delimiter
+    let special_tokens = ["<|en|>", "<|im_start|>", "<|im_end|>"];
+    let mut cleaned = text.to_string();
+    for token in &special_tokens {
+        cleaned = cleaned.replace(token, "");
+    }
+    // Clean up extra whitespace but preserve sentence structure
+    cleaned = cleaned.replace("  ", " ");
+    cleaned.trim().to_string()
+}
+
+/// Split prompt and actual text content based on <|endofprompt|>
+pub fn split_prompt_and_content(text: &str) -> (String, String) {
+    // Find the endofprompt marker
+    if let Some(pos) = text.find("<|endofprompt|>") {
+        // Find the period before endofprompt to split properly
+        let before_prompt = &text[..pos];
+        if let Some(period_pos) = before_prompt.rfind('.') {
+            // Include the period in the prompt
+            let prompt = &text[..period_pos + 1];
+            let content = &text[pos + "<|endofprompt|>".len()..];
+            (prompt.trim().to_string(), content.trim().to_string())
+        } else {
+            // No period found, use everything before endofprompt
+            let prompt = &text[..pos];
+            let content = &text[pos + "<|endofprompt|>".len()..];
+            (prompt.trim().to_string(), content.trim().to_string())
+        }
+    } else {
+        // No endofprompt found, treat entire text as content
+        (String::new(), text.to_string())
+    }
+}
 
 pub fn ensure_prompt_prefix(text: &str) -> String {
     if text.contains("<|endofprompt|>") {
@@ -24,8 +60,16 @@ pub fn text_normalize_english(
     split: bool,
     text_frontend: bool,
 ) -> Result<Vec<String>> {
+    // First, clean out any special tokens that shouldn't be spoken
+    let cleaned_text = clean_special_tokens(text);
+
+    // If text is empty after cleaning, return empty
+    if cleaned_text.trim().is_empty() {
+        return Ok(if split { vec![] } else { vec![] });
+    }
+
     let token_len = |t: &str| token_count(tokenizer, t);
-    text_normalize_english_with_counter(text, &token_len, split, text_frontend)
+    text_normalize_english_with_counter(&cleaned_text, &token_len, split, text_frontend)
 }
 
 fn text_normalize_english_with_counter<F>(
@@ -75,6 +119,7 @@ where
         EN_MERGE_LEN,
         false,
     )?;
+    // EN_PREFIX is now empty to prevent <|en|> from being spoken
     texts = texts
         .into_iter()
         .map(|t| format!("{EN_PREFIX}{t}"))
@@ -154,8 +199,8 @@ fn spell_number_full(currency: &str, integer_part: &str, decimal_part: &str) -> 
         for c in decimal_part.chars() {
             // spell each digit
             if let Some(d) = c.to_digit(10) {
-                 words.push(' ');
-                 words.push_str(unit_word(d as u16));
+                words.push(' ');
+                words.push_str(unit_word(d as u16));
             }
         }
     }
@@ -163,9 +208,9 @@ fn spell_number_full(currency: &str, integer_part: &str, decimal_part: &str) -> 
     if currency == "$" {
         // verify plural
         if int_val == 1 && decimal_part.is_empty() {
-             words.push_str(" dollar");
+            words.push_str(" dollar");
         } else {
-             words.push_str(" dollars");
+            words.push_str(" dollars");
         }
     }
 
@@ -396,7 +441,7 @@ mod tests {
     fn normalize_english_adds_prefix_and_spells_numbers() -> Result<()> {
         let counter = |t: &str| Ok(t.split_whitespace().count());
         let out = text_normalize_english_with_counter("I have 2 dogs.", &counter, true, true)?;
-        assert_eq!(out, vec!["<|en|>I have two dogs ."]);
+        assert_eq!(out, vec!["I have two dogs ."]);
         Ok(())
     }
 
@@ -417,7 +462,7 @@ mod tests {
     fn test_decimal_numbers() -> Result<()> {
         let counter = |t: &str| Ok(t.split_whitespace().count());
         let out = text_normalize_english_with_counter("It is 3.14 value.", &counter, true, true)?;
-        assert_eq!(out, vec!["<|en|>It is three point one four value ."]);
+        assert_eq!(out, vec!["It is three point one four value ."]);
         Ok(())
     }
 
@@ -425,10 +470,10 @@ mod tests {
     fn test_currency() -> Result<()> {
         let counter = |t: &str| Ok(t.split_whitespace().count());
         let out = text_normalize_english_with_counter("Costs $5.", &counter, true, true)?;
-        assert_eq!(out, vec!["<|en|>Costs five dollars ."]);
+        assert_eq!(out, vec!["Costs five dollars ."]);
 
         let out2 = text_normalize_english_with_counter("$1 price.", &counter, true, true)?;
-        assert_eq!(out2, vec!["<|en|>one dollar price ."]);
+        assert_eq!(out2, vec!["one dollar price ."]);
         Ok(())
     }
 
@@ -436,7 +481,7 @@ mod tests {
     fn test_punctuation_spacing() -> Result<()> {
         let counter = |t: &str| Ok(t.split_whitespace().count());
         let out = text_normalize_english_with_counter("Hello,world!", &counter, true, true)?;
-        assert_eq!(out, vec!["<|en|>Hello , world !"]);
+        assert_eq!(out, vec!["Hello , world !"]);
         Ok(())
     }
 }

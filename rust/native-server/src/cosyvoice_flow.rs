@@ -6,7 +6,7 @@
 //! 3. Speaker embedding projection
 //! 4. DiT decoder with ODE solver
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::{
     conv1d, embedding, linear, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder,
 };

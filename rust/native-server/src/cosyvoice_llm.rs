@@ -148,7 +148,8 @@ impl CosyVoiceLLM {
     ) -> Result<Self> {
         // Load speech embedding using weights to infer vocab size.
         info!("Loading speech_embedding from top-level...");
-        let speech_emb_weight = vb.pp("speech_embedding").get_unchecked("weight")?;
+        let target_vocab_size = llm_config.speech_token_size + llm_config.stop_token_count;
+        let speech_emb_weight = vb.pp("speech_embedding").get((target_vocab_size, llm_config.llm_input_size), "weight")?.to_dtype(vb.dtype())?;
         let (speech_vocab_size, speech_emb_dim) = speech_emb_weight.dims2()?;
         if speech_emb_dim != llm_config.llm_input_size {
             return Err(candle_core::Error::msg(format!(
@@ -167,7 +168,7 @@ impl CosyVoiceLLM {
 
         // Load decoder head (weight is transposed: [vocab_size, hidden_size])
         info!("Loading llm_decoder from top-level...");
-        let decoder_weight = vb.pp("llm_decoder").get_unchecked("weight")?;
+        let decoder_weight = vb.pp("llm_decoder").get((speech_vocab_size, llm_config.llm_output_size), "weight")?.to_dtype(vb.dtype())?;
         let (decoder_vocab_size, decoder_hidden) = decoder_weight.dims2()?;
         if decoder_hidden != llm_config.llm_output_size {
             return Err(candle_core::Error::msg(format!(
@@ -200,11 +201,10 @@ impl CosyVoiceLLM {
         }
 
         // Match Python Qwen2LM logic: Always use llm_embedding for SOS/TaskID if it exists.
-        // Python: self.llm_embedding = torch.nn.Embedding(2, llm_input_size)
-        // self.sos = 0, self.task_id = 1
+        // For CosyVoice3, llm_embedding does not exist, and special tokens are in speech_embedding.
 
-        let llm_embedding = if vb.pp("llm_embedding").contains_tensor("weight") {
-            let llm_emb_weight = vb.pp("llm_embedding").get_unchecked("weight")?;
+        let (llm_embedding, use_speech_special_tokens, sos, task_id) = if vb.pp("llm_embedding").contains_tensor("weight") {
+            let llm_emb_weight = vb.pp("llm_embedding").get((2, llm_config.llm_input_size), "weight")?.to_dtype(vb.dtype())?;
             let (_llm_vocab_size, llm_emb_dim) = llm_emb_weight.dims2()?;
             if llm_emb_dim != llm_config.llm_input_size {
                 return Err(candle_core::Error::msg(format!(
@@ -212,17 +212,11 @@ impl CosyVoiceLLM {
                     llm_config.llm_input_size, llm_emb_dim
                 )));
             }
-             Embedding::new(llm_emb_weight, llm_config.llm_input_size)
+             (Some(Embedding::new(llm_emb_weight, llm_config.llm_input_size)), false, 0, 1)
         } else {
-             // Fallback or error? For CosyVoice3 it should exist.
-             debug!("Creating llm_embedding (2 tokens) via fallback...");
-             create_random_embedding(2, llm_config.llm_input_size, &device)?
+             // CosyVoice3 logic: indices 6561 (SOS) and 6563 (TaskID) in speech_embedding
+             (None, true, llm_config.sampling_vocab_size, llm_config.sampling_vocab_size + 2)
         };
-
-        // We assume we always use llm_embedding for SOS/TaskID as per Python Qwen2LM
-        let use_speech_special_tokens = false;
-        let sos = 0;
-        let task_id = 1;
 
         // Load spk_embed_affine_layer (try both 'llm.spk...' and 'spk...')
         // The patched file has 'llm.spk_embed_affine_layer', but logically it should be top-level.
@@ -232,13 +226,13 @@ impl CosyVoiceLLM {
             "spk_embed_affine_layer"
         };
         info!("Loading spk_embed_affine_layer from {}...", spk_prefix);
-        let spk_affine_weight = vb.pp(spk_prefix).get_unchecked("weight")?;
-        let spk_affine_bias = vb.pp(spk_prefix).get_unchecked("bias")?;
+        let spk_affine_weight = vb.pp(spk_prefix).get((llm_config.llm_input_size, llm_config.spk_embed_dim), "weight")?.to_dtype(vb.dtype())?;
+        let spk_affine_bias = vb.pp(spk_prefix).get(llm_config.llm_input_size, "bias")?.to_dtype(vb.dtype())?;
         let spk_embed_affine_layer = Linear::new(spk_affine_weight, Some(spk_affine_bias));
 
         Ok(Self {
             llm,
-            llm_embedding: Some(llm_embedding),
+            llm_embedding,
             speech_embedding,
             spk_embed_affine_layer,
             llm_decoder,
@@ -257,13 +251,17 @@ impl CosyVoiceLLM {
     fn get_sos_emb(&self) -> Result<Tensor> {
         let idx = Tensor::new(&[self.sos as u32], &self.device)?;
         if self.use_speech_special_tokens {
-            self.speech_embedding.forward(&idx)?.unsqueeze(0)
+            let emb = self.speech_embedding.forward(&idx)?.unsqueeze(0)?;
+            println!("LLM: Using speech special token sos={} (norm: {:?})", self.sos, emb.to_dtype(candle_core::DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            Ok(emb)
         } else {
-            self.llm_embedding
+            let emb = self.llm_embedding
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("llm_embedding missing"))?
                 .forward(&idx)?
-                .unsqueeze(0)
+                .unsqueeze(0)?;
+            println!("LLM: Using llm_embedding sos={} (norm: {:?})", self.sos, emb.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            Ok(emb)
         }
     }
 
@@ -271,13 +269,17 @@ impl CosyVoiceLLM {
     fn get_task_id_emb(&self) -> Result<Tensor> {
         let idx = Tensor::new(&[self.task_id as u32], &self.device)?;
         if self.use_speech_special_tokens {
-            self.speech_embedding.forward(&idx)?.unsqueeze(0)
+            let emb = self.speech_embedding.forward(&idx)?.unsqueeze(0)?;
+            println!("LLM: Using speech special token task_id={} (norm: {:?})", self.task_id, emb.to_dtype(candle_core::DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            Ok(emb)
         } else {
-            self.llm_embedding
+            let emb = self.llm_embedding
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("llm_embedding missing"))?
                 .forward(&idx)?
-                .unsqueeze(0)
+                .unsqueeze(0)?;
+            println!("LLM: Using llm_embedding task_id={} (norm: {:?})", self.task_id, emb.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            Ok(emb)
         }
     }
 
@@ -485,10 +487,21 @@ impl CosyVoiceLLM {
         let mut seqlen_offset = 0;
 
         for i in 0..max_len {
+            // Generate causal mask for current input
+            let seq_len = lm_input.dim(1)?;
+            let mask = if seq_len > 1 {
+                let mask: Vec<_> = (0..seq_len)
+                    .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
+                    .collect();
+                Some(Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?.to_dtype(lm_input.dtype())?)
+            } else {
+                None
+            };
+
             // Forward pass through LLM
             let y_pred = self
                 .llm
-                .forward_embeds(&lm_input, seqlen_offset, None)?;
+                .forward_embeds(&lm_input, seqlen_offset, mask.as_ref())?;
 
             // Get logits from last position
             let logits = self.llm_decoder.forward(&y_pred.i((
@@ -523,14 +536,42 @@ impl CosyVoiceLLM {
 
         Ok(out_tokens)
     }
-}
+    pub fn debug_forward_one(
+        &mut self,
+        text_embeds: &Tensor,
+        prompt_speech_tokens: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.llm.clear_kv_cache();
+        let sos_emb = self.get_sos_emb()?;
+        let task_id_emb = self.get_task_id_emb()?;
+        let dtype = self.llm_decoder.weight().dtype();
+        let sos_emb = sos_emb.to_dtype(dtype)?;
+        let text_embeds = text_embeds.to_dtype(dtype)?;
+        let task_id_emb = task_id_emb.to_dtype(dtype)?;
 
-/// Create a random embedding layer (for weights not in safetensors)
-fn create_random_embedding(
-    vocab_size: usize,
-    hidden_size: usize,
-    device: &Device,
-) -> Result<Embedding> {
-    let weight = Tensor::randn(0.0f32, 0.02, (vocab_size, hidden_size), device)?;
-    Ok(Embedding::new(weight, hidden_size))
+        let mut parts = vec![sos_emb, text_embeds.clone(), task_id_emb];
+        if let Some(prompt_tokens) = prompt_speech_tokens {
+            if prompt_tokens.dim(1)? > 0 {
+                let prompt_emb = self.embed_speech_tokens(prompt_tokens)?.to_dtype(dtype)?;
+                parts.push(prompt_emb);
+            }
+        }
+        let lm_input = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?;
+
+        // Generate causal mask
+        let seq_len = lm_input.dim(1)?;
+        let mask = if seq_len > 1 {
+            let mask: Vec<_> = (0..seq_len)
+                .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
+                .collect();
+            Some(Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?.to_dtype(dtype)?)
+        } else {
+            None
+        };
+
+        // Forward
+        let y_pred = self.llm.forward_embeds(&lm_input, 0, mask.as_ref())?;
+        let logits = self.llm_decoder.forward(&y_pred.i((.., y_pred.dim(1)? - 1..y_pred.dim(1)?, ..))?)?;
+        Ok(logits)
+    }
 }

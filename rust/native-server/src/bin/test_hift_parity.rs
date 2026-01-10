@@ -44,17 +44,20 @@ fn main() -> Result<()> {
     let artifacts = candle_core::safetensors::load(&args.artifacts_path, &Device::Cpu)?;
 
     let mel = artifacts.get("python_flow_output").context("python_flow_output not found")?;
-    let expected_audio = artifacts.get("python_hift_audio").context("python_hift_audio not found")?;
+    let expected_audio = artifacts.get("python_audio_output").context("python_audio_output not found")?;
+    let python_source = artifacts.get("python_hift_source").context("python_hift_source not found")?;
 
     println!("  mel (input): {:?}", mel.shape());
     println!("  expected_audio: {:?}", expected_audio.shape());
+    println!("  python_source (injected): {:?}", python_source.shape());
 
-    // Move mel to device and convert to dtype
+    // Move to device and convert to dtype
     let mel = mel.to_dtype(dtype)?.to_device(&device)?;
+    let python_source = python_source.to_dtype(dtype)?.to_device(&device)?;
 
     // Run HiFT
-    println!("\nRunning HiFT inference...");
-    let generated_audio = hift.forward(&mel)?;
+    println!("\nRunning HiFT inference with injected source...");
+    let (generated_audio, _) = hift.forward_with_injected_source(&mel, &python_source)?;
 
     println!("  generated_audio shape: {:?}", generated_audio.shape());
 
