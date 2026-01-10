@@ -194,26 +194,11 @@ class CosyVoice3:
         """
         Zero-shot voice cloning inference.
 
-        Args:
-            tts_text: Text to synthesize
-            prompt_text: Transcription of prompt audio (include instruction prefix for better results)
-            prompt_wav: Path to prompt audio file (reference voice)
-            zero_shot_spk_id: Optional saved speaker ID to use instead of prompt_wav
-            stream: Enable streaming output
-            speed: Playback speed adjustment
-            text_frontend: Apply text normalization
-
-        Yields:
-            dict: Contains 'tts_speech' tensor
-        """
-        prompt_text = self.frontend.text_normalize(
-            prompt_text, split=False, text_frontend=text_frontend
-        )
-        for i in tqdm(
-            self.frontend.text_normalize(
-                tts_text, split=True, text_frontend=text_frontend
-            )
-        ):
+    def inference_zero_shot(self, tts_text, prompt_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        if self.__class__.__name__ == 'CosyVoice3' and '<|endofprompt|>' not in prompt_text + tts_text:
+            logging.warning('<|endofprompt|> not found in CosyVoice3 inference, check your input text')
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             if (not isinstance(i, Generator)) and len(i) < 0.5 * len(prompt_text):
                 logging.warning(
                     "synthesis text %s too short than prompt text %s, this may lead to bad performance",

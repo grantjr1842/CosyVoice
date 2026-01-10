@@ -74,6 +74,7 @@ def generate_audio(
     else:
         prompt_wav = None
 
+
     # Validation for instruction mode
     if mode_checkbox_group == "Instruct":
         if instruct_text == "":

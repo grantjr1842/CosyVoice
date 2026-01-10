@@ -26,6 +26,7 @@ from concurrent import futures
 import cosyvoice_pb2
 import cosyvoice_pb2_grpc
 
+
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 import grpc
 import numpy as np
