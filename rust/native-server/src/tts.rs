@@ -267,7 +267,7 @@ impl NativeTtsEngine {
             prompt_tokens,
             &prompt_mel.to_dtype(self.dtype)?,
             &speaker_embedding.to_dtype(self.dtype)?,
-            10, // n_timesteps
+            1, // n_timesteps - Python CausalMaskedDiffWithDiT uses 1 (ADR-006)
             flow_noise.map(|t| t.to_dtype(self.dtype)).transpose()?.as_ref(),
         )?;
         if debug {
@@ -406,6 +406,53 @@ impl NativeTtsEngine {
     ///
     /// # Returns
     /// Audio samples as i16
+    pub fn synthesize_flow_hift(
+        &mut self,
+        speech_tokens: &Tensor,
+        prompt_tokens: &Tensor,
+        prompt_mel: &Tensor,
+        speaker_embedding: &Tensor,
+    ) -> Result<Vec<i16>, NativeTtsError> {
+        let debug = true;
+
+        // 1. Run Flow to get mel spectrogram
+        if debug {
+            eprintln!("\n--- Running Flow inference (Forced Tokens)... ---");
+        }
+        let mel = self.flow.inference(
+            speech_tokens,
+            prompt_tokens,
+            &prompt_mel.to_dtype(self.dtype)?,
+            &speaker_embedding.to_dtype(self.dtype)?,
+            1, // n_timesteps - Python CausalMaskedDiffWithDiT uses 1 (ADR-006)
+            None,
+        )?;
+        if debug {
+            eprintln!("Flow output shape: {:?}", mel.shape());
+            //print_tensor_stats("flow_output_mel", &mel);
+        }
+
+        // 2. Run HiFT to get audio
+        if debug {
+            eprintln!("\n--- Running HiFT inference... ---");
+        }
+        let audio = self.hift.forward(&mel)?;
+        if debug {
+            eprintln!("HiFT audio shape: {:?}", audio.shape());
+        }
+
+        let audio = audio.squeeze(0)?.squeeze(0)?;
+        let audio_vec = audio.to_vec1::<f32>()?;
+
+        // Convert to i16 PCM
+        let audio_i16: Vec<i16> = audio_vec
+            .iter()
+            .map(|x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect();
+
+        Ok(audio_i16)
+    }
+
     pub fn synthesize_full_with_prompt_len(
         &mut self,
         text_embeds: &Tensor,

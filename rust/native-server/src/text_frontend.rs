@@ -1,6 +1,7 @@
 //! Minimal text frontend utilities for native parity with Python.
 
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use tokenizers::Tokenizer;
 
 pub const PROMPT_PREFIX: &str = "You are a helpful assistant.<|endofprompt|>";
@@ -54,7 +55,14 @@ where
         return Ok(vec![String::new()]);
     }
 
+    // Pipeline: Numbers -> Punctuation -> Splitting
     let normalized = spell_out_numbers(trimmed);
+    let normalized = normalize_punctuation(&normalized);
+
+    // If split is false, return the normalized string (wrapped in a vec)
+    // Note: The Python code splits paragraphs even if split=False if Chinese,
+    // but for English with wetext it returns list.
+    // Here we replicate logic: if !split, just return the whole normalized text.
     if !split {
         return Ok(vec![normalized]);
     }
@@ -84,39 +92,84 @@ fn is_only_punctuation(text: &str) -> bool {
     if text.is_empty() {
         return true;
     }
+    // Check if string contains only punctuation/symbols/spaces
     text.chars()
         .all(|c| !c.is_alphanumeric() && !c.is_whitespace())
 }
 
-fn spell_out_numbers(text: &str) -> String {
-    let mut out = String::new();
-    let mut digits = String::new();
+fn normalize_punctuation(text: &str) -> String {
+    // Add spaces around punctuation similar to wetext/Python logic
+    // WeText often does: "Hello!" -> "Hello !"
+    // But we need to be careful with decimals (3.14) which are handled by spell_out_numbers first
 
-    for c in text.chars() {
-        if c.is_ascii_digit() {
-            digits.push(c);
-            continue;
-        }
+    // Add space before and after specific punctuation marks: ! ? , . ; :
+    // Use regex replacement.
+    let re = Regex::new(r"([!?,.;:])").unwrap();
+    let text = re.replace_all(text, " $1 ");
 
-        if !digits.is_empty() {
-            out.push_str(&spell_number_chunk(&digits));
-            digits.clear();
-        }
-        out.push(c);
-    }
-
-    if !digits.is_empty() {
-        out.push_str(&spell_number_chunk(&digits));
-    }
-
-    out
+    // Clean up multiple spaces
+    let re_spaces = Regex::new(r"\s+").unwrap();
+    re_spaces.replace_all(&text, " ").trim().to_string()
 }
 
-fn spell_number_chunk(digits: &str) -> String {
-    match digits.parse::<u64>() {
-        Ok(value) => number_to_words(value),
-        Err(_) => digits.to_string(),
+fn spell_out_numbers(text: &str) -> String {
+    // Strategy: find sequences that look like numbers (including decimals, currency)
+    // Regex: \$?\d+(?:\.\d+)?
+    // \$?       : Optional currency symbol
+    // \d+       : Integer part
+    // (?:\.\d+)? : Optional decimal part
+
+    let re = Regex::new(r"(\$?)(\d+)(?:\.(\d+))?").unwrap();
+
+    let mut new_text = String::new();
+    let mut last_match_end = 0;
+
+    for cap in re.captures_iter(text) {
+        let entire_match = cap.get(0).unwrap();
+        let range = entire_match.range();
+
+        // Append text before match
+        new_text.push_str(&text[last_match_end..range.start]);
+
+        let currency = cap.get(1).map_or("", |m| m.as_str());
+        let integer_part = cap.get(2).map_or("", |m| m.as_str());
+        let decimal_part = cap.get(3).map_or("", |m| m.as_str());
+
+        let spelled = spell_number_full(currency, integer_part, decimal_part);
+        new_text.push_str(&spelled);
+
+        last_match_end = range.end;
     }
+
+    new_text.push_str(&text[last_match_end..]);
+    new_text
+}
+
+fn spell_number_full(currency: &str, integer_part: &str, decimal_part: &str) -> String {
+    let int_val = integer_part.parse::<u64>().unwrap_or(0);
+    let mut words = number_to_words(int_val);
+
+    if !decimal_part.is_empty() {
+        words.push_str(" point");
+        for c in decimal_part.chars() {
+            // spell each digit
+            if let Some(d) = c.to_digit(10) {
+                 words.push(' ');
+                 words.push_str(unit_word(d as u16));
+            }
+        }
+    }
+
+    if currency == "$" {
+        // verify plural
+        if int_val == 1 && decimal_part.is_empty() {
+             words.push_str(" dollar");
+        } else {
+             words.push_str(" dollars");
+        }
+    }
+
+    words
 }
 
 fn number_to_words(value: u64) -> String {
@@ -343,7 +396,7 @@ mod tests {
     fn normalize_english_adds_prefix_and_spells_numbers() -> Result<()> {
         let counter = |t: &str| Ok(t.split_whitespace().count());
         let out = text_normalize_english_with_counter("I have 2 dogs.", &counter, true, true)?;
-        assert_eq!(out, vec!["<|en|>I have two dogs."]);
+        assert_eq!(out, vec!["<|en|>I have two dogs ."]);
         Ok(())
     }
 
@@ -357,6 +410,33 @@ mod tests {
             true,
         )?;
         assert_eq!(out, vec!["Please speak.<|endofprompt|>Test."]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_numbers() -> Result<()> {
+        let counter = |t: &str| Ok(t.split_whitespace().count());
+        let out = text_normalize_english_with_counter("It is 3.14 value.", &counter, true, true)?;
+        assert_eq!(out, vec!["<|en|>It is three point one four value ."]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_currency() -> Result<()> {
+        let counter = |t: &str| Ok(t.split_whitespace().count());
+        let out = text_normalize_english_with_counter("Costs $5.", &counter, true, true)?;
+        assert_eq!(out, vec!["<|en|>Costs five dollars ."]);
+
+        let out2 = text_normalize_english_with_counter("$1 price.", &counter, true, true)?;
+        assert_eq!(out2, vec!["<|en|>one dollar price ."]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_punctuation_spacing() -> Result<()> {
+        let counter = |t: &str| Ok(t.split_whitespace().count());
+        let out = text_normalize_english_with_counter("Hello,world!", &counter, true, true)?;
+        assert_eq!(out, vec!["<|en|>Hello , world !"]);
         Ok(())
     }
 }

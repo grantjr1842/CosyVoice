@@ -91,6 +91,7 @@ fn main() -> Result<()> {
     let mel_len = prompt_speech_24k.dim(2)?;
     let token_len = prompt_speech_tokens.dim(1)?;
     let aligned_token_len = usize::min(mel_len / 2, token_len);
+    println!("DEBUG: mel_len={}, token_len={}, aligned_token_len={}", mel_len, token_len, aligned_token_len);
     if aligned_token_len == 0 {
         return Err(anyhow!("Prompt token length is zero after alignment"));
     }
@@ -179,14 +180,69 @@ fn main() -> Result<()> {
                 &device,
             )?;
             let text_embeds = engine.llm.embed_text_tokens(&text_tensor)?;
-            let audio_samples = engine.synthesize_full_with_prompt_len(
-                &text_embeds,
-                prompt_tokens.len(),
-                Some(&prompt_speech_tokens),
-                &prompt_speech_24k,
-                &speaker_embedding,
-                25,
-            )?;
+
+            // Check for forced Python speech tokens (from debug_artifacts.safetensors)
+            let forced_speech_tokens = if std::path::Path::new("debug_artifacts.safetensors").exists() {
+                let tensors = candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
+                if let Some(py_st) = tensors.get("python_speech_tokens") {
+                     println!("=== DEBUG: USING FORCED PYTHON SPEECH TOKENS FROM ARTIFACT ===");
+                     // Python shape [1, N]. Rust needs [1, N].
+                     Some(py_st.to_dtype(candle_core::DType::U32)?.to_device(&device)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let audio_samples = if let Some(speech_tokens) = forced_speech_tokens {
+                 // Skip LLM, run Flow + HiFT directly
+                 println!("Skipping LLM generation, using {} forced tokens.", speech_tokens.dim(1)?);
+
+                 // Flow Inference
+                 // speech_tokens: [1, N]
+                 // prompt_tokens: prompt_tokens vector -> Tensor [1, P]
+                 // Flow inputs
+                 let prompt_mel = &prompt_speech_24k; // 80-dim mel
+                 let flow_embed = &speaker_embedding;
+
+                 // Run Flow
+                 // Note: tts.rs synthesizes full flow. We replicate logic here or reuse engine methods?
+                 // engine.flow is public? No, usually private.
+                 // But NativeTtsEngine fields are usually public in this crate?
+                 // Let's check cosyvoice-native-server/src/tts.rs definition.
+                 // If not public, we might need to modify tts.rs or use a method.
+                 // Wait, `process_prompt_tensors` was available.
+                 // Let's assume `engine.flow` is accessible for now (crate visibility?).
+                 // If not, I'll need to make it public.
+
+                 // ERROR: `engine` fields might be private.
+                 // Changing strategy: Modify `native_example.rs` assuming public access,
+                 // if fails, I will edit `tts.rs` to make fields public.
+
+                 // For now, let's try to call a new method on engine `synthesize_flow_hift`?
+                 // Or just assume I can access fields.
+
+                 // Actually, `synthesize_full_with_prompt_len` is high level.
+                 // I will assume for this "Deep Dive" I can modify `tts.rs` to add a `debug_synthesize_from_tokens` method.
+                 // That's cleaner.
+                 engine.synthesize_flow_hift(
+                     &speech_tokens,
+                     &prompt_speech_tokens,
+                     prompt_mel,
+                     flow_embed
+                 )?
+            } else {
+                engine.synthesize_full_with_prompt_len(
+                    &text_embeds,
+                    prompt_tokens.len(),
+                    Some(&prompt_speech_tokens),
+                    &prompt_speech_24k,
+                    &speaker_embedding,
+                    25,
+                )?
+            };
+            println!("DEBUG: Generated audio duration: {:.2}s", audio_samples.len() as f32 / engine.sample_rate as f32);
 
             let output_path =
                 output_dir.join(format!("native_voice_clone_{}_{}.wav", idx, seg_idx));

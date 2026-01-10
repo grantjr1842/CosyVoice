@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let artifacts = candle_core::safetensors::load(&args.artifacts_path, &Device::Cpu)?;
 
     let mel = artifacts.get("python_flow_output").context("python_flow_output not found")?;
-    let expected_audio = artifacts.get("python_audio_output").context("python_audio_output not found")?;
+    let expected_audio = artifacts.get("python_hift_audio").context("python_hift_audio not found")?;
 
     println!("  mel (input): {:?}", mel.shape());
     println!("  expected_audio: {:?}", expected_audio.shape());

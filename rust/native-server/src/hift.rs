@@ -310,7 +310,7 @@ fn get_padding(kernel_size: usize, dilation: usize) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_conv1d(
+pub fn load_conv1d(
     vb: VarBuilder,
     in_c: usize,
     out_c: usize,
@@ -552,6 +552,18 @@ pub struct F0Predictor {
     classifier: candle_nn::Linear,
 }
 
+fn conv1d_to_cpu(conv: &Conv1d) -> Result<Conv1d> {
+    let w = conv.weight().to_device(&Device::Cpu)?;
+    let b = conv.bias().map(|b| b.to_device(&Device::Cpu)).transpose()?;
+    Ok(Conv1d::new(w, b, conv.config().clone()))
+}
+
+fn linear_to_cpu(lin: &candle_nn::Linear) -> Result<candle_nn::Linear> {
+    let w = lin.weight().to_device(&Device::Cpu)?;
+    let b = lin.bias().map(|b| b.to_device(&Device::Cpu)).transpose()?;
+    Ok(candle_nn::Linear::new(w, b))
+}
+
 impl F0Predictor {
     pub fn new(in_channels: usize, cond_channels: usize, vb: VarBuilder) -> Result<Self> {
         // condnet: 5 layers of Conv1d + WeightNorm
@@ -566,42 +578,18 @@ impl F0Predictor {
             let k = if i == 0 { 4 } else { 3 };
             let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, 0, &format!("f0_cond_{}", i))?;
 
-            // Log weight and bias stats for each layer
-            let w = layer.weight();
-            if let Ok(flat) = w.flatten_all() {
-                if let Ok(vec) = flat.to_vec1::<f32>() {
-                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                    debug!(
-                        "    [F0Predictor] Layer {} weights: min={:.6}, max={:.6}, mean={:.6}",
-                        i, min, max, mean
-                    );
-                }
-            }
-            if let Some(bias) = layer.bias() {
-                if let Ok(flat) = bias.flatten_all() {
-                    if let Ok(vec) = flat.to_vec1::<f32>() {
-                        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                        debug!(
-                            "    [F0Predictor] Layer {} bias: min={:.6}, max={:.6}, mean={:.6}",
-                            i, min, max, mean
-                        );
-                    }
-                }
-            }
-
-            condnet.push(layer);
+            // Move to CPU
+            let layer_cpu = conv1d_to_cpu(&layer)?;
+            condnet.push(layer_cpu);
         }
 
         // Classifier
         let classifier = candle_nn::linear(cond_channels, 1, vb.pp("classifier"))?;
+        let classifier_cpu = linear_to_cpu(&classifier)?;
 
         Ok(Self {
             condnet,
-            classifier,
+            classifier: classifier_cpu,
         })
     }
 
@@ -856,7 +844,13 @@ impl HiFTGenerator {
         stages.insert("input_mel".to_string(), mel.clone());
 
         // 1. F0 Predictor
-        let f0 = self.f0_predictor.forward(&mel)?; // [Batch, 1, Length_f0]
+        // Python: self.f0_predictor.to('cpu') inside inference.
+        // We replicate this by moving input to CPU, running inference, and moving back.
+        // This avoids potential GPU nondeterminism with small tensors / specific ops.
+        let mel_cpu = mel.to_device(&Device::Cpu)?;
+        let f0_cpu = self.f0_predictor.forward(&mel_cpu)?; // [Batch, 1, Length_f0]
+        let f0 = f0_cpu.to_device(mel.device())?;
+
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
         stages.insert("f0".to_string(), f0.clone());
@@ -989,11 +983,9 @@ impl HiFTGenerator {
                 si_in = si_in.pad_with_zeros(2, pad, 0)?;
             }
             if i == 0 {
-                debug!("[SourceDown 0] si_in shape: {:?}, stride: {}, kernel: {}", si_in.shape(), 15, 30);
             }
             let si = self.source_downs[idx].forward(&si_in)?;
             if i == 0 {
-                debug!("[SourceDown 0] si shape: {:?}", si.shape());
             }
             stages.insert(format!("source_down_out_{}", i), si.clone());
             let si = self.source_resblocks[idx].forward_with_stages(&si, Some(&format!("si_res_{}", i)), &mut stages)?;
@@ -1003,12 +995,13 @@ impl HiFTGenerator {
             let x_len = x.dim(2)?;
             let si_len = si.dim(2)?;
 
-            let common_len = x_len.min(si_len);
-            let x_slice = x.i((.., .., ..common_len))?;
-            let si_slice = si.i((.., .., ..common_len))?;
+            let check_len = x_len.min(si_len);
+            let x_slice = x.i((.., .., ..check_len))?;
+            let si_slice = si.i((.., .., ..check_len))?;
 
             x = x_slice.add(&si_slice)?;
-            stages.insert(format!("after_fusion_{}", i), x.clone());
+            stages.insert(format!("loop{}_si", i), si_slice);
+            stages.insert(format!("loop{}_x", i), x.clone());
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
@@ -1063,7 +1056,6 @@ impl HiFTGenerator {
         // NOTE: Python does NOT remove DC offset, so this is commented out
         // let mean_tensor = audio.mean(2)?.broadcast_as(audio.shape())?;
         // let audio = (audio - mean_tensor)?;
-
         // Clamp audio to [-audio_limit, audio_limit] like Python does
         // Python: x = torch.clamp(x, -self.audio_limit, self.audio_limit) where audio_limit = 0.99
         let audio_limit = 0.99f32;
