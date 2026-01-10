@@ -57,5 +57,5 @@ cuda = [
     "candle-nn/cuda",
     "candle-transformers/cuda",
     "candle-kernels",
-    "flash-attn",
+    # "flash-attn", # Disabled for compatibility with non-Ampere GPUs (e.g. T4)
 ]

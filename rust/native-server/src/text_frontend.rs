@@ -199,8 +199,9 @@ fn spell_out_numbers(text: &str) -> String {
         out.push_str(&spell_number_simple(digits));
     }
 
-    // Apply punctuation normalization after number spelling
-    normalize_punctuation(&out)
+    // NOTE: Previously called normalize_punctuation but Python's wetext doesn't
+    // add spaces around punctuation, so we skip this step for parity.
+    out
 }
 
 fn spell_number_simple(digits: &str) -> String {

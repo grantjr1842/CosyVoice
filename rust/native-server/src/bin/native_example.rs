@@ -99,10 +99,12 @@ fn main() -> Result<()> {
     prompt_speech_24k = prompt_speech_24k.narrow(2, 0, aligned_token_len * 2)?;
     prompt_speech_tokens = prompt_speech_tokens.narrow(1, 0, aligned_token_len)?;
 
-    let use_debug_artifacts =
-        std::env::var("COSYVOICE_USE_DEBUG_ARTIFACTS").map(|v| v != "0").unwrap_or(false);
-    let force_tts_tokens =
-        std::env::var("COSYVOICE_FORCE_TTS_TOKENS").map(|v| v != "0").unwrap_or(false);
+    let use_debug_artifacts = std::env::var("COSYVOICE_USE_DEBUG_ARTIFACTS")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    let force_tts_tokens = std::env::var("COSYVOICE_FORCE_TTS_TOKENS")
+        .map(|v| v != "0")
+        .unwrap_or(false);
     let debug_artifacts_path = Path::new("debug_artifacts.safetensors");
     let debug_artifacts = if use_debug_artifacts && debug_artifacts_path.exists() {
         println!("\n*** LOADING DEBUG ARTIFACTS FROM PYTHON ***");
@@ -145,7 +147,7 @@ fn main() -> Result<()> {
     }
 
     let texts = [
-        "Hello! I am an AI voice assistant powered by Fun-CosyVoice3. How may I help you today?",
+        "Hello! This is a test for parity verification.",
         "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet.",
     ];
 

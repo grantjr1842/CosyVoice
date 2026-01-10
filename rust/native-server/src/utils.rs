@@ -114,8 +114,137 @@ impl StftModule {
 }
 
 use candle_nn::{ConvTranspose1d, ConvTranspose1dConfig, Module};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 pub struct InverseStftModule {
+    n_fft: usize,
+    hop_length: usize,
+    window: Vec<f32>,
+    center: bool,
+    device: Device,
+}
+
+impl InverseStftModule {
+    pub fn new(n_fft: usize, hop_length: usize, center: bool, device: &Device) -> Result<Self> {
+        let window_cpu = hann_window(n_fft, &Device::Cpu)?;
+        let window_vec = window_cpu.to_vec1::<f32>()?;
+
+        // Debug: print first few window values
+        eprintln!(
+            "    [InverseStftModule] DC Weights (Re): {:?}",
+            &window_vec[0..n_fft.min(16)]
+        );
+
+        Ok(Self {
+            n_fft,
+            hop_length,
+            window: window_vec,
+            center,
+            device: device.clone(),
+        })
+    }
+
+    /// Proper ISTFT using iRFFT + overlap-add, matching torch.istft
+    /// Input: Magnitude, Phase [Batch, Freq, Frames]
+    /// Output: Audio [Batch, 1, Time]
+    pub fn forward(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Tensor> {
+        let device = magnitude.device();
+        let (batch, n_freq, frames) = magnitude.dims3()?;
+
+        if n_freq != self.n_fft / 2 + 1 {
+            return Err(candle_core::Error::Msg(format!(
+                "ISTFT: expected {} freq bins, got {}",
+                self.n_fft / 2 + 1,
+                n_freq
+            )));
+        }
+
+        let real = magnitude.broadcast_mul(&phase.cos()?)?;
+        let imag = magnitude.broadcast_mul(&phase.sin()?)?;
+
+        // Move to CPU
+        let real_cpu = real
+            .to_device(&Device::Cpu)?
+            .to_dtype(candle_core::DType::F32)?;
+        let imag_cpu = imag
+            .to_device(&Device::Cpu)?
+            .to_dtype(candle_core::DType::F32)?;
+        let real_vec: Vec<f32> = real_cpu.flatten_all()?.to_vec1()?;
+        let imag_vec: Vec<f32> = imag_cpu.flatten_all()?.to_vec1()?;
+
+        let out_len = (frames - 1) * self.hop_length + self.n_fft;
+        let mut output = vec![0.0f32; batch * out_len];
+
+        // Pre-compute window sum for normalization (NOLA) - computed once as it's the same for all batches
+        let mut window_sum = vec![0.0f32; out_len];
+        for frame in 0..frames {
+            let start = frame * self.hop_length;
+            for i in 0..self.n_fft {
+                if start + i < out_len {
+                    window_sum[start + i] += self.window[i] * self.window[i];
+                }
+            }
+        }
+
+        // Setup full complex iFFT using rustfft
+        let mut planner = FftPlanner::<f32>::new();
+        let ifft = planner.plan_fft_inverse(self.n_fft);
+        let mut scratch = vec![Complex::new(0.0f32, 0.0f32); ifft.get_inplace_scratch_len()];
+        let scale = 1.0 / self.n_fft as f32;
+
+        for b in 0..batch {
+            for frame in 0..frames {
+                // Construct spectrum
+                let mut spectrum = Vec::with_capacity(self.n_fft);
+
+                // 0..n_freq
+                for k in 0..n_freq {
+                    let idx = (b * n_freq * frames) + (k * frames) + frame;
+                    spectrum.push(Complex::new(real_vec[idx], imag_vec[idx]));
+                }
+
+                // Conjugates n_freq-2 down to 1 (reconstruct full Hermitian spectrum)
+                for k in (1..self.n_fft / 2).rev() {
+                    let src_idx = (b * n_freq * frames) + (k * frames) + frame;
+                    spectrum.push(Complex::new(real_vec[src_idx], -imag_vec[src_idx]));
+                }
+
+                ifft.process_with_scratch(&mut spectrum, &mut scratch);
+
+                // Overlap-add
+                let start = frame * self.hop_length;
+                for (i, c) in spectrum.iter().enumerate() {
+                    let val = c.re * scale;
+                    output[b * out_len + start + i] += val * self.window[i];
+                }
+            }
+
+            // Normalize by window sum (NOLA)
+            for i in 0..out_len {
+                let ws = window_sum[i];
+                if ws > 1e-8 {
+                    output[b * out_len + i] /= ws;
+                }
+            }
+        }
+
+        let pad = self.n_fft / 2;
+        let mut trimmed = Vec::with_capacity(batch * ((frames - 1) * self.hop_length));
+
+        for b in 0..batch {
+            let start = b * out_len + pad;
+            let trimmed_len = out_len - 2 * pad;
+            trimmed.extend_from_slice(&output[start..start + trimmed_len]);
+        }
+
+        let out_t = trimmed.len() / batch;
+        Tensor::from_vec(trimmed, (batch, out_t), device)
+    }
+}
+
+/// Old ConvTranspose-based ISTFT (kept for reference/comparison)
+#[allow(dead_code)]
+pub struct InverseStftModuleConv {
     n_fft: usize,
     hop_length: usize,
     window: Vec<f32>,
@@ -125,9 +254,10 @@ pub struct InverseStftModule {
     _device: Device,
 }
 
-impl InverseStftModule {
+#[allow(dead_code)]
+impl InverseStftModuleConv {
     pub fn new(n_fft: usize, hop_length: usize, center: bool, device: &Device) -> Result<Self> {
-        let _window = hann_window(n_fft, device)?; // [n_fft]
+        let _window = hann_window(n_fft, device)?;
         let window_cpu = hann_window(n_fft, &Device::Cpu)?;
         let window_vec = window_cpu.to_vec1::<f32>()?;
 
@@ -135,19 +265,6 @@ impl InverseStftModule {
         let mut real_weights = Vec::with_capacity(n_bins * n_fft);
         let mut imag_weights = Vec::with_capacity(n_bins * n_fft);
 
-        // We construct weights for ConvTranspose1d: [InCh, OutCh/Group, Kernel]
-        // InCh = n_bins, OutCh = 1, Kernel = n_fft.
-        // Formula: x[n] = (1/N) * sum_k (X[k] * exp(j 2pi k n / N))
-        // Real part logic:
-        // k=0, k=N/2: Re[k]*cos(...) * window
-        // 0<k<N/2: 2*Re[k]*cos(...) * window
-        // Imag part logic:
-        // k=0, k=N/2: 0 (Imag part of DC/Nyquist is 0 usually, or doesn't contribute to real signal if Hermitian)
-        // 0<k<N/2: -2*Im[k]*sin(...) * window
-
-        // Normalization: Standard ISTFT synthesis 1/n_fft.
-        // ISTFT parity test shows Rust produces ~0.4x Python amplitude with 0.41 scale.
-        // Using 1.0/n_fft as per standard IFFT definition.
         let scale = 1.0 / (n_fft as f64);
 
         for k in 0..n_bins {
@@ -155,24 +272,15 @@ impl InverseStftModule {
 
             for n in 0..n_fft {
                 let theta = 2.0 * PI * (k as f64) * (n as f64) / (n_fft as f64);
-                let win_val = 0.5 * (1.0 - (2.0 * PI * n as f64 / n_fft as f64).cos()); // Manual Hann to be sure
+                let win_val = 0.5 * (1.0 - (2.0 * PI * n as f64 / n_fft as f64).cos());
 
                 let cos_val = theta.cos() * factor * scale * win_val;
                 let sin_val = theta.sin() * factor * scale * win_val;
 
-                // For real input, we use cos basis
                 real_weights.push(cos_val as f32);
-
-                // For imag input, we use -sin basis
-                // Im[k] * (cos + j sin) -> j * Im[k] * cos - Im[k] * sin
-                // Real part is -Im[k]*sin
                 imag_weights.push((-sin_val) as f32);
             }
         }
-
-        // Debug Weights
-        eprintln!("    [InverseStftModule] DC Weights (Re): {:?}", &real_weights[0..n_fft]);
-
 
         let w_real = Tensor::from_vec(real_weights, (n_bins, 1, n_fft), device)?;
         let w_imag = Tensor::from_vec(imag_weights, (n_bins, 1, n_fft), device)?;
@@ -185,9 +293,6 @@ impl InverseStftModule {
             groups: 1,
         };
 
-        // We use using_weights directly to avoid variable creating overhead if not needed,
-        // but candle_nn::ConvTranspose1d::new expects variable or we construct struct manually.
-        // Let's construct struct manually to use fixed weights.
         let conv_real = ConvTranspose1d::new(w_real, None, cfg);
         let conv_imag = ConvTranspose1d::new(w_imag, None, cfg);
 
@@ -202,24 +307,13 @@ impl InverseStftModule {
         })
     }
 
-    /// Input: Magnitude, Phase [Batch, Freq, Frames]
-    /// Output: Audio [Batch, 1, Time]
     pub fn forward(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Tensor> {
         let real = magnitude.broadcast_mul(&phase.cos()?)?;
         let imag = magnitude.broadcast_mul(&phase.sin()?)?;
 
-        // ConvTranspose1d expects [Batch, InChannels, Time/Frames]
-        // Our input is [Batch, Freq, Frames].
-
-
-
         let y_real = self.conv_real.forward(&real)?;
         let y_imag = self.conv_imag.forward(&imag)?;
 
-
-
-
-        // Sum components
         let y = (y_real + y_imag)?;
 
         let frames = magnitude.dim(2)?;
@@ -245,8 +339,6 @@ impl InverseStftModule {
         let window_sums = window_sums.broadcast_as(y.shape())?;
         let y = y.broadcast_div(&window_sums)?;
 
-        // Output might be padded due to Centered STFT assumptions in PyTorch?
-        // Match torch.istft(center=True) by trimming n_fft/2 on both sides.
         if self.center {
             let pad = self.n_fft / 2;
             if out_len > 2 * pad {

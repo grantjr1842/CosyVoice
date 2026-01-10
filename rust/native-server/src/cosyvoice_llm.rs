@@ -9,8 +9,8 @@ use std::cmp::Ordering;
 use std::path::Path;
 use tracing::{debug, info};
 
-use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 use crate::quantized_qwen::ModelForCausalLM as QuantizedModelForCausalLM;
+use crate::qwen::{Config as QwenConfig, ModelForCausalLM};
 
 /// Configuration for CosyVoice LLM
 #[derive(Debug, Clone)]
@@ -32,8 +32,8 @@ impl Default for CosyVoiceLLMConfig {
         Self {
             llm_input_size: 896,
             llm_output_size: 896,
-            speech_token_size: 6561,  // Fun-CosyVoice3-0.5B speech token size
-            speech_extra_tokens: 25,  // CosyVoice3 special tokens (speech + 3)
+            speech_token_size: 6561, // Fun-CosyVoice3-0.5B speech token size
+            speech_extra_tokens: 25, // CosyVoice3 special tokens (speech + 3)
             sampling_vocab_size: 6561, // Fun-CosyVoice3-0.5B Flow vocab size
             spk_embed_dim: 192,
             sampling_top_p: 0.8,
@@ -57,26 +57,31 @@ impl QwenModel {
         attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         match self {
-            Self::Standard(m) => m.base_model.forward_embeds(inputs_embeds, seqlen_offset, attn_mask),
-            Self::Quantized(m) => m.base_model.forward_embeds(inputs_embeds, seqlen_offset, attn_mask),
+            Self::Standard(m) => {
+                m.base_model
+                    .forward_embeds(inputs_embeds, seqlen_offset, attn_mask)
+            }
+            Self::Quantized(m) => {
+                m.base_model
+                    .forward_embeds(inputs_embeds, seqlen_offset, attn_mask)
+            }
         }
     }
 
     fn clear_kv_cache(&mut self) {
-         match self {
+        match self {
             Self::Standard(m) => m.clear_kv_cache(),
             Self::Quantized(m) => m.clear_kv_cache(),
         }
     }
 
     fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
-         match self {
+        match self {
             Self::Standard(m) => m.base_model.embed_tokens.forward(tokens),
             Self::Quantized(m) => m.base_model.embed_tokens.forward(tokens),
         }
     }
 }
-
 
 /// CosyVoice LLM for speech token generation
 pub struct CosyVoiceLLM {
@@ -149,7 +154,10 @@ impl CosyVoiceLLM {
         // Load speech embedding using weights to infer vocab size.
         info!("Loading speech_embedding from top-level...");
         let target_vocab_size = llm_config.speech_token_size + llm_config.stop_token_count;
-        let speech_emb_weight = vb.pp("speech_embedding").get((target_vocab_size, llm_config.llm_input_size), "weight")?.to_dtype(vb.dtype())?;
+        let speech_emb_weight = vb
+            .pp("speech_embedding")
+            .get((target_vocab_size, llm_config.llm_input_size), "weight")?
+            .to_dtype(vb.dtype())?;
         let (speech_vocab_size, speech_emb_dim) = speech_emb_weight.dims2()?;
         if speech_emb_dim != llm_config.llm_input_size {
             return Err(candle_core::Error::msg(format!(
@@ -168,7 +176,10 @@ impl CosyVoiceLLM {
 
         // Load decoder head (weight is transposed: [vocab_size, hidden_size])
         info!("Loading llm_decoder from top-level...");
-        let decoder_weight = vb.pp("llm_decoder").get((speech_vocab_size, llm_config.llm_output_size), "weight")?.to_dtype(vb.dtype())?;
+        let decoder_weight = vb
+            .pp("llm_decoder")
+            .get((speech_vocab_size, llm_config.llm_output_size), "weight")?
+            .to_dtype(vb.dtype())?;
         let (decoder_vocab_size, decoder_hidden) = decoder_weight.dims2()?;
         if decoder_hidden != llm_config.llm_output_size {
             return Err(candle_core::Error::msg(format!(
@@ -203,32 +214,77 @@ impl CosyVoiceLLM {
         // Match Python Qwen2LM logic: Always use llm_embedding for SOS/TaskID if it exists.
         // For CosyVoice3, llm_embedding does not exist, and special tokens are in speech_embedding.
 
-        let (llm_embedding, use_speech_special_tokens, sos, task_id) = if vb.pp("llm_embedding").contains_tensor("weight") {
-            let llm_emb_weight = vb.pp("llm_embedding").get((2, llm_config.llm_input_size), "weight")?.to_dtype(vb.dtype())?;
-            let (_llm_vocab_size, llm_emb_dim) = llm_emb_weight.dims2()?;
-            if llm_emb_dim != llm_config.llm_input_size {
-                return Err(candle_core::Error::msg(format!(
-                    "llm_embedding dim mismatch: expected {}, got {}",
-                    llm_config.llm_input_size, llm_emb_dim
-                )));
-            }
-             (Some(Embedding::new(llm_emb_weight, llm_config.llm_input_size)), false, 0, 1)
-        } else {
-             // CosyVoice3 logic: indices 6561 (SOS) and 6563 (TaskID) in speech_embedding
-             (None, true, llm_config.sampling_vocab_size, llm_config.sampling_vocab_size + 2)
-        };
+        let (llm_embedding, use_speech_special_tokens, sos, task_id) =
+            if vb.pp("llm_embedding").contains_tensor("weight") {
+                let llm_emb_weight = vb
+                    .pp("llm_embedding")
+                    .get((2, llm_config.llm_input_size), "weight")?
+                    .to_dtype(vb.dtype())?;
+                let (_llm_vocab_size, llm_emb_dim) = llm_emb_weight.dims2()?;
+                if llm_emb_dim != llm_config.llm_input_size {
+                    return Err(candle_core::Error::msg(format!(
+                        "llm_embedding dim mismatch: expected {}, got {}",
+                        llm_config.llm_input_size, llm_emb_dim
+                    )));
+                }
+                (
+                    Some(Embedding::new(llm_emb_weight, llm_config.llm_input_size)),
+                    false,
+                    0,
+                    1,
+                )
+            } else {
+                // CosyVoice3 logic: indices 6561 (SOS) and 6563 (TaskID) in speech_embedding
+                (
+                    None,
+                    true,
+                    llm_config.sampling_vocab_size,
+                    llm_config.sampling_vocab_size + 2,
+                )
+            };
 
-        // Load spk_embed_affine_layer (try both 'llm.spk...' and 'spk...')
-        // The patched file has 'llm.spk_embed_affine_layer', but logically it should be top-level.
-        let spk_prefix = if vb.pp("llm.spk_embed_affine_layer").contains_tensor("weight") {
-            "llm.spk_embed_affine_layer"
+        // Load spk_embed_affine_layer (optional)
+        let spk_embed_affine_layer = if vb
+            .pp("llm.spk_embed_affine_layer")
+            .contains_tensor("weight")
+        {
+            info!("Loading spk_embed_affine_layer from llm.spk_embed_affine_layer...");
+            let w = vb
+                .pp("llm.spk_embed_affine_layer")
+                .get(
+                    (llm_config.llm_input_size, llm_config.spk_embed_dim),
+                    "weight",
+                )?
+                .to_dtype(vb.dtype())?;
+            let b = vb
+                .pp("llm.spk_embed_affine_layer")
+                .get(llm_config.llm_input_size, "bias")?
+                .to_dtype(vb.dtype())?;
+            Linear::new(w, Some(b))
+        } else if vb.pp("spk_embed_affine_layer").contains_tensor("weight") {
+            info!("Loading spk_embed_affine_layer from spk_embed_affine_layer...");
+            let w = vb
+                .pp("spk_embed_affine_layer")
+                .get(
+                    (llm_config.llm_input_size, llm_config.spk_embed_dim),
+                    "weight",
+                )?
+                .to_dtype(vb.dtype())?;
+            let b = vb
+                .pp("spk_embed_affine_layer")
+                .get(llm_config.llm_input_size, "bias")?
+                .to_dtype(vb.dtype())?;
+            Linear::new(w, Some(b))
         } else {
-            "spk_embed_affine_layer"
+            info!("spk_embed_affine_layer not found, using dummy (OK for CosyVoice3).");
+            let w = Tensor::zeros(
+                (llm_config.llm_input_size, llm_config.spk_embed_dim),
+                vb.dtype(),
+                &device,
+            )?;
+            let b = Tensor::zeros(llm_config.llm_input_size, vb.dtype(), &device)?;
+            Linear::new(w, Some(b))
         };
-        info!("Loading spk_embed_affine_layer from {}...", spk_prefix);
-        let spk_affine_weight = vb.pp(spk_prefix).get((llm_config.llm_input_size, llm_config.spk_embed_dim), "weight")?.to_dtype(vb.dtype())?;
-        let spk_affine_bias = vb.pp(spk_prefix).get(llm_config.llm_input_size, "bias")?.to_dtype(vb.dtype())?;
-        let spk_embed_affine_layer = Linear::new(spk_affine_weight, Some(spk_affine_bias));
 
         Ok(Self {
             llm,
@@ -252,15 +308,27 @@ impl CosyVoiceLLM {
         let idx = Tensor::new(&[self.sos as u32], &self.device)?;
         if self.use_speech_special_tokens {
             let emb = self.speech_embedding.forward(&idx)?.unsqueeze(0)?;
-            println!("LLM: Using speech special token sos={} (norm: {:?})", self.sos, emb.to_dtype(candle_core::DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            println!(
+                "LLM: Using speech special token sos={} (norm: {:?})",
+                self.sos,
+                emb.to_dtype(candle_core::DType::F32)?
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()?
+            );
             Ok(emb)
         } else {
-            let emb = self.llm_embedding
+            let emb = self
+                .llm_embedding
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("llm_embedding missing"))?
                 .forward(&idx)?
                 .unsqueeze(0)?;
-            println!("LLM: Using llm_embedding sos={} (norm: {:?})", self.sos, emb.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            println!(
+                "LLM: Using llm_embedding sos={} (norm: {:?})",
+                self.sos,
+                emb.sqr()?.sum_all()?.to_scalar::<f32>()?
+            );
             Ok(emb)
         }
     }
@@ -270,15 +338,27 @@ impl CosyVoiceLLM {
         let idx = Tensor::new(&[self.task_id as u32], &self.device)?;
         if self.use_speech_special_tokens {
             let emb = self.speech_embedding.forward(&idx)?.unsqueeze(0)?;
-            println!("LLM: Using speech special token task_id={} (norm: {:?})", self.task_id, emb.to_dtype(candle_core::DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            println!(
+                "LLM: Using speech special token task_id={} (norm: {:?})",
+                self.task_id,
+                emb.to_dtype(candle_core::DType::F32)?
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()?
+            );
             Ok(emb)
         } else {
-            let emb = self.llm_embedding
+            let emb = self
+                .llm_embedding
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("llm_embedding missing"))?
                 .forward(&idx)?
                 .unsqueeze(0)?;
-            println!("LLM: Using llm_embedding task_id={} (norm: {:?})", self.task_id, emb.sqr()?.sum_all()?.to_scalar::<f32>()?);
+            println!(
+                "LLM: Using llm_embedding task_id={} (norm: {:?})",
+                self.task_id,
+                emb.sqr()?.sum_all()?.to_scalar::<f32>()?
+            );
             Ok(emb)
         }
     }
@@ -465,7 +545,7 @@ impl CosyVoiceLLM {
             let proj = self.spk_embed_affine_layer.forward(&emb)?;
             proj.unsqueeze(1)?
         } else {
-             Tensor::zeros((1, 0, self.config.llm_input_size), dtype, &self.device)?
+            Tensor::zeros((1, 0, self.config.llm_input_size), dtype, &self.device)?
         };
 
         let mut parts = vec![sos_emb];
@@ -491,9 +571,14 @@ impl CosyVoiceLLM {
             let seq_len = lm_input.dim(1)?;
             let mask = if seq_len > 1 {
                 let mask: Vec<_> = (0..seq_len)
-                    .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
+                    .flat_map(|i| {
+                        (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 })
+                    })
                     .collect();
-                Some(Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?.to_dtype(lm_input.dtype())?)
+                Some(
+                    Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?
+                        .to_dtype(lm_input.dtype())?,
+                )
             } else {
                 None
             };
@@ -509,7 +594,10 @@ impl CosyVoiceLLM {
                 y_pred.dim(1)? - 1..y_pred.dim(1)?,
                 ..,
             ))?)?;
-            let logp = candle_nn::ops::log_softmax(&logits.squeeze(1)?.to_dtype(candle_core::DType::F32)?, 1)?;
+            let logp = candle_nn::ops::log_softmax(
+                &logits.squeeze(1)?.to_dtype(candle_core::DType::F32)?,
+                1,
+            )?;
 
             // Sample next token
             let ignore_stop = i < min_len;
@@ -540,7 +628,7 @@ impl CosyVoiceLLM {
         &mut self,
         text_embeds: &Tensor,
         prompt_speech_tokens: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         self.llm.clear_kv_cache();
         let sos_emb = self.get_sos_emb()?;
         let task_id_emb = self.get_task_id_emb()?;
@@ -549,10 +637,12 @@ impl CosyVoiceLLM {
         let text_embeds = text_embeds.to_dtype(dtype)?;
         let task_id_emb = task_id_emb.to_dtype(dtype)?;
 
-        let mut parts = vec![sos_emb, text_embeds.clone(), task_id_emb];
+        let mut parts = vec![sos_emb.clone(), text_embeds.clone(), task_id_emb.clone()];
+
         if let Some(prompt_tokens) = prompt_speech_tokens {
             if prompt_tokens.dim(1)? > 0 {
                 let prompt_emb = self.embed_speech_tokens(prompt_tokens)?.to_dtype(dtype)?;
+
                 parts.push(prompt_emb);
             }
         }
@@ -562,16 +652,24 @@ impl CosyVoiceLLM {
         let seq_len = lm_input.dim(1)?;
         let mask = if seq_len > 1 {
             let mask: Vec<_> = (0..seq_len)
-                .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
+                .flat_map(|i| {
+                    (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 })
+                })
                 .collect();
-            Some(Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?.to_dtype(dtype)?)
+            Some(
+                Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?
+                    .to_dtype(dtype)?,
+            )
         } else {
             None
         };
 
         // Forward
         let y_pred = self.llm.forward_embeds(&lm_input, 0, mask.as_ref())?;
-        let logits = self.llm_decoder.forward(&y_pred.i((.., y_pred.dim(1)? - 1..y_pred.dim(1)?, ..))?)?;
-        Ok(logits)
+
+        let logits =
+            self.llm_decoder
+                .forward(&y_pred.i((.., y_pred.dim(1)? - 1..y_pred.dim(1)?, ..))?)?;
+        Ok((logits, lm_input))
     }
 }
