@@ -5,13 +5,10 @@
 use anyhow::{anyhow, Result};
 use tracing::debug;
 use candle_core::{npy::NpzTensors, Device, Tensor};
+use crate::utils::StftModule;
 use hound::WavReader;
 use ndarray::Array2;
 use realfft::RealFftPlanner;
-use rubato::{
-    calculate_cutoff, Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
-    WindowFunction,
-};
 use std::f64::consts::PI;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -209,7 +206,77 @@ const WHISPER_N_MELS: usize = 128;
 
 static WHISPER_MEL_FILTERS_128: OnceLock<(Vec<f32>, usize, usize)> = OnceLock::new();
 
-/// Resample audio using a windowed-sinc interpolator (rubato).
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn build_sinc_resample_kernels(
+    orig: usize,
+    new: usize,
+    lowpass_filter_width: f64,
+    rolloff: f64,
+) -> (Vec<f32>, usize, usize) {
+    let base_freq = (orig.min(new) as f64) * rolloff;
+    let width = ((lowpass_filter_width * orig as f64) / base_freq).ceil() as isize;
+    let kernel_len = (orig as isize + 2 * width) as usize;
+    let scale = base_freq / orig as f64;
+
+    let mut kernels = vec![0.0f32; new * kernel_len];
+    for phase in 0..new {
+        let phase_offset = -(phase as f64) / (new as f64);
+        for k in 0..kernel_len {
+            let idx = (k as isize - width) as f64 / orig as f64;
+            let mut t = (phase_offset + idx) * base_freq;
+            if t < -lowpass_filter_width {
+                t = -lowpass_filter_width;
+            } else if t > lowpass_filter_width {
+                t = lowpass_filter_width;
+            }
+            let window = (t * PI / lowpass_filter_width / 2.0).cos().powi(2);
+            let t_pi = t * PI;
+            let sinc = if t_pi == 0.0 { 1.0 } else { t_pi.sin() / t_pi };
+            let val = sinc * window * scale;
+            kernels[phase * kernel_len + k] = val as f32;
+        }
+    }
+
+    (kernels, kernel_len, width as usize)
+}
+
+fn reflect_pad_tensor(x: &Tensor, pad: usize) -> Result<Tensor> {
+    if pad == 0 {
+        return Ok(x.clone());
+    }
+    let rank = x.rank();
+    if rank < 2 {
+        return Err(anyhow!("reflect_pad_tensor expects rank >= 2"));
+    }
+    let t = x.dim(rank - 1)?;
+    if t <= pad {
+        return Err(anyhow!("reflect_pad_tensor pad >= signal length"));
+    }
+
+    let mut indices = Vec::with_capacity(t + 2 * pad);
+    for i in 0..pad {
+        indices.push((pad - i) as u32);
+    }
+    for i in 0..t {
+        indices.push(i as u32);
+    }
+    for i in 0..pad {
+        indices.push((t - 2 - i) as u32);
+    }
+
+    let idx = Tensor::from_vec(indices, (t + 2 * pad,), x.device())?;
+    x.index_select(&idx, rank - 1).map_err(Into::into)
+}
+
+/// Resample audio to match torchaudio.transforms.Resample (sinc_interp_hann).
 pub fn resample_audio(samples: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == dst_rate {
         return Ok(samples.to_vec());
@@ -217,48 +284,188 @@ pub fn resample_audio(samples: &[f32], src_rate: u32, dst_rate: u32) -> Result<V
     if src_rate == 0 || dst_rate == 0 {
         return Err(anyhow!("Invalid sample rate: {} -> {}", src_rate, dst_rate));
     }
+    let gcd = gcd_u32(src_rate, dst_rate);
+    let orig = (src_rate / gcd) as usize;
+    let new = (dst_rate / gcd) as usize;
 
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let sinc_len = 128;
-    let window = WindowFunction::Blackman2;
-    let params = SincInterpolationParameters {
-        sinc_len,
-        f_cutoff: calculate_cutoff(sinc_len, window),
-        interpolation: SincInterpolationType::Quadratic,
-        oversampling_factor: 256,
-        window,
-    };
+    let (kernels, kernel_len, width) = build_sinc_resample_kernels(orig, new, 6.0, 0.99);
 
-    let chunk_size = 1024;
-    let mut resampler = SincFixedIn::<f32>::new(ratio, 1.1, params, chunk_size, 1)
-        .map_err(|e| anyhow!("Resampler init failed: {e}"))?;
+    let pad_left = width;
+    let pad_right = width + orig;
+    let mut padded = Vec::with_capacity(samples.len() + pad_left + pad_right);
+    padded.extend(std::iter::repeat(0.0f32).take(pad_left));
+    padded.extend_from_slice(samples);
+    padded.extend(std::iter::repeat(0.0f32).take(pad_right));
 
-    let mut out = Vec::new();
-    let mut input_slices = vec![samples];
-    let mut outbuffer = vec![vec![0.0f32; resampler.output_frames_max()]];
-
-    while input_slices[0].len() >= resampler.input_frames_next() {
-        let (nbr_in, nbr_out) = resampler
-            .process_into_buffer(&input_slices, &mut outbuffer, None)
-            .map_err(|e| anyhow!("Resampler process failed: {e}"))?;
-        input_slices[0] = &input_slices[0][nbr_in..];
-        out.extend_from_slice(&outbuffer[0][..nbr_out]);
+    let length = samples.len();
+    let num_steps = length / orig + 1;
+    let mut out = Vec::with_capacity(num_steps * new);
+    for step in 0..num_steps {
+        let start = step * orig;
+        let frame = &padded[start..start + kernel_len];
+        for phase in 0..new {
+            let mut acc = 0.0f32;
+            let kernel = &kernels[phase * kernel_len..(phase + 1) * kernel_len];
+            for (k, w) in kernel.iter().enumerate() {
+                acc += w * frame[k];
+            }
+            out.push(acc);
+        }
     }
 
-    if !input_slices[0].is_empty() {
-        let (_nbr_in, nbr_out) = resampler
-            .process_partial_into_buffer(Some(&input_slices), &mut outbuffer, None)
-            .map_err(|e| anyhow!("Resampler final chunk failed: {e}"))?;
-        out.extend_from_slice(&outbuffer[0][..nbr_out]);
-    }
-
-    let none_input: Option<&[&[f32]]> = None;
-    let (_nbr_in, nbr_out) = resampler
-        .process_partial_into_buffer(none_input, &mut outbuffer, None)
-        .map_err(|e| anyhow!("Resampler flush failed: {e}"))?;
-    out.extend_from_slice(&outbuffer[0][..nbr_out]);
-
+    let target_len = ((new as u64) * (length as u64) + (orig as u64) - 1) / (orig as u64);
+    out.truncate(target_len as usize);
     Ok(out)
+}
+
+/// Compute Whisper-style log-mel spectrogram (n_mels=128, 16kHz) on CUDA.
+///
+/// Input tensor should be [batch, time] or [time] on CUDA.
+/// Returns tensor of shape (batch, 128, frames).
+pub fn whisper_log_mel_spectrogram_cuda(samples: &Tensor) -> Result<Tensor> {
+    let device = samples.device();
+    if !device.is_cuda() {
+        return Err(anyhow!("CUDA device required for whisper_log_mel_spectrogram_cuda"));
+    }
+
+    let samples = if samples.rank() == 1 {
+        samples.unsqueeze(0)?
+    } else {
+        samples.clone()
+    };
+    let (_b, t) = samples.dims2()?;
+    if t < WHISPER_N_FFT {
+        return Err(anyhow!("Audio too short for Whisper STFT"));
+    }
+
+    let padded = reflect_pad_tensor(&samples, WHISPER_N_FFT / 2)?;
+    let stft = StftModule::new(WHISPER_N_FFT, WHISPER_HOP_LENGTH, false, device)?;
+    let (real, imag) = stft.transform(&padded)?;
+    let mag = real.sqr()?.add(&imag.sqr()?)?;
+
+    let frames = mag.dim(2)?;
+    if frames == 0 {
+        return Err(anyhow!("Whisper STFT produced no usable frames"));
+    }
+    let mag = mag.narrow(2, 0, frames - 1)?;
+    let mag = mag.contiguous()?;
+
+    let (mel_filters, n_mels, n_freq) = {
+        let filters = load_whisper_mel_filters_128()?;
+        (filters.0.as_slice(), filters.1, filters.2)
+    };
+    if n_mels != WHISPER_N_MELS {
+        return Err(anyhow!(
+            "Whisper mel filter mismatch: expected {}, got {}",
+            WHISPER_N_MELS,
+            n_mels
+        ));
+    }
+
+    let mel_filters = Tensor::from_vec(mel_filters.to_vec(), (n_mels, n_freq), device)?;
+    let mag = mag.squeeze(0)?.contiguous()?;
+    let mel_spec = mel_filters.matmul(&mag)?;
+
+    let log_spec = mel_spec.clamp(1e-10f32, f32::INFINITY)?.log()?;
+    let ln10 = Tensor::from_vec(vec![(10.0f32).ln()], (1,), device)?;
+    let log_spec = log_spec.broadcast_div(&ln10)?;
+
+    let max_val = log_spec.max_all()?.to_scalar::<f32>()?;
+    let log_spec = log_spec.maximum(max_val - 8.0)?;
+    let log_spec = log_spec.broadcast_add(&Tensor::from_vec(vec![4.0f32], (1,), device)?)?;
+    let log_spec = log_spec.broadcast_div(&Tensor::from_vec(vec![4.0f32], (1,), device)?)?;
+
+    log_spec.unsqueeze(0).map_err(Into::into)
+}
+
+/// Compute mel spectrogram on CUDA (matcha_compat settings).
+///
+/// Input tensor should be [batch, time] or [time] on CUDA.
+/// Returns tensor of shape (batch, num_mels, frames).
+pub fn mel_spectrogram_cuda(samples: &Tensor, config: &MelConfig) -> Result<Tensor> {
+    let device = samples.device();
+    if !device.is_cuda() {
+        return Err(anyhow!("CUDA device required for mel_spectrogram_cuda"));
+    }
+
+    let samples = if samples.rank() == 1 {
+        samples.unsqueeze(0)?
+    } else {
+        samples.clone()
+    };
+    let (_b, t) = samples.dims2()?;
+    if t < config.win_size {
+        return Err(anyhow!("Audio too short for mel spectrogram"));
+    }
+
+    let pad = (config.n_fft - config.hop_size) / 2;
+    let padded = reflect_pad_tensor(&samples, pad)?;
+
+    let stft = StftModule::new(config.n_fft, config.hop_size, false, device)?;
+    let (real, imag) = stft.transform(&padded)?;
+    let mag = real.sqr()?.add(&imag.sqr()?)?;
+    let mag = mag.broadcast_add(&Tensor::from_vec(vec![1e-9f32], (1,), device)?)?;
+    let mag = mag.sqrt()?;
+
+    let mel_basis = create_mel_filterbank(config);
+    let (num_mels, n_freq) = (mel_basis.nrows(), mel_basis.ncols());
+    let (mel_data, offset) = mel_basis.into_raw_vec_and_offset();
+    let mel_data = match offset {
+        Some(off) => mel_data[off..].to_vec(),
+        None => mel_data,
+    };
+    let mel_filters = Tensor::from_vec(mel_data, (num_mels, n_freq), device)?;
+
+    let mag = mag.squeeze(0)?.contiguous()?;
+    let mel_spec = mel_filters.matmul(&mag)?;
+    let mel_spec = mel_spec.clamp(1e-5f32, f32::INFINITY)?;
+    let mel_spec = mel_spec.log()?;
+
+    mel_spec.unsqueeze(0).map_err(Into::into)
+}
+
+/// Resample audio using CUDA conv1d with torchaudio-compatible kernels.
+/// Returns a Tensor of shape [1, target_len] on the given device.
+pub fn resample_audio_cuda(
+    samples: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    device: &Device,
+) -> Result<Tensor> {
+    if src_rate == dst_rate {
+        return Tensor::from_vec(samples.to_vec(), (1, samples.len()), device).map_err(Into::into);
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(anyhow!("Invalid sample rate: {} -> {}", src_rate, dst_rate));
+    }
+    if !device.is_cuda() {
+        return Err(anyhow!("CUDA device required for resample_audio_cuda"));
+    }
+
+    let gcd = gcd_u32(src_rate, dst_rate);
+    let orig = (src_rate / gcd) as usize;
+    let new = (dst_rate / gcd) as usize;
+    let (kernels, kernel_len, width) = build_sinc_resample_kernels(orig, new, 6.0, 0.99);
+
+    let pad_left = width;
+    let pad_right = width + orig;
+    let mut padded = Vec::with_capacity(samples.len() + pad_left + pad_right);
+    padded.extend(std::iter::repeat(0.0f32).take(pad_left));
+    padded.extend_from_slice(samples);
+    padded.extend(std::iter::repeat(0.0f32).take(pad_right));
+
+    let x = Tensor::from_vec(
+        padded,
+        (1, 1, pad_left + samples.len() + pad_right),
+        device,
+    )?;
+    let kernel = Tensor::from_vec(kernels, (new, 1, kernel_len), device)?;
+    let y = x.conv1d(&kernel, 0, orig, 1, 1)?;
+    let (b, c, t) = y.dims3()?;
+    let y = y.transpose(1, 2)?.reshape((b, t * c))?;
+
+    let target_len = ((new as u64) * (samples.len() as u64) + (orig as u64) - 1) / (orig as u64);
+    y.narrow(1, 0, target_len as usize).map_err(Into::into)
 }
 
 fn reflect_pad(samples: &[f32], pad: usize) -> Result<Vec<f32>> {
@@ -461,9 +668,9 @@ pub fn stft(
         fft.process_with_scratch(&mut windowed, &mut spectrum, &mut scratch)
             .map_err(|e| anyhow!("FFT error: {:?}", e))?;
 
-        // Compute magnitude
+        // Compute magnitude (match torch.stft + sqrt(sum + 1e-9))
         for (bin_idx, c) in spectrum.iter().enumerate() {
-            let mag = (c.re * c.re + c.im * c.im).sqrt();
+            let mag = (c.re * c.re + c.im * c.im + 1e-9).sqrt();
             magnitudes[[frame_idx, bin_idx]] = mag;
         }
     }
@@ -701,6 +908,106 @@ pub fn kaldi_fbank(samples: &[f32], sample_rate: u32, device: &Device) -> Result
     }
 
     Tensor::from_vec(feats, (1, num_frames, num_mel_bins), device).map_err(Into::into)
+}
+
+/// Compute Kaldi-compatible log-fbank features on CUDA.
+///
+/// Input tensor should be [batch, time] or [time] on CUDA.
+/// Returns tensor of shape (batch, frames, 80).
+pub fn kaldi_fbank_cuda(samples: &Tensor, sample_rate: u32) -> Result<Tensor> {
+    let device = samples.device();
+    if !device.is_cuda() {
+        return Err(anyhow!("CUDA device required for kaldi_fbank_cuda"));
+    }
+
+    let samples = if samples.rank() == 1 {
+        samples.unsqueeze(0)?
+    } else {
+        samples.clone()
+    };
+    let (b, t) = samples.dims2()?;
+
+    let window_size = (sample_rate as f64 * 0.025) as usize;
+    let window_shift = (sample_rate as f64 * 0.01) as usize;
+    let padded_window_size = window_size.next_power_of_two();
+
+    if t < window_size {
+        return Err(anyhow!("Audio too short for Kaldi fbank"));
+    }
+
+    let num_frames = 1 + (t - window_size) / window_shift;
+    let num_mel_bins = 80;
+    let num_freq_bins = padded_window_size / 2 + 1;
+
+    let mel_filters = kaldi_mel_filterbank(
+        num_mel_bins,
+        padded_window_size,
+        sample_rate as f64,
+        20.0,
+        0.0,
+    )?;
+
+    let base = Tensor::arange(0u32, window_size as u32, device)?;
+    let offsets = Tensor::arange(0u32, num_frames as u32, device)?;
+    let shift = Tensor::from_vec(vec![window_shift as u32], (1,), device)?;
+    let offsets = offsets.broadcast_mul(&shift)?;
+    let idx = offsets.unsqueeze(1)?.broadcast_add(&base.unsqueeze(0)?)?;
+    let idx = idx.unsqueeze(0)?.broadcast_as((b, num_frames, window_size))?.contiguous()?;
+
+    let x = samples.unsqueeze(1)?.broadcast_as((b, num_frames, t))?.contiguous()?;
+    let frames = x.gather(&idx, 2)?;
+
+    let denom = Tensor::from_vec(vec![window_size as f32], (1,), device)?;
+    let mean = frames.sum(2)?.broadcast_div(&denom)?;
+    let frames = frames.broadcast_sub(&mean.unsqueeze(2)?)?;
+
+    let coeff = Tensor::from_vec(vec![0.97f32], (1,), device)?;
+    let first = frames.narrow(2, 0, 1)?;
+    let rest = frames.narrow(2, 1, window_size - 1)?;
+    let prev = frames.narrow(2, 0, window_size - 1)?;
+    let rest_emph = rest.broadcast_sub(&prev.broadcast_mul(&coeff)?)?;
+    let first_emph = first.broadcast_mul(&Tensor::from_vec(vec![1.0f32 - 0.97], (1,), device)?)?;
+    let frames = Tensor::cat(&[&first_emph, &rest_emph], 2)?;
+
+    let window = create_povey_window(window_size);
+    let window = Tensor::from_vec(window, (1, 1, window_size), device)?;
+    let frames = frames.broadcast_mul(&window)?;
+
+    let pad_len = padded_window_size - window_size;
+    let frames = if pad_len > 0 {
+        let zeros = Tensor::zeros((b, num_frames, pad_len), candle_core::DType::F32, device)?;
+        Tensor::cat(&[&frames, &zeros], 2)?
+    } else {
+        frames
+    };
+
+    let frames = frames.reshape((b * num_frames, padded_window_size))?;
+
+    let mut real = Vec::with_capacity(num_freq_bins * padded_window_size);
+    let mut imag = Vec::with_capacity(num_freq_bins * padded_window_size);
+    for k in 0..num_freq_bins {
+        for n_idx in 0..padded_window_size {
+            let theta = -2.0 * PI * (k as f64) * (n_idx as f64) / (padded_window_size as f64);
+            real.push(theta.cos() as f32);
+            imag.push(theta.sin() as f32);
+        }
+    }
+    let dft_real = Tensor::from_vec(real, (num_freq_bins, padded_window_size), device)?;
+    let dft_imag = Tensor::from_vec(imag, (num_freq_bins, padded_window_size), device)?;
+
+    let real = frames.matmul(&dft_real.transpose(0, 1)?)?;
+    let imag = frames.matmul(&dft_imag.transpose(0, 1)?)?;
+    let power = real.sqr()?.add(&imag.sqr()?)?;
+
+    let mel_filters = Tensor::from_vec(mel_filters, (num_mel_bins, num_freq_bins), device)?;
+    let power_t = power.transpose(0, 1)?;
+    let feats = mel_filters.matmul(&power_t)?;
+    let feats = feats.transpose(0, 1)?;
+    let feats = feats.clamp(f32::EPSILON, f32::INFINITY)?.log()?;
+    let feats = feats.reshape((b, num_frames, num_mel_bins))?;
+
+    let mean = feats.mean(1)?;
+    feats.broadcast_sub(&mean.unsqueeze(1)?).map_err(Into::into)
 }
 
 // =============================================================================

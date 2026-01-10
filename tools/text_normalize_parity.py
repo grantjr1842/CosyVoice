@@ -49,7 +49,6 @@ def main():
     tokenizer_path = payload["tokenizer_path"]
     split = payload.get("split", True)
     text_frontend = payload.get("text_frontend", True)
-
     tokenizer = Tokenizer.from_file(tokenizer_path)
     segments = normalize_english(text, tokenizer, split, text_frontend)
     lengths = [len(tokenizer.encode(s, add_special_tokens=True).ids) for s in segments]

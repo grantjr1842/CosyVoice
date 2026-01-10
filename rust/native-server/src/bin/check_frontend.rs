@@ -1,42 +1,60 @@
 
 use anyhow::{Context, Result};
-use candle_core::{Device, Tensor};
-use cosyvoice_native_server::onnx_frontend::OnnxFrontend;
+use candle_core::Device;
+use clap::Parser;
 use cosyvoice_native_server::audio;
-use std::path::{Path, PathBuf};
+use cosyvoice_native_server::onnx_frontend::OnnxFrontend;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long, default_value = "pretrained_models/Fun-CosyVoice3-0.5B")]
+    model_dir: String,
+
+    #[arg(long, default_value = "frontend_artifacts.safetensors")]
+    artifacts_path: String,
+
+    #[arg(long, default_value = "asset/interstellar-tars-01-resemble-denoised.wav")]
+    prompt_wav: String,
+}
 
 fn main() -> Result<()> {
     println!("=== Checking ONNX Frontend Parity ===");
 
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let model_dir = repo_root.join("pretrained_models/Fun-CosyVoice3-0.5B");
+    let args = Args::parse();
+    let model_dir = PathBuf::from(&args.model_dir);
+
+    // Initialize Rust Frontend
+    let device = Device::new_cuda(0).context("CUDA device required")?;
+    let mut frontend = OnnxFrontend::new(model_dir.to_str().unwrap(), device.clone())?;
 
     // Load Python Artifacts
-    if !Path::new("frontend_artifacts.safetensors").exists() {
-        println!("Error: frontend_artifacts.safetensors not found. Run dump_frontend.py first.");
+    let artifacts_path = PathBuf::from(&args.artifacts_path);
+    if !artifacts_path.exists() {
+        println!(
+            "Error: {} not found. Run dump_frontend.py first.",
+            artifacts_path.display()
+        );
         return Ok(());
     }
-    let tensors = candle_core::safetensors::load("frontend_artifacts.safetensors", &Device::Cpu)?;
+    let tensors = candle_core::safetensors::load(&artifacts_path, &Device::Cpu)?;
     let py_speech_tokens = tensors.get("speech_tokens").context("Missing speech_tokens")?;
     let py_spk_emb = tensors.get("speaker_embedding").context("Missing speaker_embedding")?;
     // let py_speech_feat = tensors.get("speech_feat").context("Missing speech_feat")?;
 
-    // Initialize Rust Frontend
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
-    let mut frontend = OnnxFrontend::new(model_dir.to_str().unwrap(), device.clone())?;
-
     // Load Audio
-    let wav_path = repo_root.join("asset/interstellar-tars-01-resemble-denoised.wav");
+    let wav_path = PathBuf::from(&args.prompt_wav);
     let (samples, sr) = audio::load_wav(&wav_path)?;
     println!("Loaded wav: {} samples, sr {}", samples.len(), sr);
 
-    // Resample to 16k for tokenizer
-    let samples_16k = audio::resample_audio(&samples, sr, 16000)?;
+    // Resample to 16k for tokenizer (CUDA)
+    let samples_16k = audio::resample_audio_cuda(&samples, sr, 16000, &device)?;
 
     // Log mel for tokenizer
     // Note: Python uses whisper.log_mel_spectrogram(speech, n_mels=128)
     // Rust uses audio::whisper_log_mel_spectrogram
-    let mel_16k = audio::whisper_log_mel_spectrogram(&samples_16k, &Device::Cpu)?;
+    let mel_16k = audio::whisper_log_mel_spectrogram_cuda(&samples_16k)?;
 
     // Tokenize
     // Rust returns [1, 1, 128] ? No, [1, 128, T]
@@ -45,7 +63,7 @@ fn main() -> Result<()> {
 
     if let Some(py_mel) = tensors.get("whisper_mel") {
         println!("Comparing Mel Specs...");
-        let py_mel = py_mel.to_device(&Device::Cpu)?;
+        let py_mel = py_mel.to_device(&device)?;
         // Shape check
         println!("Py Mel Shape: {:?}", py_mel.shape());
         // L1 Error
@@ -93,7 +111,7 @@ fn main() -> Result<()> {
     }
 
     // Compare Speaker Embedding
-    let fbank = audio::kaldi_fbank(&samples_16k, 16000, &Device::Cpu)?;
+    let fbank = audio::kaldi_fbank_cuda(&samples_16k, 16000)?;
     let rust_emb = frontend.extract_speaker_embedding(&fbank)?;
 
     // CosSim

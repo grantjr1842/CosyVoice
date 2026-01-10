@@ -1,24 +1,29 @@
+use anyhow::{Context, Result};
 use candle_core::Device;
+use clap::Parser;
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use std::path::PathBuf;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long, default_value = "pretrained_models/Fun-CosyVoice3-0.5B")]
+    model_dir: String,
+
+    #[arg(long, default_value = "debug_artifacts.safetensors")]
+    artifacts_path: String,
+}
+
+fn main() -> Result<()> {
     println!("=== HiFT Parity Test ===");
+    let args = Args::parse();
 
     // Setup paths
-    // Use absolute path to ensure model finding
-    let repo_root = PathBuf::from("/home/grant/github/CosyVoice-1");
-    let model_dir = repo_root.join("pretrained_models/Fun-CosyVoice3-0.5B");
+    let model_dir = PathBuf::from(&args.model_dir);
 
     // Initialize Device
-    let device = Device::Cpu;
-    /*
-    let device = if candle_core::utils::cuda_is_available() {
-        Device::new_cuda(0)?
-    } else {
-        Device::Cpu
-    };
-    */println!("Using device: {:?}", device);
+    let device = Device::new_cuda(0).context("CUDA device required")?;
+    println!("Using device: {:?}", device);
 
     // Load Engine
     println!("Loading NativeTtsEngine...");
@@ -26,20 +31,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Engine loaded.");
 
     // Load Debug Artifacts
-    let artifact_path = repo_root.join("debug_artifacts.safetensors");
+    let artifact_path = PathBuf::from(&args.artifacts_path);
     if !artifact_path.exists() {
-        return Err(format!("Artifact file not found: {:?}", artifact_path).into());
+        return Err(anyhow::anyhow!(
+            "Artifact file not found: {}",
+            artifact_path.display()
+        ));
     }
 
     println!("Loading artifacts from: {:?}", artifact_path);
     // Load to CPU first
-    let tensors = candle_core::safetensors::load(artifact_path, &Device::Cpu)?;
+    let tensors = candle_core::safetensors::load(&artifact_path, &Device::Cpu)?;
     println!("Loaded {} tensors. Keys: {:?}", tensors.len(), tensors.keys().collect::<Vec<_>>());
 
     // Get flow output (Mel)
     let mel = tensors
         .get("python_flow_output")
-        .ok_or("python_flow_output not found in artifacts")?;
+        .context("python_flow_output not found in artifacts")?;
 
     println!("Loaded Mel shape: {:?}", mel.shape());
 
@@ -155,7 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Generated {} samples.", audio_samples.len());
 
     // Save WAV
-    let output_path = repo_root.join("output/test_hift_output.wav");
+    let output_dir = artifact_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let output_path = output_dir.join("test_hift_output.wav");
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: 24000,

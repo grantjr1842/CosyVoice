@@ -143,7 +143,9 @@ impl Attention {
         let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
 
-        let use_flash_attn = cfg!(feature = "flash-attn") && vb.device().is_cuda();
+        let disable_flash =
+            std::env::var("COSYVOICE_DISABLE_FLASH_ATTN").map(|v| v != "0").unwrap_or(false);
+        let use_flash_attn = cfg!(feature = "flash-attn") && vb.device().is_cuda() && !disable_flash;
         let use_sdpa = vb.device().is_metal();
 
         Ok(Self {

@@ -8,7 +8,6 @@ use candle_nn::VarBuilder;
 use std::path::PathBuf;
 use thiserror::Error;
 
-use crate::audio::normalize_audio;
 use crate::cosyvoice_flow::{CosyVoiceFlow, CosyVoiceFlowConfig};
 use crate::cosyvoice_llm::{CosyVoiceLLM, CosyVoiceLLMConfig};
 use crate::flow::FlowConfig;
@@ -58,7 +57,10 @@ impl NativeTtsEngine {
         let model_path = PathBuf::from(model_dir);
 
         // Initialize device
-        let device = device.unwrap_or_else(|| Device::cuda_if_available(0).unwrap_or(Device::Cpu));
+        let device = match device {
+            Some(device) => device,
+            None => Device::new_cuda(0)?,
+        };
         let dtype = if device.is_cuda() || device.is_metal() {
             DType::F16
         } else {
@@ -291,31 +293,7 @@ impl NativeTtsEngine {
         // 3. Convert to i16 samples
         let audio_vec: Vec<f32> = audio.flatten_all()?.to_vec1()?;
 
-        // Check for issues BEFORE conversion
-        let min_val = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mean_val: f32 = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
-
-        if min_val < -1.0 || max_val > 1.0 {
-            eprintln!(
-                "⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}",
-                min_val, max_val
-            );
-        }
-        if mean_val.abs() > 0.1 {
-            eprintln!(
-                "⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.",
-                mean_val
-            );
-        }
-
-        // DC Removal
-        let mut audio_vec: Vec<f32> = audio_vec.into_iter().map(|x| x - mean_val).collect();
-
-        // Normalization (Fix Gain Issue)
-        normalize_audio(&mut audio_vec, 0.95);
-
-        // Conversion
+        // Conversion (match Python: direct clamp to i16)
         let samples: Vec<i16> = audio_vec
             .iter()
             .map(|&x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
@@ -363,30 +341,6 @@ impl NativeTtsEngine {
         print_tensor_stats("hift_output_audio", &audio);
 
         let audio_vec: Vec<f32> = audio.flatten_all()?.to_vec1()?;
-
-        // Check for issues
-        let min_val = audio_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = audio_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mean_val: f32 = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
-
-        if min_val < -1.0 || max_val > 1.0 {
-            eprintln!(
-                "⚠️  WARNING: Audio values out of [-1, 1] range! min={}, max={}",
-                min_val, max_val
-            );
-        }
-        if mean_val.abs() > 0.1 {
-            eprintln!(
-                "⚠️  WARNING: Large DC offset detected! mean={}. Applying DC removal.",
-                mean_val
-            );
-        }
-
-        // DC Removal
-        let mut audio_vec: Vec<f32> = audio_vec.into_iter().map(|x| x - mean_val).collect();
-
-        // Normalization (Fix Gain Issue)
-        normalize_audio(&mut audio_vec, 0.95);
 
         let samples: Vec<i16> = audio_vec
             .iter()

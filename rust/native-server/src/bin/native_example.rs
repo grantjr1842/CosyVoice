@@ -3,9 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use candle_core::{Device, Tensor};
 use cosyvoice_native_server::audio::{self, MelConfig};
-use cosyvoice_native_server::text_frontend::{
-    clean_special_tokens, ensure_prompt_prefix, split_prompt_and_content, text_normalize_english,
-};
+use cosyvoice_native_server::text_frontend::text_normalize_english;
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use hound::WavWriter;
 use std::fs;
@@ -15,7 +13,6 @@ use tokenizers::Tokenizer;
 const DEFAULT_MODEL_SUBDIR: &str = "pretrained_models/Fun-CosyVoice3-0.5B";
 const DEFAULT_PROMPT_WAV_REL: &str = "asset/interstellar-tars-01-resemble-denoised.wav";
 const DEFAULT_PROMPT_TEXT: &str = "Eight months to Mars. Counter-orbital slingshot around 14 months to Saturn. Nothing's changed on that.";
-const PROMPT_PREFIX: &str = "Please speak in English.<|endofprompt|>";
 
 fn encode_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     let encoding = tokenizer
@@ -78,13 +75,12 @@ fn main() -> Result<()> {
         return Err(anyhow!("Prompt sample rate too low: {}", prompt_sr));
     }
 
-    let prompt_16k = audio::resample_audio(&prompt_samples, prompt_sr, 16000)?;
-    let prompt_24k = audio::resample_audio(&prompt_samples, prompt_sr, 24000)?;
+    let prompt_16k = audio::resample_audio_cuda(&prompt_samples, prompt_sr, 16000, &device)?;
+    let prompt_24k = audio::resample_audio_cuda(&prompt_samples, prompt_sr, 24000, &device)?;
 
-    let prompt_speech_16k = audio::whisper_log_mel_spectrogram(&prompt_16k, &Device::Cpu)?;
-    let prompt_fbank = audio::kaldi_fbank(&prompt_16k, 16000, &Device::Cpu)?;
-    let mut prompt_speech_24k =
-        audio::mel_spectrogram(&prompt_24k, &MelConfig::cosyvoice3(), &device)?;
+    let prompt_speech_16k = audio::whisper_log_mel_spectrogram_cuda(&prompt_16k)?;
+    let prompt_fbank = audio::kaldi_fbank_cuda(&prompt_16k, 16000)?;
+    let mut prompt_speech_24k = audio::mel_spectrogram_cuda(&prompt_24k, &MelConfig::cosyvoice3())?;
 
     let (mut prompt_speech_tokens, mut speaker_embedding) =
         engine.process_prompt_tensors(&prompt_speech_16k, &prompt_fbank)?;
@@ -103,11 +99,22 @@ fn main() -> Result<()> {
     prompt_speech_24k = prompt_speech_24k.narrow(2, 0, aligned_token_len * 2)?;
     prompt_speech_tokens = prompt_speech_tokens.narrow(1, 0, aligned_token_len)?;
 
-    // DEBUG: Load python artifacts if available to verify parity
-    if std::path::Path::new("debug_artifacts.safetensors").exists() {
+    let use_debug_artifacts =
+        std::env::var("COSYVOICE_USE_DEBUG_ARTIFACTS").map(|v| v != "0").unwrap_or(false);
+    let force_tts_tokens =
+        std::env::var("COSYVOICE_FORCE_TTS_TOKENS").map(|v| v != "0").unwrap_or(false);
+    let debug_artifacts_path = Path::new("debug_artifacts.safetensors");
+    let debug_artifacts = if use_debug_artifacts && debug_artifacts_path.exists() {
         println!("\n*** LOADING DEBUG ARTIFACTS FROM PYTHON ***");
-        // Load to CPU first to avoid potential CUDA cast issues
-        let tensors = candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
+        Some(candle_core::safetensors::load(
+            debug_artifacts_path,
+            &Device::Cpu,
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(tensors) = debug_artifacts.as_ref() {
         if let Some(py_st) = tensors.get("python_speech_tokens") {
             println!(
                 "Replacing prompt_speech_tokens: {:?} -> {:?}",
@@ -146,14 +153,8 @@ fn main() -> Result<()> {
     fs::create_dir_all(&output_dir)?;
     println!("Output directory: {:?}", output_dir);
 
-    // Build full prompt with prefix (like Python does)
-    let full_prompt_text = ensure_prompt_prefix(DEFAULT_PROMPT_TEXT);
-
-    // Split prompt and content like Python does
-    let (prompt_part, _) = split_prompt_and_content(&full_prompt_text);
-
-    // Process prompt text separately (only the part before <|endofprompt|>)
-    let prompt_texts = text_normalize_english(&prompt_part, &tokenizer, false, true)?;
+    // Process prompt text separately (Python-style: split=false)
+    let prompt_texts = text_normalize_english(DEFAULT_PROMPT_TEXT, &tokenizer, false, true)?;
     let prompt_text = prompt_texts
         .into_iter()
         .next()
@@ -161,10 +162,7 @@ fn main() -> Result<()> {
     let prompt_tokens = encode_tokens(&tokenizer, &prompt_text)?;
 
     for (idx, tts_text) in texts.iter().enumerate() {
-        // Clean the TTS text to remove any special tokens
-        let cleaned_tts_text = clean_special_tokens(tts_text);
-
-        let segments = text_normalize_english(&cleaned_tts_text, &tokenizer, true, true)?;
+        let segments = text_normalize_english(tts_text, &tokenizer, true, true)?;
         if segments.is_empty() {
             println!(
                 "\nSkipping empty text segment for input [{}/{}]",
@@ -211,20 +209,19 @@ fn main() -> Result<()> {
             );
             let text_embeds = engine.llm.embed_text_tokens(&text_tensor)?;
 
-            // Check for forced Python speech tokens (from debug_artifacts.safetensors)
-            let forced_speech_tokens = if std::path::Path::new("debug_artifacts.safetensors")
-                .exists()
-            {
-                let tensors =
-                    candle_core::safetensors::load("debug_artifacts.safetensors", &Device::Cpu)?;
-                if let Some(py_st) = tensors.get("python_speech_tokens") {
-                    println!("=== DEBUG: USING FORCED PYTHON SPEECH TOKENS FROM ARTIFACT ===");
-                    // Python shape [1, N]. Rust needs [1, N].
-                    Some(
-                        py_st
-                            .to_dtype(candle_core::DType::U32)?
-                            .to_device(&device)?,
-                    )
+            // Optional: force using precomputed speech tokens from debug artifacts.
+            let forced_speech_tokens = if force_tts_tokens {
+                if let Some(tensors) = debug_artifacts.as_ref() {
+                    if let Some(py_st) = tensors.get("speech_tokens") {
+                        println!("=== DEBUG: USING FORCED PYTHON SPEECH TOKENS FROM ARTIFACT ===");
+                        Some(
+                            py_st
+                                .to_dtype(candle_core::DType::U32)?
+                                .to_device(&device)?,
+                        )
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -251,9 +248,8 @@ fn main() -> Result<()> {
                 (speech_tokens, audio)
             } else {
                 let tts_text_len = tts_tokens.len();
-                let prompt_text_len = prompt_tokens.len();
-                let min_len = ((tts_text_len - prompt_text_len) as f32 * 2.0) as usize;
-                let max_len = ((tts_text_len - prompt_text_len) as f32 * 20.0) as usize;
+                let min_len = (tts_text_len as f32 * 2.0) as usize;
+                let max_len = (tts_text_len as f32 * 20.0) as usize;
 
                 let speech_tokens_vec = engine.llm.generate(
                     &text_embeds,

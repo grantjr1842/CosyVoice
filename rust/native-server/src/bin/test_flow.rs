@@ -20,11 +20,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Choose device
-    let device = if candle_core::utils::cuda_is_available() {
-        Device::new_cuda(0)?
-    } else {
-        Device::Cpu
-    };
+    let device = Device::new_cuda(0).context("CUDA device required")?;
     println!("Using device: {:?}", device);
     // Force F32 for parity verification to avoid F16 instability
     let dtype = DType::F32; // if device.is_cuda() { DType::F16 } else { DType::F32 };

@@ -1,7 +1,11 @@
+#!/usr/bin/env python3
+
+import argparse
 import sys
+from pathlib import Path
+
 import torch
 import torchaudio
-from pathlib import Path
 from safetensors.torch import save_file
 
 # Add repo root to path
@@ -11,11 +15,48 @@ sys.path.insert(0, str(repo_root))
 from cosyvoice.cli.cosyvoice import AutoModel
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate Python artifacts for parity testing.")
+    parser.add_argument(
+        "--model-dir",
+        default="pretrained_models/Fun-CosyVoice3-0.5B",
+        help="Path to CosyVoice3 model directory.",
+    )
+    parser.add_argument(
+        "--prompt-wav",
+        default="./asset/interstellar-tars-01-resemble-denoised.wav",
+        help="Path to prompt WAV file.",
+    )
+    parser.add_argument(
+        "--prompt-text",
+        default=(
+            "Eight months to Mars. Counter-orbital slingshot around 14 months to Saturn. "
+            "Nothing's changed on that."
+        ),
+        help="Prompt text (transcription for the prompt audio).",
+    )
+    parser.add_argument(
+        "--tts-text",
+        default="Hello! This is a test for parity verification.",
+        help="Text to synthesize.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory to write debug_artifacts.safetensors and debug_artifacts.wav.",
+    )
+    parser.add_argument(
+        "--segment-index",
+        type=int,
+        default=0,
+        help="Which normalized TTS segment to use (default: 0).",
+    )
+    args = parser.parse_args()
+
     # Configuration
-    model_dir = "pretrained_models/Fun-CosyVoice3-0.5B"
-    prompt_wav = "./asset/interstellar-tars-01-resemble-denoised.wav"
-    prompt_text = "Eight months to Mars. Counter-orbital slingshot around 14 months to Saturn. Nothing's changed on that."
-    tts_text = "Hello! This is a test for parity verification."
+    model_dir = args.model_dir
+    prompt_wav = args.prompt_wav
+    prompt_text = args.prompt_text
+    tts_text = args.tts_text
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -25,7 +66,7 @@ def main():
     cosyvoice = AutoModel(
         model_dir=model_dir,
         load_trt=False,
-        fp16=False
+        fp16=False,
     )
     print("Model loaded.")
 
@@ -35,8 +76,19 @@ def main():
     # prompt_text normalization
     prompt_text_norm = cosyvoice.frontend.text_normalize(prompt_text, split=False, text_frontend=True)
     # tts_text normalization
-    tts_text_norm_list = cosyvoice.frontend.text_normalize(tts_text, split=True, text_frontend=True)
-    tts_text_norm = tts_text_norm_list[0] # Just take the first segment
+    tts_text_norm_list = cosyvoice.frontend.text_normalize(
+        tts_text, split=True, text_frontend=True
+    )
+    if not tts_text_norm_list:
+        print("Error: text_normalize returned no segments.")
+        sys.exit(1)
+    if args.segment_index >= len(tts_text_norm_list) or args.segment_index < 0:
+        print(
+            f"Error: segment_index {args.segment_index} out of range "
+            f"(0..{len(tts_text_norm_list) - 1})."
+        )
+        sys.exit(1)
+    tts_text_norm = tts_text_norm_list[args.segment_index]
 
     model_input = cosyvoice.frontend.frontend_zero_shot(
         tts_text_norm, prompt_text_norm, prompt_wav, cosyvoice.sample_rate, ""
@@ -188,11 +240,14 @@ def main():
         "rand_noise": flow.decoder.rand_noise.contiguous().cpu()
     }
 
-    output_path = repo_root / "debug_artifacts.safetensors"
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / "debug_artifacts.safetensors"
     save_file(artifacts, output_path)
     print(f"Saved artifacts to {output_path}")
 
-    wav_path = repo_root / "debug_artifacts.wav"
+    wav_path = output_dir / "debug_artifacts.wav"
     torchaudio.save(str(wav_path), audio.contiguous().cpu(), 24000)
     print(f"Saved audio to {wav_path}")
 

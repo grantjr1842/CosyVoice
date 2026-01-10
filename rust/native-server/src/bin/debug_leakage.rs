@@ -1,6 +1,7 @@
 
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
+use clap::Parser;
 use cosyvoice_native_server::audio;
 use cosyvoice_native_server::tts::NativeTtsEngine;
 use std::path::{Path, PathBuf};
@@ -11,29 +12,70 @@ const DEFAULT_MODEL_SUBDIR: &str = "pretrained_models/Fun-CosyVoice3-0.5B";
 const DEFAULT_PROMPT_TEXT: &str = "Eight months to Mars. Counter-orbital slingshot around 14 months to Saturn. Nothing's changed on that.";
 const PROMPT_PREFIX: &str = "Please speak in English.<|endofprompt|>";
 
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Debug prompt leakage with optional artifacts override", long_about = None)]
+struct Args {
+    /// Path to frontend_artifacts.safetensors
+    #[arg(long)]
+    artifacts_path: Option<String>,
+}
+
 fn encode_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     let encoding = tokenizer.encode(text, true).map_err(|e| anyhow!("{}", e))?;
     Ok(encoding.get_ids().to_vec())
 }
 
+fn latest_benchmark_dir(root: &Path) -> Result<Option<PathBuf>> {
+    let bench_dir = root.join("output").join("benchmarks");
+    if !bench_dir.exists() {
+        return Ok(None);
+    }
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&bench_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &newest {
+            Some((best_time, _)) if *best_time >= modified => {}
+            _ => newest = Some((modified, path)),
+        }
+    }
+    Ok(newest.map(|(_, p)| p))
+}
+
 fn main() -> Result<()> {
     println!("=== Debug Leaked Prompt / Fast Speech ===");
+    let args = Args::parse();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
     let model_dir = repo_root.join(DEFAULT_MODEL_SUBDIR);
     let tokenizer_path = model_dir.join("tokenizer.json");
 
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("{}", e))?;
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    let device = Device::new_cuda(0).expect("CUDA device required");
 
     // Init Engine
     let mut engine = NativeTtsEngine::new(model_dir.to_str().unwrap(), Some(device.clone()))?;
 
     // Load Parity Artifacts
-    let artifacts_path = Path::new("frontend_artifacts.safetensors"); // Use dump_frontend.py output
+    let artifacts_path = if let Some(path) = args.artifacts_path {
+        PathBuf::from(path)
+    } else if let Some(latest_dir) = latest_benchmark_dir(&repo_root)? {
+        latest_dir.join("frontend_artifacts.safetensors")
+    } else {
+        repo_root.join("frontend_artifacts.safetensors")
+    };
     if !artifacts_path.exists() {
-        return Err(anyhow!("frontend_artifacts.safetensors not found"));
+        return Err(anyhow!(
+            "frontend_artifacts.safetensors not found at {}",
+            artifacts_path.display()
+        ));
     }
-    let tensors = candle_core::safetensors::load(artifacts_path, &Device::Cpu)?;
+    // Load to CPU first to avoid CUDA loader kernel issues, then move to device.
+    let tensors = candle_core::safetensors::load(&artifacts_path, &Device::Cpu)?;
 
     // Get Prompt Tokens (Python)
     let py_speech_tokens = tensors.get("speech_tokens").ok_or(anyhow!("missing speech_tokens"))?
@@ -92,17 +134,10 @@ fn main() -> Result<()> {
     println!("\nCalculating Rust Prompt Inputs...");
     let wav_path = repo_root.join("asset/interstellar-tars-01-resemble-denoised.wav");
     let (samples, sr) = audio::load_wav(&wav_path)?;
-    let samples_16k = audio::resample_audio(&samples, sr, 16000)?;
-    let samples_24k = audio::resample_audio(&samples, sr, 24000)?;
+    let samples_16k = audio::resample_audio_cuda(&samples, sr, 16000, &device)?;
 
-    let mel_16k = audio::whisper_log_mel_spectrogram(&samples_16k, &device)?; // Assuming correct device for frontend?
-    // Wait, OnnxFrontend uses Cuda if device is Cuda.
-    // whisper_log_mel returns Tensor on device.
-    // check_frontend used Cpu.
-    // If device is Cuda, whisper_log_mel will do stft on Cuda? No, stft impl is on CPU (Vec).
-    // It returns Tensor on `device`.
-
-    let fbank = audio::kaldi_fbank(&samples_16k, 16000, &device)?;
+    let mel_16k = audio::whisper_log_mel_spectrogram_cuda(&samples_16k)?;
+    let fbank = audio::kaldi_fbank_cuda(&samples_16k, 16000)?;
     let (rust_speech_tokens, rust_spk_emb) = engine.process_prompt_tensors(&mel_16k, &fbank)?;
 
     println!("Generating with RUST Prompt Inputs (Tokens + Emb)...");

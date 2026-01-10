@@ -2,6 +2,7 @@
 //!
 //! High-performance text-to-speech server using native Rust implementation (Candle + Ort).
 
+use anyhow::Context;
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -22,9 +23,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use shared::{config, ErrorResponse, HealthResponse, SynthesizeRequest};
 
 use cosyvoice_native_server::audio::{self, MelConfig};
-use cosyvoice_native_server::text_frontend::{
-    clean_special_tokens, ensure_prompt_prefix, text_normalize_english,
-};
+use cosyvoice_native_server::text_frontend::text_normalize_english;
 use cosyvoice_native_server::tts::NativeTtsEngine;
 
 mod qwen_special_tokens;
@@ -69,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize Native TTS engine
     info!(model_dir = %model_dir, "Initializing Native TTS engine...");
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    let device = Device::new_cuda(0).context("CUDA device required")?;
     info!("Using device: {:?}", device);
 
     let tts = NativeTtsEngine::new(&model_dir, Some(device))?;
@@ -156,7 +155,7 @@ async fn synthesize_handler(
         }
     };
 
-    let prompt_text = ensure_prompt_prefix(&match request.prompt_text.as_deref() {
+    let prompt_text = match request.prompt_text.as_deref() {
         Some(text) if !text.trim().is_empty() => text.to_string(),
         Some(_) => {
             return error_response(StatusCode::BAD_REQUEST, "prompt_text is empty".to_string())
@@ -165,7 +164,7 @@ async fn synthesize_handler(
             .speaker
             .clone()
             .unwrap_or_else(|| "Speak naturally in English.".to_string()),
-    });
+    };
 
     let prompt_segments = match text_normalize_english(&prompt_text, &state.tokenizer, false, true)
     {
@@ -192,12 +191,8 @@ async fn synthesize_handler(
     };
     let prompt_text_len = prompt_tokens.len();
 
-    let mut tts_segments = match text_normalize_english(
-        &clean_special_tokens(&request.text),
-        &state.tokenizer,
-        true,
-        true,
-    ) {
+    let mut tts_segments =
+        match text_normalize_english(&request.text, &state.tokenizer, true, true) {
         Ok(segments) => segments,
         Err(e) => {
             return error_response(
@@ -232,7 +227,12 @@ async fn synthesize_handler(
         }
     };
 
-    let prompt_16k = match audio::resample_audio(&prompt_samples, prompt_sr, 16000) {
+    let device = {
+        let tts = state.tts.lock().await;
+        tts.device.clone()
+    };
+
+    let prompt_16k = match audio::resample_audio_cuda(&prompt_samples, prompt_sr, 16000, &device) {
         Ok(samples) => samples,
         Err(e) => {
             return error_response(
@@ -241,7 +241,7 @@ async fn synthesize_handler(
             )
         }
     };
-    let prompt_24k = match audio::resample_audio(&prompt_samples, prompt_sr, 24000) {
+    let prompt_24k = match audio::resample_audio_cuda(&prompt_samples, prompt_sr, 24000, &device) {
         Ok(samples) => samples,
         Err(e) => {
             return error_response(
@@ -251,7 +251,7 @@ async fn synthesize_handler(
         }
     };
 
-    let prompt_speech_16k = match audio::whisper_log_mel_spectrogram(&prompt_16k, &Device::Cpu) {
+    let prompt_speech_16k = match audio::whisper_log_mel_spectrogram_cuda(&prompt_16k) {
         Ok(mel) => mel,
         Err(e) => {
             return error_response(
@@ -260,7 +260,7 @@ async fn synthesize_handler(
             )
         }
     };
-    let prompt_fbank = match audio::kaldi_fbank(&prompt_16k, 16000, &Device::Cpu) {
+    let prompt_fbank = match audio::kaldi_fbank_cuda(&prompt_16k, 16000) {
         Ok(fbank) => fbank,
         Err(e) => {
             return error_response(
@@ -270,13 +270,8 @@ async fn synthesize_handler(
         }
     };
 
-    let device = {
-        let tts = state.tts.lock().await;
-        tts.device.clone()
-    };
-
     let mut prompt_speech_24k =
-        match audio::mel_spectrogram(&prompt_24k, &MelConfig::cosyvoice3(), &device) {
+        match audio::mel_spectrogram_cuda(&prompt_24k, &MelConfig::cosyvoice3()) {
             Ok(mel) => mel,
             Err(e) => {
                 return error_response(

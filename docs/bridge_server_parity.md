@@ -76,20 +76,28 @@ This file inventories every import and the concrete default/runtime values used 
 
 ## Native-vs-Bridge Parity Notes (current)
 
+### Parity adjustments applied (2026-01-10)
+- **Text normalization**: Rust now mirrors `tools/text_normalize_parity.py` (no auto prompt prefix, `<|en|>` prefix preserved, special-token bypass, inflect-like number wording with hyphens/commas). See `rust/native-server/src/text_frontend.rs`.
+- **Audio postprocess**: Removed DC removal + peak normalization in native synthesis to match Python's direct float-to-i16 clamp. See `rust/native-server/src/tts.rs`.
+- **Resampling kernel**: Rust resampler now matches torchaudio's `sinc_interp_hann` kernel/stride/padding behavior for bit-level mel parity. See `rust/native-server/src/audio.rs`.
+- **Resampling length**: Rust resampler now trims/pads to `ceil(len * dst/src)` to match `torchaudio.transforms.Resample` output length, preventing Whisper mel frame count drift. See `rust/native-server/src/audio.rs`.
+- **Punctuation normalization**: Rust text frontend now adds spaces around punctuation (`. , ' - : ; ! ?`) to match Python's wetext behavior, fixing tokenization mismatch that caused 2x audio length. See `rust/native-server/src/text_frontend.rs`.
+- **STFT magnitude**: Added 1e-9 epsilon before sqrt to mirror Python `torch.stft` magnitude handling. See `rust/native-server/src/audio.rs`.
+- **CUDA resample prototype**: Added `resample_audio_cuda` + `proto_cuda_resample` to exercise CUDA conv1d resampling (not wired into pipeline yet). See `rust/native-server/src/audio.rs` and `rust/native-server/src/bin/proto_cuda_resample.rs`.
+
 ### Direct mismatches observed
 - Output length: native example generates much longer clips (23.20s, 19.20s) vs Python example (6.52s, 6.72s).
 - Native LLM sampling is **top-k only**; Python uses `ras_sampling` with `top_p=0.8`, `top_k=25`, `win_size=10`, `tau_r=0.1`.
 - Native LLM stop criteria only checks `token_id >= sampling_vocab_size`; Python uses `stop_token_ids` and additional logic.
 - Native uses `llm.safetensors`; Python prefers `llm.rl.pt` when available.
 - Native uses random SOS/task-id embeddings (not loaded from weights); Python uses trained embeddings.
-- Native DC-removes audio (mean subtraction in `synthesize_from_tokens`); Python returns raw float waveforms.
 
 ### Pre/post-processing differences
-- Resampling: native uses rubato windowed-sinc; Python uses `torchaudio.transforms.Resample`.
+- Resampling: native now mirrors `torchaudio.transforms.Resample` (sinc_interp_hann) kernel and length behavior.
 - Prompt mel: native uses Rust `mel_spectrogram` implementation; Python uses `cosyvoice.compat.matcha_compat.mel_spectrogram`.
 - Prompt speech tokens: native uses Whisper log-mel + ONNX; Python uses Whisper log-mel + ONNX (should match closely).
 - Speaker embedding: native implements Kaldi fbank + mean normalization; Python uses `torchaudio.compliance.kaldi.fbank` + mean normalization.
-- Text normalization: native uses a minimal English prefix (`<|en|>`), Python uses wetext/ttsfrd normalization and paragraph splitting.
+- Text normalization: native mirrors `tools/text_normalize_parity.py` (digits -> words, split_paragraph, `<|en|>` prefix). Python runtime may still use wetext/ttsfrd if available.
 
 ## Example Output Comparison (reference)
 
