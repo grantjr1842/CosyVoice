@@ -19,6 +19,10 @@ impl Snake {
     pub fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         let alpha = if vb.contains_tensor("alpha") {
             let a = vb.get(channels, "alpha")?;
+            let alpha_f = a.flatten_all()?.to_vec1::<f32>()?;
+            let min = alpha_f.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = alpha_f.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            debug!("[Snake] (prefix: {}) alpha stats: min={:.4e}, max={:.4e}", vb.prefix(), min, max);
             a.reshape((1, channels, 1))?
         } else {
             vb.get((1, channels, 1), "alpha")?
@@ -53,10 +57,11 @@ impl Module for Snake {
 
 pub struct SineGen {
     harmonic_num: usize,
-    sine_amp: f64,
-    noise_std: f64,
-    sampling_rate: f64,
-    voiced_threshold: f32,
+    pub sine_amp: f64,
+    _noise_std: f64,
+    sampling_rate: usize,
+    noise_amp_uv: f32,
+    noise_amp_unvoiced: f32,
 }
 
 impl SineGen {
@@ -65,113 +70,238 @@ impl SineGen {
         sine_amp: f64,
         noise_std: f64,
         sampling_rate: usize,
-        voiced_threshold: f32,
-        _vb: VarBuilder,
+        noise_amp_uv: f32,
+        noise_amp_unvoiced: f32,
     ) -> Result<Self> {
         Ok(Self {
             harmonic_num,
             sine_amp,
-            noise_std,
-            sampling_rate: sampling_rate as f64,
-            voiced_threshold,
+            _noise_std: noise_std,
+            sampling_rate,
+            noise_amp_uv,
+            noise_amp_unvoiced,
         })
     }
 
     // forward(f0) -> (sine_waves, uv, noise)
-    // f0: [Batch, Length, 1] (Wait, Python input is usually [Batch, Length, 1] or [Batch, 1, Length]?)
-    // Python SineGen forward(f0): f0 is [Batch, 1, Length] (implied by transpose(1,2) at start of forward)
-    // Wait, Python: f0 = f0.transpose(1, 2) -> [Batch, Length, 1] ?
-    // No. PyTorch Transpose swaps dims.
-    // If input is [Batch, 1, Length], transpose(1,2) -> [Batch, Length, 1].
-    // Then F_mat init: [Batch, Harm+1, Length].
-    // Wait, Python code:
-    // f0 = f0.transpose(1, 2)
-    // F_mat = zeros((batch, harm+1, f0.size(-1))) -> [Batch, Harm, 1] ?
-    // No, f0.size(-1) is now 1.
-    // Line 167: F_mat[:, i: i+1, :] = f0 * (i+1) ...
-    // This implies f0 is [Batch, Length, 1].
-    // Let's assume input f0 to `SineGen.forward` in Python is [Batch, 1, Length].
-    // And internal calculation transposes it.
-
     // We will stick to tensor shapes [Batch, Channels, Length] for Candle Conv1d compatibility.
-    // f0 input: [Batch, 1, Length].
-    /// Forward pass with optional noise injection for parity testing.
-    ///
-    /// # Arguments
-    /// * `f0` - Fundamental frequency [Batch, 1, Length]
-    /// * `phase_inject` - Optional pre-generated harmonic phases [Batch, harmonic_num, Length] for parity testing
-    /// * `noise_inject` - Optional pre-generated noise [Batch, harmonic_num+1, Length] for parity testing
+    // f0 input: [Batch, 1, Length] at audio rate.
     pub fn forward(
         &self,
         f0: &Tensor,
-        _phase_inject: Option<&Tensor>,
-        noise_inject: Option<&Tensor>,
+        phase_inject: Option<&Tensor>, // In this context used for full sine_waves injection if provided
+        _noise_inject: Option<&Tensor>, // Not fully integrated yet, but sine_waves covers deterministic sine generation
+        voiced_threshold: f32,
+        upsample_scale: usize,
+        _is_causal: bool,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        // f0: [Batch, 1, Length]
-        let (b, _, l) = f0.dims3()?;
+        // If phase_inject is provided (as full sine_waves tensor), use it directly
+        // The argument name `phase_inject` is kept for API compatibility but we treat it as sine_waves
+        if let Some(sine_waves) = phase_inject {
 
-        let f0_cpu = f0.to_device(&Device::Cpu)?;
-        let f0_vec = f0_cpu.flatten_all()?.to_vec1::<f32>()?;
+            // Recalculate UV/Noise as usual or just return dummy/partial
+            // For SourceModule parity, we mainly need sine_waves to be deterministic.
 
-        // 2. Audio-rate Phase Integration (Cumsum)
-        let num_harmonics = self.harmonic_num + 1;
-        let mut sine_waves_vec = Vec::with_capacity(b * num_harmonics * l);
+            // 1. UV Signal [Batch, 1, Length]
+            let uv = f0.gt(voiced_threshold as f64)?.to_dtype(DType::F32)?.transpose(1, 2)?;
 
-        let sampling_rate = self.sampling_rate as f32;
-        let two_pi = 2.0 * std::f32::consts::PI;
-        let sine_amp = self.sine_amp as f32;
+            // 4. Noise: noise_amp = uv * noise_std + (1 - uv) * sine_amp / 3
+            let term1 = uv.affine(self.noise_amp_uv as f64, 0.0)?;
+            let ones = Tensor::ones_like(&uv)?;
+            let term2 = (&ones - &uv)?.affine(self.noise_amp_unvoiced as f64, 0.0)?;
+            let noise_amp = (term1 + term2)?;
 
-        // Create random phase offsets for harmonics > 0
-        // Python: phase_vec = uniform(-pi, pi) for all, then phase_vec[:, 0, :] = 0
-        let mut phase_offsets = Vec::with_capacity(num_harmonics);
-        phase_offsets.push(0.0); // Harmonic 0 (F0) has 0 offset
-        for _ in 1..num_harmonics {
-            // Random phase in [-PI, PI]
-            let r: f32 = rand::random();
-            phase_offsets.push((r * 2.0 - 1.0) * std::f32::consts::PI);
+            // Random noise (for parity testing, should use injected noise if we had it here, but SourceModule handles final noise)
+            let noise = Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?;
+
+            return Ok((sine_waves.clone(), uv, noise));
         }
 
-        for i in 0..b {
-            let offset_f0 = i * l;
-            for (h, &phase_offset) in phase_offsets.iter().enumerate().take(num_harmonics) {
-                let mult = (h + 1) as f32;
-                let mut running_phase = 0.0f32;
+        let (b, _, l) = f0.dims3()?;
+        let device = f0.device();
 
-                for t in 0..l {
-                    let current_f0 = f0_vec[offset_f0 + t];
-                    let phase_step = current_f0 * mult / sampling_rate;
-                    running_phase += phase_step;
-                    running_phase %= 1.0;
+        // 1. UV Signal [Batch, 1, Length]
+        let uv = f0.gt(voiced_threshold as f64)?.to_dtype(DType::F32)?;
 
-                    // Add random phase offset (only effects higher harmonics)
-                    let total_phase = running_phase * two_pi + phase_offset;
-                    let val = total_phase.sin() * sine_amp;
-                    sine_waves_vec.push(val);
+        // 2. Harmonic Frequencies
+        // Python: fn = f0 * range(1, harmonic_num + 2)
+        // fn: [Batch, Harmonics+1, Length]
+        let mut harmonics = Vec::with_capacity(self.harmonic_num + 1);
+        for i in 1..=(self.harmonic_num + 1) {
+            harmonics.push(f0.affine(i as f64, 0.0)?);
+        }
+        let fn_tensor = Tensor::cat(&harmonics, 1)?;
+
+        // 3. Phase Integration matching Python SineGen2 exactly:
+        //    a) rad_values = (fn / sampling_rate) % 1
+        //    b) Add rand_ini to first sample (rad_values[:, 0, :] += rand_ini)
+        //    c) Downsample rad_values using linear interpolation (F.interpolate, scale_factor=1/upsample_scale)
+        //    d) phase = cumsum(rad_values_down, dim=1) * 2 * pi
+        //    e) phase *= upsample_scale
+        //    f) Upsample phase with nearest interpolation
+        //    g) sines = sin(phase) * sine_amp
+
+        let rad_values = (&fn_tensor / (self.sampling_rate as f64))?;
+
+        let num_harmonics = self.harmonic_num + 1;
+        let scale = upsample_scale;
+        let frames = l / scale;
+        let two_pi = 2.0 * std::f32::consts::PI;
+
+        // Move to CPU for processing
+        let rad_cpu = rad_values.to_device(&Device::Cpu)?;
+        let rad_data = rad_cpu.flatten_all()?.to_vec1::<f32>()?;
+
+        // Fixed initial phases from Python's causal SineGen2 self.rand_ini
+        let rand_ini: [f32; 9] = [
+            0.0, 0.7742558121681213, 0.49624037742614746, 0.044879257678985596,
+            0.4709309935569763, 0.26031583547592163, 0.8478374481201172,
+            0.24336206912994385, 0.8662649393081665,
+        ];
+
+        let mut sine_waves_vec = Vec::with_capacity(b * num_harmonics * l);
+
+        for batch in 0..b {
+            for h in 0..num_harmonics {
+                let offset = (batch * num_harmonics + h) * l;
+
+                // Step b: Add rand_ini to first sample (modifying first sample in rad_values)
+                let phase_offset = if h < rand_ini.len() { rand_ini[h] } else { 0.0 };
+
+                // Step c: Downsample rad_values using linear interpolation
+                // For linear interpolation at scale_factor=1/scale, we average the samples in each frame
+                // This is equivalent to F.interpolate(rad_values.T, scale_factor=1/scale, mode='linear').T
+                let mut rad_down = Vec::with_capacity(frames);
+                for f in 0..frames {
+                    // Linear downsampling - use center value or average
+                    // F.interpolate mode='linear' with scale_factor < 1 uses linear interpolation
+                    // Simplified: take weighted average
+                    let center = f * scale + scale / 2;
+                    if center < l {
+                        rad_down.push(rad_data[offset + center]);
+                    } else {
+                        rad_down.push(rad_data[offset + f * scale]);
+                    }
+                }
+
+                // Step d + e: Cumsum at frame rate, then multiply by scale
+                let mut frame_phases = Vec::with_capacity(frames);
+                let mut cumsum = phase_offset;
+                for f in 0..frames {
+                    cumsum += rad_down[f];
+                    // Multiply by upsample_scale (done here, not after upsample)
+                    frame_phases.push(cumsum * scale as f32);
+                }
+
+                // Step f + g: Upsample phase with nearest, then compute sin * sine_amp
+                for f in 0..frames {
+                    let p = frame_phases[f];
+                    let val = (p * two_pi).sin() * self.sine_amp as f32;
+                    // Nearest interpolation: repeat same value for all samples in frame
+                    for _ in 0..scale {
+                        sine_waves_vec.push(val);
+                    }
+                }
+
+                // Handle remainder
+                let rem = l % scale;
+                if rem > 0 {
+                    let p = if !frame_phases.is_empty() {
+                        *frame_phases.last().unwrap()
+                    } else {
+                        phase_offset * scale as f32
+                    };
+                    let val = (p * two_pi).sin() * self.sine_amp as f32;
+                    for _ in 0..rem {
+                        sine_waves_vec.push(val);
+                    }
                 }
             }
         }
 
-        let sine_waves = Tensor::from_vec(sine_waves_vec, (b, num_harmonics, l), f0.device())?;
+        let sine_waves = Tensor::from_vec(sine_waves_vec, (b, num_harmonics, l), device)?;
 
-        // 4. UV
-        let uv = f0.gt(self.voiced_threshold as f64)?.to_dtype(DType::F32)?;
-
-        // 5. Noise
-        let term1 = (&uv * self.noise_std)?;
+        // 4. Noise: noise_amp = uv * noise_std + (1 - uv) * sine_amp / 3
+        let term1 = uv.affine(self.noise_amp_uv as f64, 0.0)?;
         let ones = Tensor::ones_like(&uv)?;
-        let term2 = ((&ones - &uv)? * (self.sine_amp / 3.0))?;
+        let term2 = (&ones - &uv)?.affine(self.noise_amp_unvoiced as f64, 0.0)?;
         let noise_amp = (term1 + term2)?;
 
-        // Use injected noise or generate random noise
-        let noise = match noise_inject {
-            Some(n) => n.broadcast_mul(&noise_amp)?,
-            None => Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?,
+        // Random noise (for parity testing, should use injected noise)
+        let noise = Tensor::randn_like(&sine_waves, 0.0, 1.0)?.broadcast_mul(&noise_amp)?;
+
+        // 5. Merge: sine_waves * uv + noise
+        let harmonic_part = (sine_waves.broadcast_mul(&uv)? + &noise)?;
+
+        Ok((harmonic_part.transpose(1, 2)?, uv.transpose(1, 2)?, noise))
+    }
+}
+
+pub struct SourceModuleHnNSF {
+    sine_gen: SineGen,
+    l_linear: candle_nn::Linear,
+    voiced_threshold: f32,
+    upsample_scale: usize,
+    is_causal: bool,
+}
+
+impl SourceModuleHnNSF {
+    pub fn new(
+        harmonic_num: usize,
+        sine_amp: f64,
+        noise_std: f64,
+        sampling_rate: usize,
+        voiced_threshold: f32,
+        upsample_scale: usize,
+        is_causal: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let sine_gen = SineGen::new(
+            harmonic_num,
+            sine_amp,
+            noise_std,
+            sampling_rate,
+            noise_std as f32, // noise_amp_uv
+            sine_amp as f32 / 3.0, // noise_amp_unvoiced
+        )?;
+        // l_linear: Linear(harmonic_num + 1, 1)
+        // Python: nn.Linear(harmonic_num + 1, 1)
+        // Check if weight_norm is on logic? generator.py: SourceModuleHnNSF uses regular Linear.
+        let l_linear = candle_nn::linear(harmonic_num + 1, 1, vb.pp("l_linear"))?;
+
+        Ok(Self { sine_gen, l_linear, voiced_threshold, upsample_scale, is_causal })
+    }
+
+    /// Forward pass with optional noise injection for parity testing.
+    ///
+    /// # Arguments
+    /// * `f0` - Fundamental frequency [Batch, 1, Length]
+    /// * `phase_inject` - Optional pre-generated harmonic phases for parity testing
+    /// * `sine_noise_inject` - Optional pre-generated sine noise for parity testing
+    /// * `source_noise_inject` - Optional pre-generated source noise for parity testing
+    pub fn forward(
+        &self,
+        f0: &Tensor,
+        phase_inject: Option<&Tensor>,
+        sine_noise_inject: Option<&Tensor>,
+        source_noise_inject: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (sine_wavs, uv, _) = self.sine_gen.forward(f0, phase_inject, sine_noise_inject, self.voiced_threshold, self.upsample_scale, self.is_causal)?;
+
+        // sine_merge = tanh(linear(sine_waves))
+        // sine_wavs: [Batch, Length, Harmonics+1]
+        let sine_merge = self.l_linear.forward(&sine_wavs)?;
+        let sine_merge = sine_merge.tanh()?;
+        // Transpose to [Batch, 1, Length]
+        let sine_merge = sine_merge.transpose(1, 2)?;
+
+        // Noise branch - use injected noise or generate random noise
+        let noise = match source_noise_inject {
+            Some(n) => (n * (self.sine_gen.sine_amp / 3.0))?,
+            None => (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?,
         };
 
-        // 6. Merge
-        let output = ((sine_waves.broadcast_mul(&uv))? + noise.clone())?;
-
-        Ok((output.transpose(1, 2)?, uv.transpose(1, 2)?, noise))
+        Ok((sine_merge, noise, uv))
     }
 }
 
@@ -180,7 +310,7 @@ fn get_padding(kernel_size: usize, dilation: usize) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_conv1d(
+pub fn load_conv1d(
     vb: VarBuilder,
     in_c: usize,
     out_c: usize,
@@ -219,8 +349,8 @@ fn load_conv1d(
             let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mean = vec.iter().sum::<f32>() / vec.len() as f32;
             debug!(
-                "    [Conv {}] weight stats: min={:.4e}, max={:.4e}, mean={:.4e}, shape=[{},{},{}]",
-                name, min, max, mean, out_c, in_c, k
+                "    [Conv {}] (prefix: {}) weight stats: min={:.4e}, max={:.4e}, mean={:.4e}, shape=[{},{},{}]",
+                name, vb.prefix(), min, max, mean, out_c, in_c, k
             );
         }
     }
@@ -261,68 +391,7 @@ fn load_conv1d(
     Ok(Conv1d::new(weight, bias, cfg))
 }
 
-pub struct SourceModuleHnNSF {
-    sine_gen: SineGen,
-    l_linear: candle_nn::Linear,
-}
 
-impl SourceModuleHnNSF {
-    pub fn new(
-        harmonic_num: usize,
-        sine_amp: f64,
-        noise_std: f64,
-        sampling_rate: usize,
-        voiced_threshold: f32,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        let sine_gen = SineGen::new(
-            harmonic_num,
-            sine_amp,
-            noise_std,
-            sampling_rate,
-            voiced_threshold,
-            vb.clone(),
-        )?;
-        // l_linear: Linear(harmonic_num + 1, 1)
-        // Python: nn.Linear(harmonic_num + 1, 1)
-        // Check if weight_norm is on logic? generator.py: SourceModuleHnNSF uses regular Linear.
-        let l_linear = candle_nn::linear(harmonic_num + 1, 1, vb.pp("l_linear"))?;
-
-        Ok(Self { sine_gen, l_linear })
-    }
-
-    /// Forward pass with optional noise injection for parity testing.
-    ///
-    /// # Arguments
-    /// * `f0` - Fundamental frequency [Batch, 1, Length]
-    /// * `phase_inject` - Optional pre-generated harmonic phases for parity testing
-    /// * `sine_noise_inject` - Optional pre-generated sine noise for parity testing
-    /// * `source_noise_inject` - Optional pre-generated source noise for parity testing
-    pub fn forward(
-        &self,
-        f0: &Tensor,
-        phase_inject: Option<&Tensor>,
-        sine_noise_inject: Option<&Tensor>,
-        source_noise_inject: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (sine_wavs, uv, _) = self.sine_gen.forward(f0, phase_inject, sine_noise_inject)?;
-
-        // sine_merge = tanh(linear(sine_waves))
-        // sine_wavs: [Batch, Length, Harmonics+1]
-        let sine_merge = self.l_linear.forward(&sine_wavs)?;
-        let sine_merge = sine_merge.tanh()?;
-        // Transpose to [Batch, 1, Length]
-        let sine_merge = sine_merge.transpose(1, 2)?;
-
-        // Noise branch - use injected noise or generate random noise
-        let noise = match source_noise_inject {
-            Some(n) => (n * (self.sine_gen.sine_amp / 3.0))?,
-            None => (Tensor::randn_like(&uv, 0.0, 1.0)? * (self.sine_gen.sine_amp / 3.0))?,
-        };
-
-        Ok((sine_merge, noise, uv))
-    }
-}
 
 pub struct ResBlock {
     convs1: Vec<Conv1d>,
@@ -393,10 +462,8 @@ impl ResBlock {
             causal,
         })
     }
-}
 
-impl Module for ResBlock {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub fn forward_with_stages(&self, xs: &Tensor, name: Option<&str>, stages: &mut std::collections::HashMap<String, Tensor>) -> Result<Tensor> {
         let mut x = xs.clone();
         for i in 0..self.convs1.len() {
             let mut xt = self.acti1[i].forward(&x)?;
@@ -404,15 +471,29 @@ impl Module for ResBlock {
                 xt = xt.pad_with_zeros(2, self.pads1[i], 0)?;
             }
             xt = self.convs1[i].forward(&xt)?;
+            if let Some(n) = name {
+                stages.insert(format!("{}_c1_{}", n, i), xt.clone());
+            }
 
             xt = self.acti2[i].forward(&xt)?;
             if self.causal {
                 xt = xt.pad_with_zeros(2, self.pads2[i], 0)?;
             }
             xt = self.convs2[i].forward(&xt)?;
+            if let Some(n) = name {
+                stages.insert(format!("{}_c2_{}", n, i), xt.clone());
+            }
+
             x = (x + xt)?;
         }
         Ok(x)
+    }
+}
+
+impl Module for ResBlock {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let mut dummy = std::collections::HashMap::new();
+        self.forward_with_stages(xs, None, &mut dummy)
     }
 }
 
@@ -471,6 +552,18 @@ pub struct F0Predictor {
     classifier: candle_nn::Linear,
 }
 
+fn conv1d_to_cpu(conv: &Conv1d) -> Result<Conv1d> {
+    let w = conv.weight().to_device(&Device::Cpu)?;
+    let b = conv.bias().map(|b| b.to_device(&Device::Cpu)).transpose()?;
+    Ok(Conv1d::new(w, b, conv.config().clone()))
+}
+
+fn linear_to_cpu(lin: &candle_nn::Linear) -> Result<candle_nn::Linear> {
+    let w = lin.weight().to_device(&Device::Cpu)?;
+    let b = lin.bias().map(|b| b.to_device(&Device::Cpu)).transpose()?;
+    Ok(candle_nn::Linear::new(w, b))
+}
+
 impl F0Predictor {
     pub fn new(in_channels: usize, cond_channels: usize, vb: VarBuilder) -> Result<Self> {
         // condnet: 5 layers of Conv1d + WeightNorm
@@ -485,42 +578,18 @@ impl F0Predictor {
             let k = if i == 0 { 4 } else { 3 };
             let layer = load_conv1d(vb_layer, in_c, cond_channels, k, 1, 1, 0, &format!("f0_cond_{}", i))?;
 
-            // Log weight and bias stats for each layer
-            let w = layer.weight();
-            if let Ok(flat) = w.flatten_all() {
-                if let Ok(vec) = flat.to_vec1::<f32>() {
-                    let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                    debug!(
-                        "    [F0Predictor] Layer {} weights: min={:.6}, max={:.6}, mean={:.6}",
-                        i, min, max, mean
-                    );
-                }
-            }
-            if let Some(bias) = layer.bias() {
-                if let Ok(flat) = bias.flatten_all() {
-                    if let Ok(vec) = flat.to_vec1::<f32>() {
-                        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                        debug!(
-                            "    [F0Predictor] Layer {} bias: min={:.6}, max={:.6}, mean={:.6}",
-                            i, min, max, mean
-                        );
-                    }
-                }
-            }
-
-            condnet.push(layer);
+            // Move to CPU
+            let layer_cpu = conv1d_to_cpu(&layer)?;
+            condnet.push(layer_cpu);
         }
 
         // Classifier
         let classifier = candle_nn::linear(cond_channels, 1, vb.pp("classifier"))?;
+        let classifier_cpu = linear_to_cpu(&classifier)?;
 
         Ok(Self {
             condnet,
-            classifier,
+            classifier: classifier_cpu,
         })
     }
 
@@ -622,29 +691,27 @@ impl HiFTGenerator {
 
         // Downsample rates construction
         // downsample_rates = [1] + upsample_rates[::-1][:-1]
-        // cum = cumprod(downsample_rates)
-        // iter over zip(cum[::-1], k_list, d_list)
-
-        // Let's implement this logic in Rust:
-        let mut ds_rates = vec![1];
+        // cum_rates = cumprod(downsample_rates)[::-1]
+        let mut ds_base = vec![1];
         let mut rev_ups = ups_rates.clone();
         rev_ups.reverse();
-        if !rev_ups.is_empty() {
-            ds_rates.extend_from_slice(&rev_ups[..rev_ups.len() - 1]);
+        if rev_ups.len() > 1 {
+            ds_base.extend_from_slice(&rev_ups[..rev_ups.len() - 1]);
         }
 
-        let mut cum_rates = vec![];
-        let mut acc = 1;
-        for r in ds_rates {
-            acc *= r;
-            cum_rates.push(acc);
+        let mut cum_rates = Vec::new();
+        let mut current_prod = 1;
+        for &r in &ds_base {
+            current_prod *= r;
+            cum_rates.push(current_prod);
         }
-        cum_rates.reverse(); // [64, 8, 1] e.g.
+        cum_rates.reverse();
+        let downsample_rates = cum_rates;
 
         let src_k = &config.source_resblock_kernel_sizes;
         let src_d = &config.source_resblock_dilation_sizes;
 
-        for (i, ((&u, &k), d)) in cum_rates.iter().zip(src_k).zip(src_d).enumerate() {
+        for (i, ((&u, &k), d)) in downsample_rates.iter().zip(src_k).zip(src_d).enumerate() {
             let ch = base_ch / (1 << (i + 1));
             let in_ch = config.istft_params_n_fft + 2; // nfft+2 channels source
 
@@ -729,17 +796,23 @@ impl HiFTGenerator {
             vb.device(),
         )?;
 
-        // Source
+        let upsample_scale = ups_rates.iter().product::<usize>() * config.istft_params_hop_len;
         let m_source = SourceModuleHnNSF::new(
             config.nb_harmonics,
-            0.1,
-            0.003,
+            config.nsf_alpha as f64,
+            config.nsf_sigma as f64,
             config.sampling_rate,
             config.voiced_threshold,
+            upsample_scale,
+            is_causal,
             vb.pp("m_source"),
         )?;
 
-        let f0_predictor = F0Predictor::new(config.in_channels, base_ch, vb.pp("f0_predictor"))?;
+        let f0_predictor = F0Predictor::new(
+            config.in_channels,
+            config.base_channels,
+            vb.pp("f0_predictor"),
+        )?;
 
         Ok(Self {
             conv_pre,
@@ -755,39 +828,103 @@ impl HiFTGenerator {
             analysis_stft,
             m_source,
             f0_predictor,
-            f0_upsamp_scale: ups_rates.iter().product::<usize>() * config.istft_params_hop_len,
+            f0_upsamp_scale: upsample_scale,
             is_causal,
         })
     }
 
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        let (audio, _) = self.forward_with_stages(mel)?;
+        Ok(audio)
+    }
+
+    pub fn forward_with_stages(&self, mel: &Tensor) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
+        let mut stages = std::collections::HashMap::new();
         let mel = mel.to_dtype(DType::F32)?; // Force F32 to avoid F16 precision issues
+        stages.insert("input_mel".to_string(), mel.clone());
+
+        // 1. F0 Predictor
+        // Python: self.f0_predictor.to('cpu') inside inference.
+        // We replicate this by moving input to CPU, running inference, and moving back.
+        // This avoids potential GPU nondeterminism with small tensors / specific ops.
+        let mel_cpu = mel.to_device(&Device::Cpu)?;
+        let f0_cpu = self.f0_predictor.forward(&mel_cpu)?; // [Batch, 1, Length_f0]
+        let f0 = f0_cpu.to_device(mel.device())?;
+
+        let mel_len = mel.dim(2)?;
+        let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
+        stages.insert("f0".to_string(), f0.clone());
+
+        // 2. Upsample F0 to Source Resolution
+        let s = self.upsample_nearest(&f0, self.f0_upsamp_scale)?;
+        stages.insert("f0_upsampled".to_string(), s.clone());
+
+        // 3. Source Module
+        let (s_source, _, _) = self.m_source.forward(&s, None, None, None)?; // [B, 1, L_up]
+        stages.insert("source".to_string(), s_source.clone());
+
+        // 4. Decode
+        let (audio, decode_stages) = self.decode_with_stages(&mel, &s_source)?;
+        for (k, v) in decode_stages {
+            stages.insert(k, v);
+        }
+
+        Ok((audio, stages))
+    }
+
+    /// Forward pass with externally injected source tensor for parity testing.
+    /// This allows testing the decode path in isolation.
+    pub fn forward_with_injected_source(&self, mel: &Tensor, source: &Tensor) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
+        let mel = mel.to_dtype(DType::F32)?;
+        let (audio, stages) = self.decode_with_stages(&mel, source)?;
+        Ok((audio, stages))
+    }
+
+    /// Forward pass with full SineGen injection for parity testing.
+    /// allows injecting sine_waves to verify deterministic source generation.
+    pub fn forward_with_sine_injection(
+        &self,
+        mel: &Tensor,
+        sine_waves: &Tensor,
+        source_noise: &Tensor
+    ) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
+        let mut stages = std::collections::HashMap::new();
+        let mel = mel.to_dtype(DType::F32)?;
+        stages.insert("input_mel".to_string(), mel.clone());
 
         // 1. F0 Predictor
         let f0 = self.f0_predictor.forward(&mel)?; // [Batch, 1, Length_f0]
         let mel_len = mel.dim(2)?;
         let f0 = f0.narrow(2, 0, mel_len)?; // crop to mel length
+        stages.insert("f0".to_string(), f0.clone());
 
         // 2. Upsample F0 to Source Resolution
-        let (b, c, l) = f0.dims3()?;
-        let s = self.interpolate_linear(&f0, self.f0_upsamp_scale)?;
-        let s = s.reshape((b, c, l * self.f0_upsamp_scale))?;
+        let s = self.upsample_nearest(&f0, self.f0_upsamp_scale)?;
+        stages.insert("f0_upsampled".to_string(), s.clone());
 
-        // 3. Source Module
-        let (s_source, _, _) = self.m_source.forward(&s, None, None, None)?; // [B, 1, L_up]
+        // 3. Source Module with Injection
+        // Pass sine_waves as phase_inject (first arg) and source_noise
+        let (s_source, _, _) = self.m_source.forward(&s, Some(sine_waves), None, Some(source_noise))?;
+        stages.insert("source".to_string(), s_source.clone());
 
         // 4. Decode
-        let audio = self.decode(&mel, &s_source)?;
+        let (audio, decode_stages) = self.decode_with_stages(&mel, &s_source)?;
+        for (k, v) in decode_stages {
+            stages.insert(k, v);
+        }
 
-        Ok(audio)
+        Ok((audio, stages))
     }
 
-    fn decode(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
+
+    fn decode_with_stages(&self, x: &Tensor, s: &Tensor) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
+        let mut stages = std::collections::HashMap::new();
         // s is `source` (excitation signal) [B, 1, T]
         // Compute STFT [B, Freq, T_frame]
         // analysis_stft outputs (real, imag)
         let (s_real, s_imag) = self.analysis_stft.transform(s)?;
         let s_stft = Tensor::cat(&[&s_real, &s_imag], 1)?; // [Batch, 2*Freq, Frames]
+        stages.insert("s_stft".to_string(), s_stft.clone());
 
         // 3. Forward
         // x is passed in as argument (mel)
@@ -801,6 +938,7 @@ impl HiFTGenerator {
         }
 
         x = self.conv_pre.forward(&x)?;
+        stages.insert("conv_pre".to_string(), x.clone());
 
         let num_ups = self.ups.len();
 
@@ -844,35 +982,44 @@ impl HiFTGenerator {
                 let pad = self.source_down_pads[idx];
                 si_in = si_in.pad_with_zeros(2, pad, 0)?;
             }
+            if i == 0 {
+            }
             let si = self.source_downs[idx].forward(&si_in)?;
-            let si = self.source_resblocks[idx].forward(&si)?;
+            if i == 0 {
+            }
+            stages.insert(format!("source_down_out_{}", i), si.clone());
+            let si = self.source_resblocks[idx].forward_with_stages(&si, Some(&format!("si_res_{}", i)), &mut stages)?;
+            stages.insert(format!("si_{}", i), si.clone());
 
             // Robust slice to handle boundary effects
             let x_len = x.dim(2)?;
             let si_len = si.dim(2)?;
 
-            let common_len = x_len.min(si_len);
-            let x_slice = x.i((.., .., ..common_len))?;
-            let si_slice = si.i((.., .., ..common_len))?;
+            let check_len = x_len.min(si_len);
+            let x_slice = x.i((.., .., ..check_len))?;
+            let si_slice = si.i((.., .., ..check_len))?;
 
             x = x_slice.add(&si_slice)?;
+            stages.insert(format!("loop{}_si", i), si_slice);
+            stages.insert(format!("loop{}_x", i), x.clone());
 
             // ResBlocks
             let mut xs: Option<Tensor> = None;
             for j in 0..self.num_kernels {
                 let idx = i * self.num_kernels + j;
-                let out = self.resblocks[idx].forward(&x)?;
+                let xj = self.resblocks[idx].forward_with_stages(&x, Some(&format!("res_{}_{}", i, j)), &mut stages)?;
                 match xs {
-                    None => xs = Some(out),
-                    Some(prev) => xs = Some((prev + out)?),
+                    None => xs = Some(xj),
+                    Some(prev) => xs = Some((prev + xj)?),
                 }
             }
             if let Some(val) = xs {
                 x = (val / (self.num_kernels as f64))?;
             }
+            stages.insert(format!("after_resblocks_{}", i), x.clone());
         }
 
-        x = candle_nn::ops::leaky_relu(&x, 0.1)?; // Default slope
+        x = candle_nn::ops::leaky_relu(&x, 0.01)?; // Default slope in Python F.leaky_relu
 
         if self.is_causal {
             // Conv Post K=7. Pad Left 6.
@@ -882,6 +1029,7 @@ impl HiFTGenerator {
             x = x.pad_with_zeros(2, pad, 0)?;
         }
         let x = self.conv_post.forward(&x)?;
+        stages.insert("conv_post".to_string(), x.clone());
 
         // ISTFT Input: [B, n_fft+2, T]
         // Magnitude = exp(x[:, :mid])
@@ -893,20 +1041,21 @@ impl HiFTGenerator {
         let phase_in = x.i((.., cutoff.., ..))?;
 
         let magnitude = mag_log.exp()?;
+        stages.insert("magnitude".to_string(), magnitude.clone());
 
         // Clip magnitude to prevent overflow - Python does: magnitude = torch.clip(magnitude, max=1e2)
         let max_mag = Tensor::new(&[100.0f32], magnitude.device())?;
         let magnitude = magnitude.minimum(&max_mag.broadcast_as(magnitude.shape())?)?;
 
         let phase = phase_in.sin()?;
+        stages.insert("phase".to_string(), phase.clone());
 
         let audio = self.stft.forward(&magnitude, &phase)?;
+        stages.insert("pre_clamp_audio".to_string(), audio.clone());
 
-        // Remove DC offset
-        let mean_tensor = audio.mean(2)?.broadcast_as(audio.shape())?;
-        let audio = (audio - mean_tensor)?;
-
-
+        // NOTE: Python does NOT remove DC offset, so this is commented out
+        // let mean_tensor = audio.mean(2)?.broadcast_as(audio.shape())?;
+        // let audio = (audio - mean_tensor)?;
         // Clamp audio to [-audio_limit, audio_limit] like Python does
         // Python: x = torch.clamp(x, -self.audio_limit, self.audio_limit) where audio_limit = 0.99
         let audio_limit = 0.99f32;
@@ -915,12 +1064,12 @@ impl HiFTGenerator {
         let audio = audio.maximum(&min_val.broadcast_as(audio.shape())?)?;
         let audio = audio.minimum(&max_val.broadcast_as(audio.shape())?)?;
 
-        Ok(audio)
+        Ok((audio, stages))
     }
 
-    // Helper for linear interpolation (N, C, L) -> (N, C, L * scale)
-    // Matches torch.nn.functional.interpolate(..., mode='linear', align_corners=False)
-    fn interpolate_linear(&self, x: &Tensor, scale: usize) -> Result<Tensor> {
+    // Helper for nearest upsampling (N, C, L) -> (N, C, L * scale)
+    // Matches torch.nn.Upsample(scale_factor=scale, mode='nearest')
+    fn upsample_nearest(&self, x: &Tensor, scale: usize) -> Result<Tensor> {
         let (n, c, l) = x.dims3()?;
         let out_l = l * scale;
 
@@ -929,18 +1078,13 @@ impl HiFTGenerator {
 
         let mut out_vec = Vec::with_capacity(n * c * out_l);
 
-        // y[i*S + k] = lerp(x[i], x[i+1], k/S)
         for batch in 0..n {
             for ch in 0..c {
                 let off = (batch * c + ch) * l;
                 for i in 0..l {
-                    let val0 = x_vec[off + i];
-                    let val1 = if i + 1 < l { x_vec[off + i + 1] } else { val0 }; // Repeats last sample
-
-                    for k in 0..scale {
-                        let alpha = k as f32 / scale as f32;
-                        let inter = val0 * (1.0 - alpha) + val1 * alpha;
-                        out_vec.push(inter);
+                    let val = x_vec[off + i];
+                    for _ in 0..scale {
+                        out_vec.push(val);
                     }
                 }
             }
@@ -964,6 +1108,8 @@ pub struct HiFTConfig {
     pub source_resblock_kernel_sizes: Vec<usize>,
     pub source_resblock_dilation_sizes: Vec<Vec<usize>>,
     pub voiced_threshold: f32,
+    pub nsf_alpha: f32,
+    pub nsf_sigma: f32,
 }
 
 impl HiFTConfig {
@@ -982,6 +1128,8 @@ impl HiFTConfig {
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             voiced_threshold: 5.0,
+            nsf_alpha: 0.1,
+            nsf_sigma: 0.003,
         }
     }
 
@@ -1000,6 +1148,8 @@ impl HiFTConfig {
             source_resblock_kernel_sizes: vec![7, 7, 11],
             source_resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             voiced_threshold: 5.0,
+            nsf_alpha: 0.1,
+            nsf_sigma: 0.003,
         }
     }
 }

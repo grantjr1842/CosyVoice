@@ -261,9 +261,11 @@ impl CosyVoiceFlow {
         );
 
         // Build conditioning tensor: [1, 80, total_len]
+        // Use inputs dtype
+        let dtype = embedding.dtype();
         let mut conds = Tensor::zeros(
             (1, self.config.output_size, prompt_mel_len + target_mel_len),
-            DType::F32,
+            dtype,
             &self.device,
         )?;
 
@@ -272,15 +274,17 @@ impl CosyVoiceFlow {
             // Build conds by concatenating [1, 80, prompt_len] and [1, 80, target_len]
             let zeros_part = Tensor::zeros(
                 (1, self.config.output_size, target_mel_len),
-                DType::F32,
+                dtype,
                 &self.device,
             )?;
-            conds = Tensor::cat(&[prompt_feat, &zeros_part], 2)?; // Cat along dim 2
+            // Ensure prompt_feat is correct dtype
+            let prompt_feat = prompt_feat.to_dtype(dtype)?;
+            conds = Tensor::cat(&[&prompt_feat, &zeros_part], 2)?; // Cat along dim 2
         }
         debug!("    conds shape: {:?}", conds.shape());
 
         // Create mask (all ones for now)
-        let mask = Tensor::ones((1, total_mel_len), DType::F32, &self.device)?;
+        let mask = Tensor::ones((1, total_mel_len), dtype, &self.device)?;
 
         // mu = h transposed
         let mu = h.transpose(1, 2)?; // [batch, hidden_dim, mel_len]
@@ -360,9 +364,10 @@ impl CosyVoiceFlow {
 }
 
 /// L2 normalize along dimension 1
-fn l2_normalize(x: &Tensor) -> Result<Tensor> {
+pub fn l2_normalize(x: &Tensor) -> Result<Tensor> {
     let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?;
-    let norm = norm.broadcast_add(&Tensor::new(&[1e-8f32], x.device())?)?;
+    let eps = Tensor::new(&[1e-8f32], x.device())?.to_dtype(x.dtype())?;
+    let norm = norm.broadcast_add(&eps)?;
     x.broadcast_div(&norm)
 }
 

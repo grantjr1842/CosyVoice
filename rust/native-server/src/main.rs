@@ -25,6 +25,9 @@ use cosyvoice_native_server::audio::{self, MelConfig};
 use cosyvoice_native_server::text_frontend::text_normalize_english;
 use cosyvoice_native_server::tts::NativeTtsEngine;
 
+mod qwen_special_tokens;
+
+
 // Use jemalloc for better memory allocation performance
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -79,9 +82,22 @@ async fn main() -> anyhow::Result<()> {
             tokenizer_path
         ));
     }
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    info!("Tokenizer initialized successfully");
+
+    // Add Qwen special tokens if missing
+    // We explicitly add them to match Python's dynamic addition.
+    // The base tokenizer usually ends at id 151643 (<|endoftext|>).
+    // Adding them should assign IDs starting from 151644.
+    let special_tokens = qwen_special_tokens::get_special_tokens();
+    let tokens: Vec<tokenizers::AddedToken> = special_tokens
+        .iter()
+        .map(|&t| tokenizers::AddedToken::from(t, true))
+        .collect();
+    tokenizer.add_special_tokens(&tokens);
+
+    info!("Tokenizer initialized successfully with {} additional special tokens", special_tokens.len());
+
 
     let state = Arc::new(AppState {
         tts: Mutex::new(tts),

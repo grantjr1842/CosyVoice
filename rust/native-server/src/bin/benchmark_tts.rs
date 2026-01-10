@@ -58,24 +58,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Preparing inputs (using random/dummy data for benchmark consistency)...");
     let device = &engine.device;
-    let _dtype = if args.fp16 { candle_core::DType::F16 } else { candle_core::DType::F32 };
+    let dtype = engine.dtype;
 
     // Dummy text tokens [1, 50]
     let text_tokens = candle_core::Tensor::zeros((1, 50), candle_core::DType::U32, device)?;
 
     // Dummy prompt speech 16k [1, 128, 200]
-    // Dummy prompt speech 16k [1, 128, 200]
+    // Keep as F32 for Frontend compatibility (ONNX usually expects F32)
     let prompt_speech_16k = candle_core::Tensor::randn(0f32, 1f32, (1, 128, 200), device)?;
 
     // Dummy prompt speech 24k [1, 80, 200]
-    let prompt_speech_24k = candle_core::Tensor::randn(0f32, 1f32, (1, 80, 200), device)?;
+    // Must match engine dtype (F16 on CUDA) -> used by Flow/LLM
+    let prompt_speech_24k = candle_core::Tensor::randn(0f32, 1f32, (1, 80, 200), device)?
+        .to_dtype(dtype)?;
 
     // Dummy prompt fbank [1, 200, 80] - Keep as F32 for Frontend compatibility
     let prompt_fbank = candle_core::Tensor::randn(0f32, 1f32, (1, 200, 80), device)?;
 
-    println!("DEBUG: prompt_speech_16k dtype: {:?}", prompt_speech_16k.dtype());
-    println!("DEBUG: prompt_speech_24k dtype: {:?}", prompt_speech_24k.dtype());
-    println!("DEBUG: prompt_fbank dtype: {:?}", prompt_fbank.dtype());
+    // println!("DEBUG: prompt_speech_16k dtype: {:?}", prompt_speech_16k.dtype());
+    // println!("DEBUG: prompt_speech_24k dtype: {:?}", prompt_speech_24k.dtype());
+    // println!("DEBUG: prompt_fbank dtype: {:?}", prompt_fbank.dtype());
 
     println!("Warming up...");
     // Run one iteration to warm up caches

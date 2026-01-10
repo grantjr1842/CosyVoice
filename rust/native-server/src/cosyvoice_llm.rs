@@ -33,7 +33,7 @@ impl Default for CosyVoiceLLMConfig {
             llm_input_size: 896,
             llm_output_size: 896,
             speech_token_size: 6561,  // Fun-CosyVoice3-0.5B speech token size
-            speech_extra_tokens: 200, // CosyVoice3 stop/special token range
+            speech_extra_tokens: 25,  // CosyVoice3 special tokens (speech + 3)
             sampling_vocab_size: 6561, // Fun-CosyVoice3-0.5B Flow vocab size
             spk_embed_dim: 192,
             sampling_top_p: 0.8,
@@ -86,6 +86,8 @@ pub struct CosyVoiceLLM {
     llm_embedding: Option<Embedding>,
     /// Speech token embedding
     speech_embedding: Embedding,
+    /// Speaker embedding projection
+    spk_embed_affine_layer: Linear,
     /// Decoder head for speech tokens
     llm_decoder: Linear,
     /// Decoder vocabulary size (including special tokens)
@@ -179,11 +181,16 @@ impl CosyVoiceLLM {
                 speech_vocab_size, decoder_vocab_size
             )));
         }
+        if decoder_vocab_size != speech_vocab_size {
+            return Err(candle_core::Error::msg(format!(
+                "llm_decoder vocab mismatch: expected {}, got {}",
+                speech_vocab_size, decoder_vocab_size
+            )));
+        }
         let llm_decoder = Linear::new(decoder_weight, None);
         info!("llm_decoder loaded successfully");
 
-        let extra_tokens = speech_vocab_size - llm_config.sampling_vocab_size;
-        let use_speech_special_tokens = extra_tokens >= 3;
+        let _extra_tokens = speech_vocab_size - llm_config.sampling_vocab_size;
         let mut stop_token_ids = Vec::new();
         for idx in llm_config.sampling_vocab_size..speech_vocab_size {
             if stop_token_ids.len() >= llm_config.stop_token_count {
@@ -191,42 +198,49 @@ impl CosyVoiceLLM {
             }
             stop_token_ids.push(idx);
         }
-        let (llm_embedding, sos, task_id) = if use_speech_special_tokens {
-            let sos = llm_config.sampling_vocab_size;
-            let task_id = llm_config.sampling_vocab_size.saturating_add(2);
-            if task_id >= speech_vocab_size {
-                return Err(candle_core::Error::msg(
-                    "special token ids exceed speech vocab size; check llm config",
-                ));
+
+        // Match Python Qwen2LM logic: Always use llm_embedding for SOS/TaskID if it exists.
+        // Python: self.llm_embedding = torch.nn.Embedding(2, llm_input_size)
+        // self.sos = 0, self.task_id = 1
+
+        let llm_embedding = if vb.pp("llm_embedding").contains_tensor("weight") {
+            let llm_emb_weight = vb.pp("llm_embedding").get_unchecked("weight")?;
+            let (_llm_vocab_size, llm_emb_dim) = llm_emb_weight.dims2()?;
+            if llm_emb_dim != llm_config.llm_input_size {
+                return Err(candle_core::Error::msg(format!(
+                    "llm_embedding dim mismatch: expected {}, got {}",
+                    llm_config.llm_input_size, llm_emb_dim
+                )));
             }
-            (None, sos, task_id)
+             Embedding::new(llm_emb_weight, llm_config.llm_input_size)
         } else {
-            let llm_embedding = if vb.pp("llm_embedding").contains_tensor("weight") {
-                let llm_emb_weight = vb.pp("llm_embedding").get_unchecked("weight")?;
-                let (llm_vocab_size, llm_emb_dim) = llm_emb_weight.dims2()?;
-                if llm_emb_dim != llm_config.llm_input_size {
-                    return Err(candle_core::Error::msg(format!(
-                        "llm_embedding dim mismatch: expected {}, got {}",
-                        llm_config.llm_input_size, llm_emb_dim
-                    )));
-                }
-                if llm_vocab_size < 2 {
-                    return Err(candle_core::Error::msg(
-                        "llm_embedding vocab too small for sos/task_id",
-                    ));
-                }
-                Embedding::new(llm_emb_weight, llm_config.llm_input_size)
-            } else {
-                debug!("Creating llm_embedding (2 tokens)...");
-                create_random_embedding(2, llm_config.llm_input_size, &device)?
-            };
-            (Some(llm_embedding), 0, 1)
+             // Fallback or error? For CosyVoice3 it should exist.
+             debug!("Creating llm_embedding (2 tokens) via fallback...");
+             create_random_embedding(2, llm_config.llm_input_size, &device)?
         };
+
+        // We assume we always use llm_embedding for SOS/TaskID as per Python Qwen2LM
+        let use_speech_special_tokens = false;
+        let sos = 0;
+        let task_id = 1;
+
+        // Load spk_embed_affine_layer (try both 'llm.spk...' and 'spk...')
+        // The patched file has 'llm.spk_embed_affine_layer', but logically it should be top-level.
+        let spk_prefix = if vb.pp("llm.spk_embed_affine_layer").contains_tensor("weight") {
+            "llm.spk_embed_affine_layer"
+        } else {
+            "spk_embed_affine_layer"
+        };
+        info!("Loading spk_embed_affine_layer from {}...", spk_prefix);
+        let spk_affine_weight = vb.pp(spk_prefix).get_unchecked("weight")?;
+        let spk_affine_bias = vb.pp(spk_prefix).get_unchecked("bias")?;
+        let spk_embed_affine_layer = Linear::new(spk_affine_weight, Some(spk_affine_bias));
 
         Ok(Self {
             llm,
-            llm_embedding,
+            llm_embedding: Some(llm_embedding),
             speech_embedding,
+            spk_embed_affine_layer,
             llm_decoder,
             _speech_vocab_size: speech_vocab_size,
             _sampling_vocab_size: llm_config.sampling_vocab_size,
@@ -352,7 +366,7 @@ impl CosyVoiceLLM {
         sampling_k: usize,
         ignore_stop: bool,
     ) -> Result<u32> {
-        let logp = logp.squeeze(0)?;
+        let logp = logp.to_dtype(candle_core::DType::F32)?.squeeze(0)?;
         let logp_vec: Vec<f32> = logp.to_vec1()?;
         let mut probs: Vec<f32> = logp_vec.iter().map(|v| v.exp()).collect();
         if ignore_stop {
@@ -422,7 +436,7 @@ impl CosyVoiceLLM {
         &mut self,
         text_embeds: &Tensor,
         prompt_speech_tokens: Option<&Tensor>,
-        _speaker_embedding: Option<&Tensor>,
+        speaker_embedding: Option<&Tensor>,
         sampling_k: usize,
         min_len: usize,
         max_len: usize,
@@ -430,17 +444,36 @@ impl CosyVoiceLLM {
         // Clear KV cache for fresh generation
         self.llm.clear_kv_cache();
 
-        // Build initial input: [sos, text, task_id, prompt_speech]
+        // Build initial input: [sos, spk_emb, text, task_id, prompt_speech]
         let sos_emb = self.get_sos_emb()?;
         let task_id_emb = self.get_task_id_emb()?;
 
+        // Ensure all parts have same dtype as llm_decoder
+        let dtype = self.llm_decoder.weight().dtype();
+        let sos_emb = sos_emb.to_dtype(dtype)?;
+        let text_embeds = text_embeds.to_dtype(dtype)?;
+        let task_id_emb = task_id_emb.to_dtype(dtype)?;
+
+        // Speaker embedding projection
+        // NOTE: CosyVoice3 (Qwen2LM) does NOT use speaker embedding in the LLM.
+        // We keep the argument for compatibility but do not use it in `parts`.
+        let _spk_emb = if let Some(emb) = speaker_embedding {
+            // F.normalize(embedding, dim=1) + affine + unsqueeze
+            let emb = crate::cosyvoice_flow::l2_normalize(emb)?.to_dtype(dtype)?;
+            let proj = self.spk_embed_affine_layer.forward(&emb)?;
+            proj.unsqueeze(1)?
+        } else {
+             Tensor::zeros((1, 0, self.config.llm_input_size), dtype, &self.device)?
+        };
+
         let mut parts = vec![sos_emb];
+        // parts.push(spk_emb); // DISABLED for CosyVoice3 parity
         parts.push(text_embeds.clone());
         parts.push(task_id_emb);
 
         if let Some(prompt_tokens) = prompt_speech_tokens {
             if prompt_tokens.dim(1)? > 0 {
-                let prompt_emb = self.embed_speech_tokens(prompt_tokens)?;
+                let prompt_emb = self.embed_speech_tokens(prompt_tokens)?.to_dtype(dtype)?;
                 parts.push(prompt_emb);
             }
         }
@@ -463,7 +496,7 @@ impl CosyVoiceLLM {
                 y_pred.dim(1)? - 1..y_pred.dim(1)?,
                 ..,
             ))?)?;
-            let logp = candle_nn::ops::log_softmax(&logits.squeeze(1)?, 1)?;
+            let logp = candle_nn::ops::log_softmax(&logits.squeeze(1)?.to_dtype(candle_core::DType::F32)?, 1)?;
 
             // Sample next token
             let ignore_stop = i < min_len;
@@ -478,6 +511,9 @@ impl CosyVoiceLLM {
             }
 
             out_tokens.push(top_id);
+            if i < 20 {
+                debug!("Gen token {}: {}", i, top_id);
+            }
 
             // Prepare next input (just the new token embedding)
             seqlen_offset += lm_input.dim(1)?;

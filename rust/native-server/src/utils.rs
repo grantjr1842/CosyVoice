@@ -145,13 +145,10 @@ impl InverseStftModule {
         // k=0, k=N/2: 0 (Imag part of DC/Nyquist is 0 usually, or doesn't contribute to real signal if Hermitian)
         // 0<k<N/2: -2*Im[k]*sin(...) * window
 
-        // Normalization fix: torch.istft applies a different normalization that we need to match.
-        // Empirical analysis:
-        // - Python torch.istft produces pre_clamp audio with max ~2.25
-        // - Rust raw ISTFT (with scale=1/n_fft) produces max ~5.5
-        // - Required correction factor: 2.25 / 5.5 = 0.41
-        // So the corrected scale = 0.41 / n_fft
-        let scale = 0.41 / (n_fft as f64);
+        // Normalization: Standard ISTFT synthesis 1/n_fft.
+        // ISTFT parity test shows Rust produces ~0.4x Python amplitude with 0.41 scale.
+        // Using 1.0/n_fft as per standard IFFT definition.
+        let scale = 1.0 / (n_fft as f64);
 
         for k in 0..n_bins {
             let factor = if k == 0 || k == n_fft / 2 { 1.0 } else { 2.0 };
