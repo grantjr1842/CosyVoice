@@ -181,18 +181,6 @@ class CosyVoice3:
         """Save speaker info to disk."""
         torch.save(self.frontend.spk2info, "{}/spk2info.pt".format(self.model_dir))
 
-    def inference_zero_shot(
-        self,
-        tts_text,
-        prompt_text,
-        prompt_wav,
-        zero_shot_spk_id="",
-        stream=False,
-        speed=1.0,
-        text_frontend=True,
-    ):
-        """
-        Zero-shot voice cloning inference.
 
     def inference_zero_shot(self, tts_text, prompt_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
         if self.__class__.__name__ == 'CosyVoice3' and '<|endofprompt|>' not in prompt_text + tts_text:
