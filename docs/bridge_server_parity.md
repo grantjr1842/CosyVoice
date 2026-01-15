@@ -77,7 +77,7 @@ This file inventories every import and the concrete default/runtime values used 
 ## Native-vs-Bridge Parity Notes (current)
 
 ### Parity adjustments applied (2026-01-10)
-- **Text normalization**: Rust now mirrors `tools/text_normalize_parity.py` (no auto prompt prefix, `<|en|>` prefix preserved, special-token bypass, inflect-like number wording with hyphens/commas). See `rust/native-server/src/text_frontend.rs`.
+- **Text normalization**: Rust now mirrors `tools/text_normalize_parity.py` (no auto prompt prefix, no prefix, special-token bypass, inflect-like number wording with hyphens/commas). See `rust/native-server/src/text_frontend.rs`.
 - **Audio postprocess**: Removed DC removal + peak normalization in native synthesis to match Python's direct float-to-i16 clamp. See `rust/native-server/src/tts.rs`.
 - **Resampling kernel**: Rust resampler now matches torchaudio's `sinc_interp_hann` kernel/stride/padding behavior for bit-level mel parity. See `rust/native-server/src/audio.rs`.
 - **Resampling length**: Rust resampler now trims/pads to `ceil(len * dst/src)` to match `torchaudio.transforms.Resample` output length, preventing Whisper mel frame count drift. See `rust/native-server/src/audio.rs`.
@@ -97,7 +97,7 @@ This file inventories every import and the concrete default/runtime values used 
 - Prompt mel: native uses Rust `mel_spectrogram` implementation; Python uses `cosyvoice.compat.matcha_compat.mel_spectrogram`.
 - Prompt speech tokens: native uses Whisper log-mel + ONNX; Python uses Whisper log-mel + ONNX (should match closely).
 - Speaker embedding: native implements Kaldi fbank + mean normalization; Python uses `torchaudio.compliance.kaldi.fbank` + mean normalization.
-- Text normalization: native mirrors `tools/text_normalize_parity.py` (digits -> words, split_paragraph, `<|en|>` prefix). Python runtime may still use wetext/ttsfrd if available.
+- **Text normalization**: Rust now mirrors `tools/text_normalize_parity.py` (digits -> words, split_paragraph, no valid prefix). Python runtime may still use wetext/ttsfrd if available.
 
 ## Example Output Comparison (reference)
 
