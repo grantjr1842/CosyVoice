@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokenizers::Tokenizer;
 
 /// List of special tokens that should be filtered out from speech
-const SPECIAL_TOKENS: &[&str] = &["<|en|>", "<|endofprompt|>", "<|im_start|>", "<|im_end|>"];
+const SPECIAL_TOKENS: &[&str] = &["<|endofprompt|>", "<|im_start|>", "<|im_end|>"];
 
 /// Clean text by removing special tokens that shouldn't be spoken
 pub fn clean_special_tokens(text: &str) -> String {
@@ -36,12 +36,10 @@ mod tests {
 
     #[test]
     fn test_clean_special_tokens() {
-        assert_eq!(clean_special_tokens("<|en|>Hello world"), "Hello world");
         assert_eq!(
             clean_special_tokens("You are helpful.<|endofprompt|>Hello"),
             "You are helpful. Hello"
         );
-        assert_eq!(clean_special_tokens("<|en|><|endofprompt|>Test"), "Test");
     }
 
     #[test]

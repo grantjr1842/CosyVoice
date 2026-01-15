@@ -96,7 +96,7 @@ where
         EN_MERGE_LEN,
         false,
     )?;
-    // NOTE: <|en|> prefix removed as it is not a valid token and unnecessary
+
     texts.retain(|t| !is_only_punctuation(t));
 
     Ok(texts)
@@ -515,10 +515,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_english_adds_prefix_and_spells_numbers() -> Result<()> {
+    fn normalize_english_spells_numbers() -> Result<()> {
         let counter = |t: &str| Ok(t.split_whitespace().count());
         let out = text_normalize_english_with_counter("I have 2 dogs.", &counter, true, true)?;
-        // <|en|> prefix removed
         assert_eq!(out, vec!["I have two dogs ."]);
         Ok(())
     }

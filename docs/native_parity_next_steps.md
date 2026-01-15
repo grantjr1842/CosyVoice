@@ -28,7 +28,7 @@ Goal: Normalize and split text the same way as Python before tokenization.
 
 Targets:
 - Match `CosyVoiceFrontEnd.text_normalize` behavior for English.
-- Support `<|en|>` prefix and paragraph splitting by token count.
+- Support paragraph splitting by token count.
 - Keep the same prompt prefix behavior with `<|endofprompt|>`.
 
 Primary refs:

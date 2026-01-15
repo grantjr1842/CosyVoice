@@ -1,5 +1,0 @@
-error: key with no value, expected `=`
-  --> rust/native-server/Cargo.toml:55:23
-   |
-55 |     "candle-core/cuda",
-   |                       ^
